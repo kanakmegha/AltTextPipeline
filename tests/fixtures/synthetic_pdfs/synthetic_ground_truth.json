@@ -1,0 +1,154 @@
+{
+  "case1_caption_below": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case1_caption_below.pdf",
+    "description": "Single image with standard caption positioned below",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 1. Archaeological site plan of the central acropolis.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case2_caption_above": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case2_caption_above.pdf",
+    "description": "Single image with standard caption positioned above",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 2. Elevation contour map of the northern ridge.",
+        "expected_position": "above",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case3_multiline_captions": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case3_multiline_captions.pdf",
+    "description": "Multiline captions above and below across consecutive pages",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 3. Stratigraphic sequence of Trench IV showing multiple sedimentary layers and archaeological horizons from the late bronze age.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      },
+      {
+        "page": 2,
+        "placement": 1,
+        "expected_caption": "Plate 1. Microscopic analysis of ceramic temper showing quartz inclusions and organic matter preserved in the matrix.",
+        "expected_position": "above",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case4_multiple_images_one_page": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case4_multiple_images_one_page.pdf",
+    "description": "Two distinct images with independent captions on a single page",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 4A. Eastern entrance portal overlooking the lower terrace.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      },
+      {
+        "page": 1,
+        "placement": 2,
+        "expected_caption": "Figure 4B. Western perimeter wall foundation trench.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case5_two_column_layout": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case5_two_column_layout.pdf",
+    "description": "Two-column layout testing horizontal isolation between adjacent columns",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 5. Column 1 ceramic vessel with incised geometric ornament.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      },
+      {
+        "page": 1,
+        "placement": 2,
+        "expected_caption": "Figure 6. Column 2 bronze dagger recovered from Burial 12.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case6_image_without_caption": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case6_image_without_caption.pdf",
+    "description": "Image with no nearby text blocks within caption tolerance",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "",
+        "expected_position": null,
+        "expected_caption_found": false,
+        "expected_needs_review": true
+      }
+    ]
+  },
+  "case7_duplicate_captions": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case7_duplicate_captions.pdf",
+    "description": "Two separate images on different pages with identical captions (filename deduplication test)",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 7. Standard specimen comparison under polarized light.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      },
+      {
+        "page": 2,
+        "placement": 1,
+        "expected_caption": "Figure 7. Standard specimen comparison under polarized light.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  },
+  "case8_reused_image_object": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case8_reused_image_object.pdf",
+    "description": "Reused image object with separate placements and distinct captions",
+    "expected_items": [
+      {
+        "page": 1,
+        "placement": 1,
+        "expected_caption": "Figure 8. Organizational hallmark stamp on frontispiece.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      },
+      {
+        "page": 2,
+        "placement": 1,
+        "expected_caption": "Figure 9. Secondary placement of hallmark stamp in colophon.",
+        "expected_position": "below",
+        "expected_caption_found": true,
+        "expected_needs_review": false
+      }
+    ]
+  }
+}

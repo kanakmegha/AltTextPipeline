@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+
+# Large source documents and generated artifacts
+*.pdf
+diagnostic_output/
+phase1_baseline_report.json
+phase2_comparison_report.json
