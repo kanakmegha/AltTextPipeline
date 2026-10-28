@@ -15,3 +15,4 @@ __pycache__/
 diagnostic_output/
 phase1_baseline_report.json
 phase2_comparison_report.json
+data/

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AltTextPipeline — Extraction Inspector</title>
+  <meta name="description" content="Visual extraction and caption matching inspector for digitally generated book PDFs." />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand-wrapper">
+        <div class="brand-icon" aria-hidden="true">A</div>
+        <div class="brand-titles">
+          <h1>AltTextPipeline</h1>
+          <p>Extraction Inspector &amp; Editorial Grounding Testbed</p>
+        </div>
+      </div>
+      <div class="header-badges">
+        <span class="badge">
+          <span class="badge-dot"></span>
+          Modular Engine Active
+        </span>
+        <span class="badge">SQLite WAL</span>
+      </div>
+    </header>
+
+    <!-- Upload & Extraction Setup Panel -->
+    <section class="panel" aria-labelledby="upload-section-title">
+      <div class="panel-header">
+        <h2 id="upload-section-title" class="panel-title">Upload &amp; Extract PDF</h2>
+        <p class="panel-subtitle">Upload a digitally generated book PDF to inspect image placements and matched captions.</p>
+      </div>
+
+      <div class="upload-grid">
+        <!-- Dropzone -->
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Upload PDF by dragging and dropping or clicking">
+          <input type="file" id="pdfFile" accept="application/pdf" />
+          <div class="dropzone-icon" aria-hidden="true">📄</div>
+          <div class="dropzone-text">Drag &amp; drop your book PDF here, or browse</div>
+          <div class="dropzone-hint">Digitally generated PDFs supported (.pdf)</div>
+          <div id="selectedFileName" class="selected-filename"></div>
+        </div>
+
+        <!-- Options Column -->
+        <div class="options-column">
+          <div class="input-group">
+            <label for="pageRange">Page Numbers (Optional)</label>
+            <input type="text" id="pageRange" class="input-control" placeholder="e.g. 1, 4, 33, 46, 77 (leave blank for all)" />
+          </div>
+
+          <div class="input-group">
+            <label for="projectName">Project Name (Optional)</label>
+            <input type="text" id="projectName" class="input-control" placeholder="e.g. Etruria Study Extraction" />
+          </div>
+
+          <div id="sampleCard" class="quick-sample-card" style="display: none;">
+            <div class="quick-sample-info">
+              <h4>Quick Test: 40345.pdf</h4>
+              <p>Pre-configured with sample pages 1, 4, 33, 46, 77</p>
+            </div>
+            <button id="useSampleBtn" class="btn-secondary" type="button">Use Sample</button>
+          </div>
+
+          <button id="startExtractBtn" class="btn-primary" type="button" disabled>
+            <span>Run Extraction</span>
+            <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Loading / Progress -->
+      <div id="progressContainer" class="progress-container" aria-live="polite">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-status">
+          <span id="progressText">Analyzing document layout and bounding boxes...</span>
+          <span>In Progress</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Empty State -->
+    <div id="emptyState" class="empty-state">
+      <div class="empty-icon" aria-hidden="true">🖼️</div>
+      <h3 class="empty-title">No Extraction Results Yet</h3>
+      <p class="empty-desc">
+        Select a PDF or click <strong>"Use Sample"</strong> to test extraction on the local <em>40345.pdf</em> sample pages.
+        Extracted images, bounding boxes, and candidate captions will appear here.
+      </p>
+    </div>
+
+    <!-- Extraction Results Section -->
+    <main id="resultsSection" style="display: none;">
+      <div class="results-header">
+        <div class="metrics-strip">
+          <div class="metric-pill">
+            <span class="metric-label">Total Images:</span>
+            <span id="totalCount" class="metric-value">0</span>
+          </div>
+          <div class="metric-pill">
+            <span class="metric-label" style="color: var(--status-matched);">Matched:</span>
+            <span id="matchedCount" class="metric-value" style="color: var(--status-matched);">0</span>
+          </div>
+          <div class="metric-pill">
+            <span class="metric-label" style="color: var(--status-review);">Needs Review:</span>
+            <span id="reviewCount" class="metric-value" style="color: var(--status-review);">0</span>
+          </div>
+        </div>
+
+        <div class="filter-tabs" role="tablist">
+          <button class="filter-tab active" data-filter="all" role="tab" aria-selected="true">All Images</button>
+          <button class="filter-tab" data-filter="matched" role="tab" aria-selected="false">Matched Captions</button>
+          <button class="filter-tab" data-filter="review" role="tab" aria-selected="false">Needs Review</button>
+        </div>
+      </div>
+
+      <!-- Gallery Grid -->
+      <div id="galleryGrid" class="gallery-grid" aria-label="Extracted images gallery"></div>
+    </main>
+  </div>
+
+  <!-- Inspection Modal Dialog -->
+  <div id="inspectionModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <h3 id="modalTitle">Image Details</h3>
+          <p id="modalSubtitle">Page X · Placement Y</p>
+        </div>
+        <button id="modalCloseBtn" class="modal-close-btn" aria-label="Close dialog">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Preview Box -->
+        <div class="modal-preview-box">
+          <img id="modalImg" class="modal-preview-img" src="" alt="Extracted preview" />
+        </div>
+
+        <!-- Meta and Caption Details -->
+        <div>
+          <!-- Review Alert Box (Conditional) -->
+          <div id="modalReviewBox" class="review-reasons-box" style="display: none;">
+            <strong>⚠️ Manual Review Advised:</strong>
+            <ul id="modalReasonsList"></ul>
+          </div>
+
+          <div class="modal-section">
+            <div class="modal-section-title">Selected Caption</div>
+            <div id="modalCaption" class="modal-caption-text"></div>
+          </div>
+
+          <div class="modal-section">
+            <div class="modal-section-title">Placement Coordinates</div>
+            <div class="meta-grid">
+              <div>
+                <span class="meta-item-label">Source Page:</span>
+                <span id="metaPage" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Placement:</span>
+                <span id="metaPlacement" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Caption Position:</span>
+                <span id="metaPos" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Bounding Box:</span>
+                <span id="metaBbox" class="meta-item-value"></span>
+              </div>
+              <div style="grid-column: 1 / -1;">
+                <span class="meta-item-label">Internal UUID:</span>
+                <span id="metaUuid" class="meta-item-value"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Candidate Text Blocks Table -->
+        <div class="candidates-table-wrap">
+          <div class="modal-section-title">Geometric Candidate Blocks &amp; Priority Scores</div>
+          <table class="candidates-table">
+            <thead>
+              <tr>
+                <th>Position</th>
+                <th>Gap</th>
+                <th>Score</th>
+                <th>Fig Prefix</th>
+                <th>Candidate Text Block</th>
+              </tr>
+            </thead>
+            <tbody id="candidatesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
