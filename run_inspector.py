@@ -14,4 +14,4 @@ if __name__ == "__main__":
     print("  AltTextPipeline — Extraction Inspector Web Interface")
     print(f"  Access local inspector in your browser: http://{host}:{port}")
     print("=" * 70)
-    uvicorn.run("src.web.app:app", host=host, port=port, reload=False)
+    uvicorn.run("src.web.app:app", host=host, port=port, reload=True)

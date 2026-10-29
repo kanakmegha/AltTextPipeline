@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AltTextPipeline — Review &amp; Edit</title>
+  <meta name="description" content="Extracted-image reader, cross-page figure grouping, and large individual-image alt-text review workspace." />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Application Header -->
+    <header class="app-header">
+      <div class="brand-wrapper">
+        <div class="brand-icon" aria-hidden="true">A</div>
+        <div class="brand-titles">
+          <h1>AltTextPipeline</h1>
+          <p>Extraction Inspector &amp; Editorial Grounding Testbed</p>
+        </div>
+      </div>
+
+      <!-- Pipeline Stepper -->
+      <nav class="pipeline-stepper" aria-label="Pipeline Stages">
+        <a href="/" class="step-item" title="Upload new PDF">
+          <span class="step-badge">1</span>
+          <span>Upload &amp; Extract</span>
+        </a>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <span class="step-item active" aria-current="step">
+          <span class="step-badge">2</span>
+          <span>Review &amp; Edit</span>
+        </span>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <a id="stepperExportLink" href="/export/{{project_id}}" class="step-item" title="Continue to Export">
+          <span class="step-badge">3</span>
+          <span>Export to Word</span>
+        </a>
+      </nav>
+
+      <div class="header-badges">
+        <div class="text-size-widget" role="group" aria-label="Reading text size controls">
+          <span class="text-size-label">Text:</span>
+          <button type="button" class="btn-text-size active" data-size="normal" aria-label="Normal text size" title="Normal text (100%)">A</button>
+          <button type="button" class="btn-text-size" data-size="large" aria-label="Large text size" title="Large text (115%)">A+</button>
+          <button type="button" class="btn-text-size" data-size="xlarge" aria-label="Extra large text size" title="Extra Large text (130%)">A++</button>
+        </div>
+        <span id="aiConfigBadge" class="badge">
+          <span class="badge-dot"></span>
+          AI: Loading...
+        </span>
+        <span id="aiSpendBadge" class="badge">Spend: $0.00 / $2.00</span>
+        <span class="badge">SQLite WAL</span>
+      </div>
+    </header>
+
+    <!-- Stage Navigation Bar & Compact Project Summary -->
+    <div class="stage-nav-bar">
+      <div class="project-summary-strip">
+        <h2 id="projectTitle" class="project-title-badge">{{project_name}}</h2>
+        <div class="metrics-strip" style="margin-bottom: 0;">
+          <div class="metric-pill">
+            <span class="metric-label">Total Images:</span>
+            <span id="totalCount" class="metric-value">0</span>
+          </div>
+          <div class="metric-pill">
+            <span class="metric-label" style="color: var(--status-matched);">Matched:</span>
+            <span id="matchedCount" class="metric-value" style="color: var(--status-matched);">0</span>
+          </div>
+          <button id="manageGroupsBtn" class="metric-pill" type="button" title="View &amp; manage figure groups" style="cursor: pointer; border: 1px solid rgba(99, 102, 241, 0.4); background: rgba(99, 102, 241, 0.1);">
+            <span class="metric-label" style="color: #a5b4fc;">Figure Groups:</span>
+            <span id="groupCount" class="metric-value" style="color: #c7d2fe;">0</span>
+          </button>
+          <div class="metric-pill">
+            <span class="metric-label" style="color: var(--status-review);">Needs Review:</span>
+            <span id="reviewCount" class="metric-value" style="color: var(--status-review);">0</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 14px;">
+        <span id="reviewProgressBarText" class="nav-progress-text">Progress: 0/0 Approved (0%)</span>
+        <a id="continueExportBtn" href="/export/{{project_id}}" class="btn-primary" style="text-decoration: none;">
+          <span>Continue to Export</span>
+          <span aria-hidden="true">→</span>
+        </a>
+      </div>
+    </div>
+
+    <!-- Review & Edit Main Workspace (Direct individual-image workflow) -->
+    <main id="reviewWorkspaceSection" class="review-workspace" aria-label="Client-Friendly Review Workspace">
+      <!-- Top Review Header Card with Progress and Nav Actions -->
+      <div class="rw-header-card">
+        <div class="rw-header-info">
+          <div class="rw-heading-row">
+            <h2 id="rwImageHeading" class="rw-heading">Image Review</h2>
+            <div class="rw-meta-strip">
+              <span id="rwPageBadge" class="badge">Page 1</span>
+              <span id="rwFilenameBadge" class="badge">figure_1.png</span>
+              <span id="rwStatusBadge" class="status-pill review">Needs Review</span>
+              <span id="rwGroupBadge" class="page-badge" style="display:none; background:#6366f1;">Group</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rw-progress-wrap">
+          <div class="rw-progress-labels">
+            <span id="rwProgressLabel" class="rw-progress-label">Review Progress: 0 of 0 Approved</span>
+            <span id="rwUnresolvedIssuesCount" class="badge-review-issues" style="display:none;">0 Issues</span>
+          </div>
+          <div class="rw-progress-bar">
+            <div id="rwProgressBarFill" class="rw-progress-fill" style="width: 0%;"></div>
+          </div>
+        </div>
+
+        <div class="rw-nav-actions">
+          <button id="rwPrevBtn" class="btn-secondary" type="button" aria-label="Previous image">
+            <span>◀</span> Previous
+          </button>
+          <span id="rwImageCounter" class="rw-counter-text">1 of 1</span>
+          <button id="rwNextBtn" class="btn-secondary" type="button" aria-label="Next image">
+            Next <span>▶</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Main Review Body: Large Preview & Editorial Details -->
+      <div class="rw-body-grid">
+        <!-- Left: Prominent Extracted-Image Preview with Focus/Zoom button -->
+        <div class="rw-preview-column">
+          <div class="rw-preview-card">
+            <div class="rw-preview-wrapper">
+              <img id="rwImagePreview" class="rw-preview-img" src="" alt="Selected image asset preview" />
+            </div>
+            <div class="rw-preview-controls">
+              <button id="rwFocusPreviewBtn" class="btn-secondary btn-sm" type="button" title="View focused full-resolution preview">
+                🔍 Focus Preview
+              </button>
+              <span id="rwDimensionsText" class="rw-dims-label">Format: PNG</span>
+            </div>
+          </div>
+
+          <!-- Unresolved Caption Review Alert Box (when applicable) -->
+          <div id="rwReviewAlertBox" class="review-reasons-box" style="display: none;">
+            <div class="modal-section-title" style="color: #fbbf24;">⚠️ Review Required Before Approval</div>
+            <ul id="rwReviewReasonsList" class="reasons-list"></ul>
+          </div>
+        </div>
+
+        <!-- Right: Editorial Details (Caption, Alt-Text Draft, Actions) -->
+        <div class="rw-details-column">
+          <!-- Expandable Caption Card -->
+          <div class="rw-card">
+            <div class="rw-card-header">
+              <h3 class="rw-card-title">Source Caption</h3>
+              <button id="rwCaptionExpandBtn" class="btn-link" type="button" style="display:none;">Expand</button>
+            </div>
+            <div id="rwCaptionBlock" class="rw-caption-block has-caption">
+              <p id="rwCaptionText" class="rw-caption-text">Caption text here</p>
+            </div>
+            <div class="rw-caption-edit-wrap">
+              <input type="text" id="rwCaptionEditInput" class="input-control" placeholder="Correct or update caption..." />
+              <button id="rwSaveCaptionBtn" class="btn-secondary btn-sm" type="button">Update Caption</button>
+              <button id="rwResolveCaptionBtn" class="btn-secondary btn-sm" type="button" style="display:none; color: #10b981; border-color: rgba(16, 185, 129, 0.4);">✓ Resolve Caption Flag</button>
+            </div>
+          </div>
+
+          <!-- Alt-Text Generation & Approval Card -->
+          <div class="rw-card">
+            <div class="rw-card-header">
+              <div class="rw-card-title-wrap">
+                <h3 class="rw-card-title">Alt-Text Description</h3>
+                <span id="rwVersionBadge" class="version-tag">No Draft</span>
+              </div>
+              <div class="rw-card-header-actions" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                <button id="rwGenerateDraftBtn" class="btn-generate-primary" type="button" title="Generate AI alt-text draft for current image">
+                  <span id="rwGenSpinner" style="display:none;">⏳</span>
+                  <span id="rwGenBtnText">✨ Generate Alt Text</span>
+                </button>
+                <div class="rw-lang-wrap">
+                  <select id="rwLangSelect" class="lang-select" aria-label="Alt-text language variant">
+                    <option value="en-GB">British English</option>
+                    <option value="en-US">American English</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Contamination Warning Banner (Hidden by default) -->
+            <div id="rwContaminationAlert" class="alert-box alert-warning" style="display:none; margin: 10px 0; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #f59e0b;">
+              <div style="display:flex; align-items:center; justify-content:space-between; gap: 10px; flex-wrap:wrap;">
+                <span><strong>⚠️ Prompt Scratchpad Detected:</strong> This draft contains prompt instructions, intermediate drafts, or word counts.</span>
+                <button id="rwCleanDraftBtn" class="btn-secondary btn-sm" type="button" style="background:#f59e0b; color:#0f172a; font-weight:700; white-space:nowrap; border:none; padding:4px 10px; border-radius:4px; cursor:pointer;">✨ Clean Description</button>
+              </div>
+            </div>
+
+            <!-- Alt-Text Textarea (Large, readable typography) -->
+            <div class="rw-draft-wrap">
+              <textarea id="rwDraftTextarea" class="rw-draft-textarea" rows="4" placeholder="Generate or write alt-text description..."></textarea>
+              <div class="rw-draft-meta">
+                <span id="rwWordCountBadge" class="word-count-badge">0 words (target: 45–50)</span>
+                <div class="rw-history-wrap">
+                  <label for="rwVersionSelect" class="rw-history-label">History:</label>
+                  <select id="rwVersionSelect" class="rw-version-select" aria-label="Version history"></select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Clearly visible, multiline Follow-up instruction / Revision prompt input -->
+            <div class="rw-revision-wrap">
+              <label for="rwRevisionInput" class="rw-revision-label">Follow-up instruction / Revision prompt:</label>
+              <textarea id="rwRevisionInput" class="rw-revision-textarea" rows="2" placeholder="e.g. Describe the axis units more clearly; make it more concise; focus on visual contrast..."></textarea>
+              <div class="rw-revision-action-row">
+                <button id="rwReviseBtn" class="btn-secondary" type="button">
+                  <span id="rwReviseSpinner" style="display:none;">⏳</span>
+                  <span>✨ Revise with AI</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="rwErrorAlert" class="ai-error-box" style="display: none;"></div>
+
+            <!-- Review Actions: Regenerate, Save Draft, Approve -->
+            <div class="rw-actions-footer">
+              <button id="rwRegenerateDraftBtn" class="btn-secondary" type="button" title="Regenerate alternative AI draft">
+                <span>✨ Regenerate Draft</span>
+              </button>
+              <button id="rwSaveDraftBtn" class="btn-secondary" type="button">
+                <span>Save Draft Edit</span>
+              </button>
+              <button id="rwApproveBtn" class="btn-approve-primary" type="button">
+                <span>✓ Approve Alt Text</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Selection Dock (Floating bottom bar for cross-page grouping) -->
+    <aside id="selectionDock" class="selection-dock" role="toolbar" aria-label="Selected images dock" style="display: none;">
+      <div class="selection-dock-content">
+        <div class="selection-dock-info">
+          <span class="selection-dock-icon" aria-hidden="true">🔗</span>
+          <div class="selection-dock-text">
+            <span id="selectionCountLabel" class="selection-count-label">0 images selected</span>
+            <span id="selectionPagesLabel" class="selection-pages-label">across 0 pages</span>
+          </div>
+        </div>
+        <div class="selection-dock-actions">
+          <button id="groupSelectedBtn" class="btn-dock-primary" title="Group selected images and assign caption" disabled>
+            Group Selected
+          </button>
+          <button id="clearSelectionBtn" class="btn-dock-secondary" title="Clear current selection" aria-label="Clear selection">
+            Clear Selection
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Context Menu for Image Card (Right-click or 3-dot trigger) -->
+    <div id="imageContextMenu" class="context-menu" role="menu" aria-label="Image actions" style="display: none;">
+      <button class="context-menu-item" id="contextMenuGroupBtn" role="menuitem" tabindex="0">
+        <span class="context-menu-icon" aria-hidden="true">🔗</span>
+        <span class="context-menu-text">Group images with…</span>
+      </button>
+      <button class="context-menu-item" id="contextMenuInspectBtn" role="menuitem" tabindex="0">
+        <span class="context-menu-icon" aria-hidden="true">🔍</span>
+        <span class="context-menu-text">Inspect &amp; Alt Text</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Inspection Modal Dialog -->
+  <div id="inspectionModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <h3 id="modalTitle">Image Details</h3>
+          <p id="modalSubtitle">Page X · Placement Y</p>
+        </div>
+        <button id="modalCloseBtn" class="modal-close-btn" aria-label="Close dialog">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-preview-box">
+          <img id="modalImg" class="modal-preview-img" src="" alt="Extracted preview" />
+        </div>
+
+        <div>
+          <!-- Review Alert Box (Conditional) -->
+          <div id="modalReviewBox" class="review-reasons-box" style="display: none;">
+            <strong>⚠️ Manual Review Advised:</strong>
+            <ul id="modalReasonsList"></ul>
+          </div>
+
+          <!-- Figure Group Membership Box (Conditional) -->
+          <div id="modalGroupBox" class="modal-group-box" style="display: none;">
+            <div class="group-box-header">
+              <span class="group-box-title">Figure Group Membership</span>
+              <span id="modalGroupBadge" class="status-pill matched">Group</span>
+            </div>
+            <div id="modalGroupDetails" class="group-box-details"></div>
+            <div class="group-box-actions">
+              <button id="modalConfirmGroupBtn" class="btn-group-action confirm" type="button">✓ Confirm Group Caption</button>
+              <button id="modalRemoveFromGroupBtn" class="btn-group-action remove" type="button">Remove From Group</button>
+              <button id="modalSplitGroupBtn" class="btn-group-action split" type="button">Split Group</button>
+            </div>
+          </div>
+
+          <div class="modal-section">
+            <div class="modal-section-title">Selected Caption</div>
+            <div id="modalCaption" class="modal-caption-text"></div>
+          </div>
+
+          <!-- AI Alt-Text Generation Section -->
+          <div class="modal-section ai-generation-section">
+            <div class="modal-section-header">
+              <div class="modal-section-title">AI Alternative Text Draft</div>
+              <span id="altTextStatusBadge" class="status-pill review">Not Drafted</span>
+            </div>
+
+            <div class="ai-controls-bar">
+              <div class="ai-control-group">
+                <label for="altTextLangSelect" class="ai-control-label">Language:</label>
+                <select id="altTextLangSelect" class="ai-select-control">
+                  <option value="en-GB" selected>British English (en-GB)</option>
+                  <option value="en-US">American English (en-US)</option>
+                </select>
+              </div>
+
+              <button id="generateDraftBtn" class="btn-generate-ai" type="button">
+                <span id="genBtnSpinner" class="gen-spinner" style="display: none;">⏳</span>
+                <span id="genBtnText">Generate Alt Text</span>
+              </button>
+            </div>
+
+            <!-- Optional Custom User Prompt with Reset Action -->
+            <details class="prompt-accordion">
+              <summary class="prompt-summary">
+                <span>Prompt Configuration</span>
+                <button id="resetPromptBtn" class="btn-reset-prompt" type="button" title="Reset prompt to exact default starter prompt">Reset to Default</button>
+              </summary>
+              <textarea id="customUserPromptInput" class="custom-prompt-input" rows="3" placeholder="Leave blank to use default 45–50-word prompt..."></textarea>
+            </details>
+
+            <!-- Draft Output Textarea (Editable by human editor) -->
+            <div class="draft-textarea-wrap">
+              <textarea id="modalAltTextDraft" class="draft-textarea" rows="4" placeholder="Generated draft alt-text will appear here. Editor can inspect and refine..."></textarea>
+              <div class="draft-footer-bar">
+                <div class="word-counter-wrap">
+                  <span id="wordCountBadge" class="word-count-badge">0 words</span>
+                  <span id="wordCountAlert" class="word-count-alert"></span>
+                </div>
+                <div class="approval-action-wrap">
+                  <span id="approvalStatusTag" class="approval-tag unapproved">Draft Unapproved</span>
+                  <button id="approveDraftBtn" class="btn-approve" type="button">✓ Approve Alt Text</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Audit Provenance & Telemetry Metadata -->
+            <div id="altTextMetaWrap" class="alt-text-telemetry" style="display: none;">
+              <span id="metaModelTag" class="telemetry-pill">Model: -</span>
+              <span id="metaTokensTag" class="telemetry-pill">Tokens: -</span>
+              <span id="metaCostTag" class="telemetry-pill">Est. Cost: -</span>
+              <span id="metaDurationTag" class="telemetry-pill">Duration: -</span>
+            </div>
+
+            <div id="altTextErrorBox" class="ai-error-box" style="display: none;"></div>
+          </div>
+
+          <div class="modal-section">
+            <div class="modal-section-title">Placement Coordinates</div>
+            <div class="meta-grid">
+              <div>
+                <span class="meta-item-label">Source Page:</span>
+                <span id="metaPage" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Placement:</span>
+                <span id="metaPlacement" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Caption Position:</span>
+                <span id="metaPos" class="meta-item-value"></span>
+              </div>
+              <div>
+                <span class="meta-item-label">Bounding Box:</span>
+                <span id="metaBbox" class="meta-item-value"></span>
+              </div>
+              <div style="grid-column: 1 / -1;">
+                <span class="meta-item-label">Internal UUID:</span>
+                <span id="metaUuid" class="meta-item-value"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Candidate Text Blocks Table -->
+        <div class="candidates-table-wrap">
+          <div class="modal-section-title">Geometric Candidate Blocks &amp; Priority Scores</div>
+          <table class="candidates-table">
+            <thead>
+              <tr>
+                <th>Position</th>
+                <th>Gap</th>
+                <th>Score</th>
+                <th>Fig Prefix</th>
+                <th>Candidate Text Block</th>
+              </tr>
+            </thead>
+            <tbody id="candidatesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Focused Image Preview Lightbox Modal -->
+  <div id="focusedPreviewModal" class="modal-backdrop focused-lightbox-backdrop" role="dialog" aria-modal="true" aria-label="Focused Full Image Inspection" style="display: none;">
+    <div class="focused-lightbox-dialog">
+      <div class="focused-lightbox-header">
+        <span id="focusedPreviewTitle" class="focused-lightbox-title">Focused Image Preview</span>
+        <button id="focusedPreviewCloseBtn" class="modal-close-btn" aria-label="Close focused preview">✕</button>
+      </div>
+      <div class="focused-lightbox-body">
+        <img id="focusedPreviewImg" class="focused-lightbox-img" src="" alt="Full-size inspection preview" />
+      </div>
+      <div id="focusedPreviewCaption" class="focused-lightbox-caption"></div>
+    </div>
+  </div>
+
+  <!-- Caption Grouping Decision Modal -->
+  <div id="captionGroupingModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="groupDecisionTitle" style="display: none;">
+    <div class="modal-dialog group-decision-dialog">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <h3 id="groupDecisionTitle">Group Selected Images</h3>
+          <p id="groupDecisionSubtitle">Confirm caption association for the selected images</p>
+        </div>
+        <button id="groupDecisionCloseBtn" class="modal-close-btn" aria-label="Close dialog">✕</button>
+      </div>
+
+      <div class="modal-body group-decision-body">
+        <!-- Selected Images List Summary -->
+        <div class="group-decision-summary">
+          <div class="modal-section-title">Selected Images (<span id="groupDecisionCount">0</span>)</div>
+          <div id="groupDecisionImagesList" class="group-decision-images-list"></div>
+        </div>
+
+        <!-- Decision Options (Case A / B / C) -->
+        <div class="group-decision-section">
+          <div class="modal-section-title">Caption Association Decision</div>
+          <div id="groupDecisionOptions" class="group-decision-options">
+            <!-- Populated dynamically based on Case A, B, or C -->
+          </div>
+        </div>
+
+        <!-- Final Caption Input -->
+        <div class="group-decision-section">
+          <label for="groupFinalCaptionInput" class="modal-section-title">Final Caption to Apply</label>
+          <textarea id="groupFinalCaptionInput" class="input-control group-final-caption" rows="3" placeholder="Enter or edit final shared caption..."></textarea>
+        </div>
+
+        <div id="groupDecisionError" class="ai-error-box" style="display: none;"></div>
+      </div>
+
+      <div class="modal-footer group-decision-footer">
+        <button id="groupDecisionCancelBtn" class="btn-secondary" type="button">Cancel</button>
+        <button id="groupDecisionConfirmBtn" class="btn-primary" type="button">
+          <span id="groupConfirmSpinner" style="display:none;">⏳</span>
+          <span>Confirm Group &amp; Caption</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Figure Groups Management Modal Dialog -->
+  <div id="figureGroupsModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="figureGroupsModalTitle" style="display: none;">
+    <div class="modal-dialog figure-groups-dialog">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <h3 id="figureGroupsModalTitle">Figure Groups &amp; Shared Captions</h3>
+          <p id="figureGroupsModalSubtitle">Review, confirm, split, or remove images associated across PDF pages</p>
+        </div>
+        <button id="figureGroupsCloseBtn" class="modal-close-btn" aria-label="Close dialog">✕</button>
+      </div>
+
+      <div id="figureGroupsBody" class="figure-groups-body">
+        <p class="text-muted" style="text-align: center; padding: 24px;">No multi-image figure groups in this project.</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/review.js"></script>
+</body>
+</html>

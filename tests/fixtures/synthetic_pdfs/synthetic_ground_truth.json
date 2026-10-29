@@ -150,5 +150,29 @@
         "expected_needs_review": false
       }
     ]
+  },
+  "case9_same_page_group": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case9_same_page_group.pdf",
+    "description": "Two panels on same page sharing a combined caption",
+    "expected_items": [
+      {
+        "page": 1,
+        "expected_figure": "Figure 10",
+        "expected_group_size": 2,
+        "expected_caption": "Figure 10. Architectural elevation and plan: (a) west elevation; (b) ground plan."
+      }
+    ]
+  },
+  "case10_cross_page_group": {
+    "file": "/Users/skanakmegha/Documents/MEGHA/Personal-Development/AltTextPipeline/tests/fixtures/synthetic_pdfs/case10_cross_page_group.pdf",
+    "description": "Cross-page figure group with continuation caption spanning pages 1 and 2",
+    "expected_items": [
+      {
+        "expected_figure": "Figure 11",
+        "expected_group_size": 2,
+        "is_cross_page": true,
+        "expected_review_status": "candidate"
+      }
+    ]
   }
 }

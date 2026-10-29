@@ -410,6 +410,75 @@ def generate_synthetic_fixtures(output_dir):
         ]
     }
 
+    # ============================================================
+    # Case 9: Same-Page Figure Group (Panels a and b)
+    # ============================================================
+    p9 = os.path.join(output_dir, "case9_same_page_group.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=700)
+    page.insert_image(fitz.Rect(50, 100, 240, 280), stream=img_blue)
+    page.insert_image(fitz.Rect(260, 100, 450, 280), stream=img_green)
+    _safe_insert_textbox(
+        page,
+        fitz.Rect(50, 295, 450, 345),
+        "Figure 10. Architectural elevation and plan: (a) west elevation; (b) ground plan.",
+        fontsize=10
+    )
+    doc.save(p9)
+    doc.close()
+
+    ground_truth["case9_same_page_group"] = {
+        "file": p9,
+        "description": "Two panels on same page sharing a combined caption",
+        "expected_items": [
+            {
+                "page": 1,
+                "expected_figure": "Figure 10",
+                "expected_group_size": 2,
+                "expected_caption": "Figure 10. Architectural elevation and plan: (a) west elevation; (b) ground plan.",
+            }
+        ]
+    }
+
+    # ============================================================
+    # Case 10: Cross-Page Figure Group Candidate
+    # ============================================================
+    p10 = os.path.join(output_dir, "case10_cross_page_group.pdf")
+    doc = fitz.open()
+    # Page 1: image at bottom with initial caption
+    page1 = doc.new_page(width=500, height=700)
+    page1.insert_image(fitz.Rect(60, 450, 440, 600), stream=img_red)
+    _safe_insert_textbox(
+        page1,
+        fitz.Rect(60, 615, 440, 655),
+        "Figure 11. (a) Sanctuary complex excavation phase 1.",
+        fontsize=10
+    )
+    # Page 2: image at top with continuation caption
+    page2 = doc.new_page(width=500, height=700)
+    page2.insert_image(fitz.Rect(60, 60, 440, 210), stream=img_purple)
+    _safe_insert_textbox(
+        page2,
+        fitz.Rect(60, 225, 440, 265),
+        "Figure 11 (continued). (b) Stratigraphic profile phase 2.",
+        fontsize=10
+    )
+    doc.save(p10)
+    doc.close()
+
+    ground_truth["case10_cross_page_group"] = {
+        "file": p10,
+        "description": "Cross-page figure group with continuation caption spanning pages 1 and 2",
+        "expected_items": [
+            {
+                "expected_figure": "Figure 11",
+                "expected_group_size": 2,
+                "is_cross_page": True,
+                "expected_review_status": "candidate",
+            }
+        ]
+    }
+
     gt_path = os.path.join(output_dir, "synthetic_ground_truth.json")
     with open(gt_path, "w", encoding="utf-8") as f:
         json.dump(ground_truth, f, indent=2)

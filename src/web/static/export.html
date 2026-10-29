@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AltTextPipeline — Export to Word (DOCX)</title>
+  <meta name="description" content="Generate and download validated Word DOCX documents with approved alt text." />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Application Header -->
+    <header class="app-header">
+      <div class="brand-wrapper">
+        <div class="brand-icon" aria-hidden="true">A</div>
+        <div class="brand-titles">
+          <h1>AltTextPipeline</h1>
+          <p>Extraction Inspector &amp; Editorial Grounding Testbed</p>
+        </div>
+      </div>
+
+      <!-- Pipeline Stepper -->
+      <nav class="pipeline-stepper" aria-label="Pipeline Stages">
+        <a href="/" class="step-item" title="Upload new PDF">
+          <span class="step-badge">1</span>
+          <span>Upload &amp; Extract</span>
+        </a>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <a id="stepperReviewLink" href="/review/{{project_id}}" class="step-item" title="Back to Review &amp; Edit">
+          <span class="step-badge">2</span>
+          <span>Review &amp; Edit</span>
+        </a>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <span class="step-item active" aria-current="step">
+          <span class="step-badge">3</span>
+          <span>Export to Word</span>
+        </span>
+      </nav>
+
+      <div class="header-badges">
+        <div class="text-size-widget" role="group" aria-label="Reading text size controls">
+          <span class="text-size-label">Text:</span>
+          <button type="button" class="btn-text-size active" data-size="normal" aria-label="Normal text size" title="Normal text (100%)">A</button>
+          <button type="button" class="btn-text-size" data-size="large" aria-label="Large text size" title="Large text (115%)">A+</button>
+          <button type="button" class="btn-text-size" data-size="xlarge" aria-label="Extra large text size" title="Extra Large text (130%)">A++</button>
+        </div>
+        <span id="aiConfigBadge" class="badge">
+          <span class="badge-dot"></span>
+          AI: Loading...
+        </span>
+        <span id="aiSpendBadge" class="badge">Spend: $0.00 / $2.00</span>
+        <span class="badge">SQLite WAL</span>
+      </div>
+    </header>
+
+    <!-- Stage Navigation Bar -->
+    <div class="stage-nav-bar">
+      <div class="project-summary-strip">
+        <h2 id="projectTitle" class="project-title-badge">{{project_name}}</h2>
+        <span id="reviewSummaryBadge" class="badge">Review Status: Loading...</span>
+      </div>
+      <div>
+        <a id="backToReviewBtn" href="/review/{{project_id}}" class="btn-secondary" style="text-decoration: none;">
+          <span>◀</span> Back to Review &amp; Edit
+        </a>
+      </div>
+    </div>
+
+    <!-- Page 3: DOCX Export Section -->
+    <section id="exportSection" class="export-section" aria-label="Word DOCX Export Panel">
+      <div class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">Word Document Export (DOCX)</h2>
+          <p class="panel-subtitle">Export all approved figures, captions, and accessibility alt text in reading order into a validated Word document.</p>
+        </div>
+
+        <div class="export-grid">
+          <!-- Readiness Checklist Card -->
+          <div class="export-card">
+            <h3 class="export-card-title">Export Readiness Status</h3>
+            <div id="exportChecklist" class="export-checklist">
+              <div id="checkTotalImages" class="checklist-item">
+                <span class="check-icon" id="checkIconImages">⏳</span>
+                <span class="check-text" id="checkTextImages">Extracted Images Present</span>
+              </div>
+              <div id="checkApprovals" class="checklist-item">
+                <span class="check-icon" id="checkIconApprovals">⏳</span>
+                <span class="check-text" id="checkTextApprovals">All Alt-Text Approved</span>
+              </div>
+              <div id="checkCaptionReviews" class="checklist-item">
+                <span class="check-icon" id="checkIconReviews">⏳</span>
+                <span class="check-text" id="checkTextReviews">No Unresolved Caption Reviews</span>
+              </div>
+            </div>
+
+            <!-- Actionable explanations of unresolved items -->
+            <div id="exportBlockingAlert" class="export-blocking-alert" style="display: none;">
+              <h4 class="blocking-title">Items Preventing Export:</h4>
+              <ul id="exportBlockingList" class="blocking-list"></ul>
+            </div>
+
+            <div class="export-action-wrap">
+              <button id="startDocxExportBtn" class="btn-primary btn-lg" type="button" disabled>
+                <span>Generate &amp; Download DOCX</span>
+                <span class="btn-icon">⬇</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Export History and Recent Downloads -->
+          <div class="export-card">
+            <h3 class="export-card-title">Generated Exports</h3>
+            <div id="exportsHistoryList" class="exports-history-list">
+              <p class="text-muted">No exports generated for this project yet.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/export.js"></script>
+</body>
+</html>

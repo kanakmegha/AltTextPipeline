@@ -25,6 +25,7 @@ from .heuristics import (
     evaluate_caption_ambiguity,
 )
 from .naming import build_concise_filename, allocate_unique_filename
+from .grouping import FigureGrouper
 
 
 class ExtractionEngine:
@@ -81,7 +82,9 @@ class ExtractionEngine:
             os.makedirs(output_images_dir, exist_ok=True)
 
         used_filenames = set(existing_filenames or set())
-        extracted_images: List[ExtractedImage] = []
+        images_by_page: Dict[int, List[ExtractedImage]] = {}
+        text_blocks_by_page: Dict[int, List[Tuple]] = {}
+        page_dimensions: Dict[int, Tuple[float, float]] = {}
         errors: List[Dict[str, Any]] = []
 
         image_seq_counter = 0
@@ -90,11 +93,15 @@ class ExtractionEngine:
             if page_num < 1 or page_num > total_pages:
                 continue
 
+            page_extracted_images: List[ExtractedImage] = []
+
             try:
                 page = doc[page_num - 1]
                 page_width = page.rect.width
                 page_height = page.rect.height
                 text_blocks = page.get_text("blocks")
+                text_blocks_by_page[page_num] = text_blocks
+                page_dimensions[page_num] = (page_width, page_height)
                 image_info_list = page.get_images(full=True)
 
                 # 1. First collect all image placements on this page for boundary isolation
@@ -205,8 +212,12 @@ class ExtractionEngine:
                         review_reasons=review_reasons,
                         caption_candidates=candidates,
                         raw_caption_blocks=raw_blocks,
+                        association_type="single" if caption_found else "uncaptioned",
+                        association_confidence=1.0 if caption_found else 0.0,
                     )
-                    extracted_images.append(img_record)
+                    page_extracted_images.append(img_record)
+
+                images_by_page[page_num] = page_extracted_images
 
             except Exception as e:
                 errors.append({
@@ -216,12 +227,28 @@ class ExtractionEngine:
 
         doc.close()
 
+        # Step 3: Run Multi-Image Grouping & Cross-Page Association
+        grouper = FigureGrouper(
+            max_cluster_gap=self.max_caption_gap * 1.5,
+            max_caption_gap=self.max_caption_gap,
+            horizontal_tolerance=self.horizontal_tolerance,
+        )
+        final_images, groups = grouper.group_images_and_captions(
+            images_by_page=images_by_page,
+            text_blocks_by_page=text_blocks_by_page,
+            page_dimensions=page_dimensions,
+        )
+
         stats = {
-            "total_images": len(extracted_images),
-            "captions_found": sum(1 for img in extracted_images if img.caption_found),
-            "captions_above": sum(1 for img in extracted_images if img.caption_position == "above"),
-            "captions_below": sum(1 for img in extracted_images if img.caption_position == "below"),
-            "review_flagged": sum(1 for img in extracted_images if img.needs_caption_review),
+            "total_images": len(final_images),
+            "captions_found": sum(1 for img in final_images if img.caption_found),
+            "captions_above": sum(1 for img in final_images if img.caption_position == "above"),
+            "captions_below": sum(1 for img in final_images if img.caption_position == "below"),
+            "review_flagged": sum(1 for img in final_images if img.needs_caption_review),
+            "groups_found": len(groups),
+            "group_matched_images": sum(1 for img in final_images if img.association_type == "group"),
+            "single_matched_images": sum(1 for img in final_images if img.association_type == "single"),
+            "uncaptioned_images": sum(1 for img in final_images if img.association_type == "uncaptioned"),
             "error_count": len(errors),
         }
 
@@ -229,7 +256,8 @@ class ExtractionEngine:
             pdf_path=pdf_path,
             total_pages=total_pages,
             pages_processed=target_pages,
-            images=extracted_images,
+            images=final_images,
             errors=errors,
             stats=stats,
+            groups=groups,
         )

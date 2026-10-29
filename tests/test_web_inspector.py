@@ -91,6 +91,18 @@ def test_upload_and_extract_synthetic_pdf(web_client):
     assert img_res.headers["content-type"].startswith("image/")
     assert len(img_res.content) > 0
 
+    # Verify extraction target route loads dedicated Review page without upload form
+    review_res = client.get(f"/review/{project_id}")
+    assert review_res.status_code == 200
+    assert 'id="reviewWorkspaceSection"' in review_res.text
+    assert 'id="dropzone"' not in review_res.text
+
+    # Verify subsequent export route loads dedicated Export page without review workspace
+    export_res = client.get(f"/export/{project_id}")
+    assert export_res.status_code == 200
+    assert 'id="exportSection"' in export_res.text
+    assert 'id="reviewWorkspaceSection"' not in export_res.text
+
 
 def test_error_handling_invalid_project(web_client):
     client, _ = web_client
@@ -100,3 +112,9 @@ def test_error_handling_invalid_project(web_client):
 
     res_img = client.get("/api/projects/non-existent-uuid/images/non-existent/file")
     assert res_img.status_code == 404
+
+    res_review = client.get("/review/non-existent-uuid")
+    assert res_review.status_code == 404
+
+    res_export = client.get("/export/non-existent-uuid")
+    assert res_export.status_code == 404

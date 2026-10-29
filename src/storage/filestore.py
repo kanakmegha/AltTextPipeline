@@ -164,6 +164,8 @@ class FileStore:
             raise FileNotFoundError(f"Storage asset not found: {relative_key}")
         return path.read_bytes()
 
+    read_file = read_bytes
+
     def cleanup_project(
         self,
         project_id: str,

@@ -57,6 +57,37 @@ class CaptionCandidate:
 
 
 @dataclass
+class FigureGroup:
+    group_id: str
+    caption_text: str
+    caption_page_number: int
+    caption_position: Optional[str] = "below"
+    figure_label: Optional[str] = None
+    image_ids: List[str] = field(default_factory=list)
+    is_cross_page: bool = False
+    review_status: str = "candidate"  # "candidate" or "confirmed"
+    review_reasons: List[str] = field(default_factory=list)
+    confidence: float = 1.0
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "caption_text": self.caption_text,
+            "caption_page_number": self.caption_page_number,
+            "caption_position": self.caption_position,
+            "figure_label": self.figure_label,
+            "image_ids": self.image_ids,
+            "image_count": len(self.image_ids),
+            "is_cross_page": self.is_cross_page,
+            "review_status": self.review_status,
+            "review_reasons": self.review_reasons,
+            "confidence": round(self.confidence, 2),
+            "evidence": self.evidence,
+        }
+
+
+@dataclass
 class ExtractedImage:
     image_id: str  # Stable UUID independent of filename
     page_number: int
@@ -73,6 +104,10 @@ class ExtractedImage:
     review_reasons: List[str] = field(default_factory=list)
     caption_candidates: List[CaptionCandidate] = field(default_factory=list)
     raw_caption_blocks: List[str] = field(default_factory=list)
+    group_id: Optional[str] = None
+    association_type: str = "single"  # "single", "group", "uncaptioned"
+    association_confidence: float = 1.0
+    panel_label: Optional[str] = None
 
     def to_dict(self, include_bytes: bool = False) -> Dict[str, Any]:
         data = {
@@ -91,6 +126,10 @@ class ExtractedImage:
             "candidate_count": len(self.caption_candidates),
             "caption_candidates": [c.to_dict() for c in self.caption_candidates],
             "raw_caption_blocks": self.raw_caption_blocks,
+            "group_id": self.group_id,
+            "association_type": self.association_type,
+            "association_confidence": round(self.association_confidence, 2),
+            "panel_label": self.panel_label,
         }
         if include_bytes:
             data["byte_size"] = len(self.image_bytes)
@@ -113,6 +152,7 @@ class ExtractionResult:
     images: List[ExtractedImage]
     errors: List[Dict[str, Any]]
     stats: Dict[str, Any]
+    groups: List[FigureGroup] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -122,7 +162,9 @@ class ExtractionResult:
             "images_extracted": len(self.images),
             "captions_found": sum(1 for img in self.images if img.caption_found),
             "needs_review": sum(1 for img in self.images if img.needs_caption_review),
+            "groups_found": len(self.groups),
             "errors": self.errors,
             "images": [img.to_dict(include_bytes=True) for img in self.images],
+            "groups": [g.to_dict() for g in self.groups],
             "stats": self.stats,
         }
