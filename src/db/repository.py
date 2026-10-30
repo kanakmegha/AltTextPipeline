@@ -6,9 +6,37 @@ draft versions, approvals, background jobs, and exports.
 """
 
 import json
+import hashlib
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from .connection import DatabaseConnection
+
+
+def utc_now_iso() -> str:
+    """Returns current UTC timestamp in ISO-8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Password & session token hashing (stdlib, no extra dependency)
+# ---------------------------------------------------------------------------
+
+def _hash_password(password: str, salt: Optional[bytes] = None) -> tuple[str, str]:
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return dk.hex(), salt.hex()
+
+
+def _verify_password(password: str, expected_hash_hex: str, salt_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return secrets.compare_digest(dk.hex(), expected_hash_hex)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def utc_now_iso() -> str:
@@ -828,6 +856,98 @@ class Repository:
                 data["details"] = json.loads(data["details"] or "{}")
                 events.append(data)
             return events
+
+    # ============================================================
+    # Users & Sessions (Authentication)
+    # ============================================================
+
+    def create_user(
+        self,
+        user_id: str,
+        email: str,
+        password: str,
+    ) -> Dict[str, Any]:
+        now = utc_now_iso()
+        password_hash, password_salt = _hash_password(password)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (id, email, password_hash, password_salt, is_active, created_at)
+                VALUES (?, ?, ?, ?, 1, ?);
+                """,
+                (user_id, email, password_hash, password_salt, now)
+            )
+        return self.get_user(user_id)
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cursor = conn.execute("SELECT * FROM users WHERE id = ?;", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            cursor = conn.execute("SELECT * FROM users WHERE email = ?;", (email,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def verify_user_password(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        user = self.get_user_by_email(email)
+        if not user:
+            return None
+        if _verify_password(password, user["password_hash"], user["password_salt"]):
+            return user
+        return None
+
+    def create_session(
+        self,
+        session_id: str,
+        user_id: str,
+        token: str,
+        expires_at: str,
+    ) -> Dict[str, Any]:
+        token_hash = _hash_token(token)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (session_id, user_id, token_hash, expires_at, now := utc_now_iso())
+            )
+        return self.get_session_by_token(token)
+
+    def get_session_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        token_hash = _hash_token(token)
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM sessions WHERE token_hash = ?;",
+                (token_hash,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_session(self, token: str) -> bool:
+        token_hash = _hash_token(token)
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?;",
+                (token_hash,)
+            )
+            return cursor.rowcount > 0
+
+    def cleanup_expired_sessions(self) -> int:
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE expires_at < ?;",
+                (now,)
+            )
+            return cursor.rowcount or 0
+
+    # ============================================================
+    # Figure Grouping (existing)
+    # ============================================================
 
     def create_group_from_selection(
         self,

@@ -4,16 +4,22 @@ Extraction Inspector - FastAPI Application
 Local web interface allowing editors and engineers to upload PDFs, run the
 Phase 2 modular extraction engine, view extracted assets and captions, and inspect
 geometric candidates and review flags.
+
+Production deployment on Vercel uses PostgreSQL + Vercel Blob storage via the
+connection/storage factories. Local development uses SQLite + local disk via
+run_inspector.py.
 """
 
 import json
 import logging
 import os
 import uuid
+import secrets
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,10 +27,14 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("alttext.web")
 
-from src.db.connection import DatabaseConnection
-from src.db.migrations import apply_migrations
+from src.db.connection_factory import create_connection
+from src.storage.storage_factory import create_storage
+from src.db.migrations import apply_migrations as sqlite_apply_migrations
+from src.db.postgres_migrations import apply_migrations as postgres_apply_migrations
 from src.db.repository import Repository
+from src.db.postgres_repository import PostgresRepository
 from src.storage.filestore import FileStore
+from src.storage.base_storage import BaseStorage
 from src.extraction.engine import ExtractionEngine
 from src.ai.config import AIConfig
 from src.ai.providers import AIProvider, HuggingFaceInferenceProvider, MockAIProvider
@@ -37,12 +47,13 @@ from src.ai.prompts import (
 )
 from src.ai.cleaner import clean_alt_text_response, is_contaminated_alt_text
 from src.export import check_export_eligibility, export_project_docx, DocxBuilder, ExportValidationError
+from src.web import auth
 
 
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+STATIC_DIR = BASE_DIR / "src" / "web" / "static"
 DEFAULT_DB_PATH = str(BASE_DIR / "data" / "pipeline.db")
 DEFAULT_STORAGE_DIR = str(BASE_DIR / "data" / "storage")
-STATIC_DIR = BASE_DIR / "src" / "web" / "static"
 
 
 class GenerateRequestPayload(BaseModel):
@@ -76,7 +87,7 @@ class ImageAssociationUpdatePayload(BaseModel):
 
 class CaptionUpdatePayload(BaseModel):
     caption: Optional[str] = None
-    needs_review: Optional[bool] = None
+    needs_caption_review: Optional[bool] = None
     resolve_review: Optional[bool] = False
 
 
@@ -91,13 +102,36 @@ class ApproveRequestPayload(BaseModel):
     alt_text: Optional[str] = None
 
 
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
 
 def create_app(
-    db_path: str = DEFAULT_DB_PATH,
-    storage_dir: str = DEFAULT_STORAGE_DIR,
+    db_conn=None,
+    storage=None,
     ai_provider: Optional[AIProvider] = None,
     ai_config: Optional[AIConfig] = None,
+    # Backward-compatible parameters for existing tests and local dev
+    db_path: Optional[str] = None,
+    storage_dir: Optional[str] = None,
 ) -> FastAPI:
+    """
+    Creates and configures the FastAPI application.
+
+    Parameters
+    ----------
+    db_conn : DatabaseConnection | PostgresConnection, optional
+        Database connection. If None, one is created from DATABASE_URL (Postgres)
+        or DB_PATH (SQLite) environment variables, or from db_path.
+    storage : BaseStorage | FileStore, optional
+        Storage backend. If None, one is created from BLOB_READ_WRITE_TOKEN
+        (Vercel Blob) or STORAGE_DIR (local) environment variables, or from storage_dir.
+    db_path : str, optional
+        Path to SQLite database (backward compat, local dev only).
+    storage_dir : str, optional
+        Path to local storage directory (backward compat, local dev only).
+    """
     app = FastAPI(
         title="AltTextPipeline - Extraction Inspector",
         description="Local web interface to inspect image extraction, caption matching, and alt-text generation",
@@ -112,10 +146,37 @@ def create_app(
         allow_headers=["*"],
     )
 
-    db_conn = DatabaseConnection(db_path)
-    apply_migrations(db_conn)
-    repo = Repository(db_conn)
-    filestore = FileStore(storage_dir)
+    # ------------------------------------------------------------------
+    # Database & storage initialization
+    # ------------------------------------------------------------------
+    if db_conn is None:
+        backend = "postgres" if os.environ.get("DATABASE_URL") else "sqlite"
+        if backend == "postgres":
+            db_conn = create_connection(backend="postgres")
+        else:
+            # Backward compat: use db_path if provided
+            effective_db_path = db_path or os.environ.get("DB_PATH", DEFAULT_DB_PATH)
+            db_conn = create_connection(backend="sqlite", db_path=effective_db_path)
+
+    if storage is None:
+        # Backward compat: use storage_dir if provided
+        effective_storage_dir = storage_dir or os.environ.get("STORAGE_DIR", DEFAULT_STORAGE_DIR)
+        storage = create_storage(backend="local", base_dir=effective_storage_dir)
+
+    # Run migrations appropriate to the backend
+    if type(db_conn).__name__ == "PostgresConnection":
+        postgres_apply_migrations(db_conn)
+        if auth.AUTH_ENABLED:
+            auth.ensure_auth_schema(db_conn)
+        repo = PostgresRepository(db_conn)
+    else:
+        sqlite_apply_migrations(db_conn)
+        if auth.AUTH_ENABLED:
+            auth.ensure_auth_schema(db_conn)
+        repo = Repository(db_conn)
+
+    filestore = storage
+
     engine = ExtractionEngine()
 
     cfg = ai_config or AIConfig.from_env()
@@ -126,11 +187,9 @@ def create_app(
     elif cfg.is_configured():
         provider = HuggingFaceInferenceProvider(cfg)
     else:
-        # Graceful fallback: Mock provider for offline local testing
         provider = MockAIProvider(provider_name=cfg.hf_provider, model_name=cfg.hf_model)
 
     budget_tracker = BudgetTracker(max_monthly_spend_usd=cfg.max_monthly_spend_usd)
-    # Hydrate budget tracker from database ledger if records exist
     total_db_usage = repo.get_total_ai_usage()
     if total_db_usage and total_db_usage.get("total_cost_usd"):
         budget_tracker.total_spend_usd = total_db_usage["total_cost_usd"]
@@ -155,10 +214,119 @@ def create_app(
     app.state.ai_provider = provider
     app.state.budget_tracker = budget_tracker
     app.state.generator = generator
+    app.state.storage = storage
 
     # Mount static assets
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    # ------------------------------------------------------------------
+    # Authentication middleware
+    # ------------------------------------------------------------------
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        request.state.repo = repo
+
+        if auth.AUTH_ENABLED and not auth._is_public_path(request.url.path):
+            if request.url.path.startswith("/api/"):
+                try:
+                    user = auth.require_auth(request)
+                    request.state.user = user
+                except HTTPException as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                        headers=exc.headers or {},
+                    )
+            else:
+                request.state.user = None
+        else:
+            request.state.user = (
+                auth.require_auth(request)
+                if auth.AUTH_ENABLED
+                else {"id": "dev", "email": "dev@local", "is_active": True}
+            )
+
+        response = await call_next(request)
+        return response
+
+    # ------------------------------------------------------------------
+    # Auth endpoints
+    # ------------------------------------------------------------------
+    @app.post("/api/auth/login")
+    async def login(payload: LoginPayload):
+        if not auth.AUTH_ENABLED:
+            return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
+
+        user = repo.verify_user_password(payload.email, payload.password)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        token = auth._make_session_token()
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=auth.SESSION_COOKIE_MAX_AGE)).isoformat()
+        session_id = str(uuid.uuid4())
+        repo.create_session(session_id, user["id"], token, expires_at)
+
+        signed_token = auth._sign(token)
+        csrf_token = secrets.token_urlsafe(16)
+
+        response = JSONResponse(
+            {"status": "logged_in", "user": {"id": user["id"], "email": user["email"]}}
+        )
+        response.set_cookie(
+            key=auth.SESSION_COOKIE_NAME,
+            value=signed_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=auth.SESSION_COOKIE_MAX_AGE,
+            path="/",
+        )
+        response.set_cookie(
+            key=auth.CSRF_TOKEN_NAME,
+            value=csrf_token,
+            httponly=False,
+            secure=True,
+            samesite="lax",
+            max_age=auth.SESSION_COOKIE_MAX_AGE,
+            path="/",
+        )
+        return response
+
+    @app.post("/api/auth/logout")
+    async def logout(request: Request):
+        if not auth.AUTH_ENABLED:
+            return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
+        token = auth.get_session_cookie(request)
+        if token:
+            repo.delete_session(token)
+        response = JSONResponse({"status": "logged_out"})
+        response.delete_cookie(key=auth.SESSION_COOKIE_NAME, path="/")
+        response.delete_cookie(key=auth.CSRF_TOKEN_NAME, path="/")
+        return response
+
+    @app.get("/api/auth/session")
+    async def get_session(request: Request):
+        if not auth.AUTH_ENABLED:
+            return JSONResponse({"auth_enabled": False, "user": {"id": "dev", "email": "dev@local"}})
+        try:
+            user = auth.require_auth(request)
+            return JSONResponse({"auth_enabled": True, "user": {"id": user["id"], "email": user["email"]}})
+        except HTTPException:
+            return JSONResponse({"auth_enabled": True, "user": None}, status_code=401)
+
+    @app.get("/api/auth/csrf-token")
+    async def get_csrf_token(request: Request):
+        if not auth.AUTH_ENABLED:
+            return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
+        existing = request.cookies.get(auth.CSRF_TOKEN_NAME)
+        if not existing:
+            existing = secrets.token_urlsafe(16)
+        return JSONResponse({"csrf_token": existing})
+
+    # ------------------------------------------------------------------
+    # Existing routes
+    # ------------------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
     async def index_page():
@@ -193,7 +361,7 @@ def create_app(
 
     @app.get("/api/health")
     async def health_check():
-        return {"status": "ok", "app": "Extraction Inspector", "version": "0.3.0"}
+        return {"status": "ok", "app": "Extraction Inspector", "version": "0.4.0"}
 
     @app.get("/api/sample-pdf-available")
     async def sample_pdf_available():
@@ -253,17 +421,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="Image asset not found")
 
         try:
-            target_path = filestore.resolve_path(project_id, asset["file_storage_key"])
-            if not target_path.exists():
-                raise HTTPException(status_code=404, detail="Image binary not found on disk")
+            data = filestore.read_bytes(project_id, asset["file_storage_key"])
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Image binary not found in storage")
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
         media_type = f"image/{asset['image_format']}" if asset["image_format"] != "jpg" else "image/jpeg"
-        return FileResponse(
-            path=str(target_path),
+        return Response(
+            content=data,
             media_type=media_type,
-            filename=asset["suggested_filename"]
+            headers={"Content-Disposition": f'inline; filename="{asset["suggested_filename"]}"'}
         )
 
     @app.post("/api/upload-and-extract")
@@ -275,26 +443,34 @@ def create_app(
     ):
         """
         Uploads a PDF (or uses the local sample 40345.pdf) and executes extraction.
+        In production (Vercel), the sample PDF is not available; users must upload.
         """
         project_id = str(uuid.uuid4())
 
-        # Determine source PDF
         if use_sample_pdf:
             sample_path = BASE_DIR / "40345.pdf"
             if not sample_path.exists():
-                raise HTTPException(status_code=400, detail="Local sample PDF (40345.pdf) not found.")
+                raise HTTPException(status_code=400, detail="Sample PDF not available in this deployment.")
             source_bytes = sample_path.read_bytes()
             original_filename = "40345.pdf"
         elif file is not None:
+            if not file.filename or not file.filename.lower().endswith(".pdf"):
+                raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
             source_bytes = await file.read()
-            original_filename = file.filename or "uploaded.pdf"
+            original_filename = file.filename
         else:
             raise HTTPException(status_code=400, detail="Must provide a PDF file or select use_sample_pdf=true")
 
         if len(source_bytes) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        # Save source PDF in isolated FileStore
+        max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+        if len(source_bytes) > max_upload_mb * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {max_upload_mb} MB."
+            )
+
         rel_key, checksum, _ = filestore.save_source_pdf(
             project_id=project_id,
             source_path_or_bytes=source_bytes,
@@ -312,26 +488,27 @@ def create_app(
             status="extracting"
         )
 
-        # Parse target page numbers if provided
         target_page_numbers: Optional[List[int]] = None
         if pages and pages.strip():
             try:
-                # Handle comma-separated and space-separated
                 cleaned_pages = pages.replace(",", " ")
                 target_page_numbers = [int(p) for p in cleaned_pages.split() if p.isdigit()]
             except ValueError:
                 target_page_numbers = None
 
-        source_abs_path = str(filestore.resolve_path(project_id, rel_key))
-
+        import tempfile
+        tmp_pdf_path = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(source_bytes)
+                tmp_pdf_path = tmp.name
+
             extraction_res = engine.process_pdf(
-                pdf_path=source_abs_path,
+                pdf_path=tmp_pdf_path,
                 page_numbers=target_page_numbers,
-                output_images_dir=None # Keep extraction purely memory to FileStore
+                output_images_dir=None
             )
 
-            # Persist figure groups
             for grp in extraction_res.groups:
                 repo.create_figure_group(
                     group_id=grp.group_id,
@@ -345,7 +522,6 @@ def create_app(
                     review_reasons=grp.review_reasons,
                 )
 
-            # Persist each extracted image into FileStore and Database
             for img in extraction_res.images:
                 img_key, img_checksum, _ = filestore.save_image(
                     project_id=project_id,
@@ -381,11 +557,16 @@ def create_app(
         except Exception as e:
             repo.update_project_status(project_id, status="failed")
             raise HTTPException(status_code=500, detail=f"Extraction failure: {repr(e)}")
+        finally:
+            if tmp_pdf_path and os.path.exists(tmp_pdf_path):
+                try:
+                    os.unlink(tmp_pdf_path)
+                except OSError:
+                    pass
 
         saved_images = repo.list_project_images(project_id)
         saved_groups = repo.list_project_groups(project_id)
 
-        # Include candidate diagnostic details for frontend inspection
         img_dict_map = {img.image_id: [c.to_dict() for c in img.caption_candidates] for img in extraction_res.images}
         for item in saved_images:
             item["caption_candidates"] = img_dict_map.get(item["id"], [])
@@ -415,7 +596,6 @@ def create_app(
 
     @app.get("/api/ai/config")
     async def get_ai_config():
-        """Returns safe, secret-redacted provider, model configuration, and prompt defaults."""
         data = app.state.ai_config.to_safe_dict()
         is_mock = isinstance(app.state.ai_provider, MockAIProvider)
         is_configured = app.state.ai_config.is_configured() and not is_mock
@@ -432,12 +612,10 @@ def create_app(
 
     @app.get("/api/ai/budget")
     async def get_ai_budget():
-        """Returns budget tracker summary for spend badges and limits."""
         return app.state.budget_tracker.get_summary()
 
     @app.get("/api/ai/usage")
     async def get_ai_usage():
-        """Returns cumulative spend, remaining budget, and token ledger summary."""
         tracker_summary = app.state.budget_tracker.get_summary()
         ledger_total = app.state.repo.get_total_ai_usage()
         return {
@@ -447,7 +625,6 @@ def create_app(
 
     @app.get("/api/projects/{project_id}/images/{image_id}/versions")
     async def get_image_versions(project_id: str, image_id: str):
-        """Returns version history and latest draft for an image."""
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -484,10 +661,6 @@ def create_app(
         image_id: str,
         payload: Optional[GenerateRequestPayload] = None,
     ):
-        """
-        Generates a new alt-text draft for an image asset.
-        Strictly preserves prior drafts and NEVER automatically approves.
-        """
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -708,7 +881,6 @@ def create_app(
         else:
             reasons = []
 
-        # Helper for isolating caption-specific review reasons
         def _is_caption_reason(r: str) -> bool:
             r_lower = r.lower()
             return any(kw in r_lower for kw in [
@@ -716,11 +888,10 @@ def create_app(
                 "competing figure", "post-approval", "no caption found"
             ])
 
-        # Explicit resolution or manual flag control
-        if payload.resolve_review or payload.needs_review is False:
+        if payload.resolve_review or payload.needs_caption_review is False:
             needs_review = False
             reasons = [r for r in reasons if not _is_caption_reason(r)]
-        elif payload.needs_review is True:
+        elif payload.needs_caption_review is True:
             needs_review = True
         elif caption_changed and approval:
             needs_review = True
@@ -740,8 +911,7 @@ def create_app(
             review_reasons=reasons,
         )
 
-        # Record audit event for traceability
-        event_type = "caption_review_resolved" if (payload.resolve_review or payload.needs_review is False) else "caption_updated"
+        event_type = "caption_review_resolved" if (payload.resolve_review or payload.needs_caption_review is False) else "caption_updated"
         audit_details = {
             "prior_caption": old_caption,
             "new_caption": new_caption,
@@ -749,7 +919,7 @@ def create_app(
             "new_needs_review": needs_review,
             "prior_reasons": asset.get("review_reasons", []),
             "new_reasons": reasons,
-            "resolved": bool(payload.resolve_review or payload.needs_review is False),
+            "resolved": bool(payload.resolve_review or payload.needs_caption_review is False),
         }
         repo.record_audit_event(
             event_id=str(uuid.uuid4()),
@@ -796,10 +966,6 @@ def create_app(
         image_id: str,
         payload: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Extracts a clean, trustworthy alt-text description from a contaminated draft
-        without silently overwriting or automatically approving anything.
-        """
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -833,7 +999,6 @@ def create_app(
 
         version_id = payload.version_id if payload and payload.version_id else None
 
-        # If custom text was provided on approve, create/pin version
         if payload and payload.alt_text:
             latest = repo.get_latest_version(image_id)
             if not latest or latest["text"].strip() != payload.alt_text.strip():
@@ -869,7 +1034,6 @@ def create_app(
         )
         repo.update_image_status(image_id, "approved")
 
-        # Clear caption review warning upon conscious approval
         raw_reasons = asset.get("review_reasons")
         if isinstance(raw_reasons, list):
             reasons = raw_reasons
@@ -902,6 +1066,7 @@ def create_app(
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
         eligibility = check_export_eligibility(repo, project_id)
+
         def _enrich_export_item(exp: Dict[str, Any]) -> Dict[str, Any]:
             exp["download_url"] = f"/api/projects/{project_id}/exports/{exp['id']}/download"
             if not exp.get("filename"):
@@ -913,11 +1078,9 @@ def create_app(
 
             if not exp.get("size_bytes") and not exp.get("byte_size"):
                 try:
-                    fpath = filestore.resolve_path(project_id, exp["file_storage_key"])
-                    import os
-                    size = os.path.getsize(fpath)
-                    exp["size_bytes"] = size
-                    exp["byte_size"] = size
+                    data = filestore.read_bytes(project_id, exp["file_storage_key"])
+                    exp["size_bytes"] = len(data)
+                    exp["byte_size"] = len(data)
                 except Exception:
                     pass
             elif not exp.get("size_bytes"):
@@ -928,9 +1091,10 @@ def create_app(
             fc = exp.get("figure_count")
             if fc is None or fc == 0:
                 try:
-                    fpath = filestore.resolve_path(project_id, exp["file_storage_key"])
                     import zipfile
-                    with zipfile.ZipFile(fpath, "r") as z:
+                    import io as _io
+                    data = filestore.read_bytes(project_id, exp["file_storage_key"])
+                    with zipfile.ZipFile(_io.BytesIO(data), "r") as z:
                         media_files = [n for n in z.namelist() if n.startswith("word/media/")]
                         if media_files:
                             fc = len(media_files)
@@ -1008,25 +1172,22 @@ def create_app(
             raise HTTPException(status_code=404, detail="Export not found")
 
         try:
-            file_path = filestore.resolve_path(project_id, export_record["file_storage_key"])
+            data = filestore.read_bytes(project_id, export_record["file_storage_key"])
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Export file missing from storage")
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"File asset missing: {e}")
 
-        if not file_path.exists():
-            raise HTTPException(status_code=404, detail="Export file missing from disk")
-
-        # Mark delivered
         repo.update_export_status(export_id, status="delivered", mark_delivered=True)
 
         filename = Path(export_record["file_storage_key"]).name
-        # Strip export_id prefix if present
         if filename.startswith(f"{export_id}_"):
             filename = filename[len(f"{export_id}_"):]
 
-        return FileResponse(
-            path=str(file_path),
+        return Response(
+            content=data,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename=filename,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     return app
