@@ -2,6 +2,8 @@
 
 An editorial workspace and pipeline for extracting images and matching captions from digitally generated book PDFs, generating alt text with AI, and managing iterative editorial review through to Word document export.
 
+For production direct-to-Blob uploads and the Render extraction worker, see [the deployment guide](docs/deployment/render-worker.md).
+
 ---
 
 ## Quick Start: Extraction Inspector & Alt-Text Generation

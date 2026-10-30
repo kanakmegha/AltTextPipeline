@@ -262,4 +262,73 @@ def apply_migrations(db: PostgresConnection) -> int:
                     "CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);"
                 )
 
+    # Migration 6: Upload keys table for direct-to-Blob uploads
+    if current_version < 6:
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS upload_keys (
+                        id TEXT PRIMARY KEY,
+                        upload_key TEXT NOT NULL UNIQUE,
+                        project_id TEXT,
+                        status TEXT NOT NULL DEFAULT 'uploading',
+                        owner_id TEXT,
+                        filename TEXT NOT NULL DEFAULT 'upload.pdf',
+                        expected_size INTEGER NOT NULL DEFAULT 0,
+                        blob_key TEXT,
+                        token_issued BOOLEAN NOT NULL DEFAULT FALSE,
+                        content_type TEXT NOT NULL,
+                        source_storage_key TEXT,
+                        source_checksum TEXT,
+                        source_size INTEGER,
+                        total_chunks INTEGER,
+                        chunk_size INTEGER,
+                        uploaded_chunks INTEGER DEFAULT 0,
+                        temp_dir TEXT,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        error_message TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_upload_keys_status ON upload_keys(status);"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_upload_keys_project ON upload_keys(project_id);"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_upload_keys_expires ON upload_keys(expires_at);"
+                )
+        _record_version(db, 6)
+        current_version = 6
+
+    if current_version < 7:
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute("ALTER TABLE upload_keys ADD COLUMN IF NOT EXISTS owner_id TEXT;")
+                cur.execute("ALTER TABLE upload_keys ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT 'upload.pdf';")
+                cur.execute("ALTER TABLE upload_keys ADD COLUMN IF NOT EXISTS expected_size BIGINT NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE upload_keys ADD COLUMN IF NOT EXISTS blob_key TEXT;")
+                cur.execute("ALTER TABLE upload_keys ADD COLUMN IF NOT EXISTS token_issued BOOLEAN NOT NULL DEFAULT FALSE;")
+        _record_version(db, 7)
+        current_version = 7
+
+    if current_version < 8:
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_updated_at TIMESTAMPTZ;")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_image_project_dedupe ON image_assets(project_id, page_number, xref, placement_index);")
+        _record_version(db, 8)
+        current_version = 8
+
+    if current_version < 9:
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS page_numbers TEXT;")
+        _record_version(db, 9)
+        current_version = 9
+
     return current_version

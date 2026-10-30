@@ -202,4 +202,85 @@ def apply_migrations(db: DatabaseConnection) -> int:
         if existing_project_cols:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);")
 
+        # Migration 6: Upload keys table for direct-to-Blob uploads
+        if current_version < 6:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS upload_keys (
+                    id TEXT PRIMARY KEY,
+                    upload_key TEXT NOT NULL UNIQUE,
+                    project_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'uploading',
+                    owner_id TEXT,
+                    filename TEXT NOT NULL DEFAULT 'upload.pdf',
+                    expected_size INTEGER NOT NULL DEFAULT 0,
+                    blob_key TEXT,
+                    token_issued INTEGER NOT NULL DEFAULT 0,
+                    content_type TEXT NOT NULL,
+                    source_storage_key TEXT,
+                    source_checksum TEXT,
+                    source_size INTEGER,
+                    total_chunks INTEGER,
+                    chunk_size INTEGER,
+                    uploaded_chunks INTEGER DEFAULT 0,
+                    temp_dir TEXT,
+                    expires_at TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_keys_status ON upload_keys(status);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_keys_project ON upload_keys(project_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_keys_expires ON upload_keys(expires_at);")
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);",
+                (6, now_iso)
+            )
+            current_version = 6
+
+        # Migration 7: durable upload intent and worker retry metadata
+        if current_version < 7:
+            cursor = conn.execute("PRAGMA table_info(upload_keys);")
+            existing = {col[1] for col in cursor.fetchall()}
+            for name, definition in (
+                ("owner_id", "TEXT"),
+                ("filename", "TEXT NOT NULL DEFAULT 'upload.pdf'"),
+                ("expected_size", "INTEGER NOT NULL DEFAULT 0"),
+                ("blob_key", "TEXT"),
+                ("token_issued", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE upload_keys ADD COLUMN {name} {definition};")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (7, now_iso))
+            current_version = 7
+
+        if current_version < 8:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
+            if "jobs" in tables:
+                cursor = conn.execute("PRAGMA table_info(jobs);")
+                existing = {col[1] for col in cursor.fetchall()}
+                if "lease_updated_at" not in existing:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN lease_updated_at TEXT;")
+            if "image_assets" in tables:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_image_project_dedupe ON image_assets(project_id, page_number, xref, placement_index);")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (8, now_iso))
+            current_version = 8
+
+        if current_version < 9:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
+            if "jobs" in tables:
+                cursor = conn.execute("PRAGMA table_info(jobs);")
+                existing = {col[1] for col in cursor.fetchall()}
+                if "page_numbers" not in existing:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN page_numbers TEXT;")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (9, now_iso))
+            current_version = 9
+
     return current_version

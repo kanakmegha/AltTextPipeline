@@ -15,6 +15,7 @@ behavior, adapted for PostgreSQL:
 import json
 import hashlib
 import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from .postgres_connection import PostgresConnection
@@ -134,6 +135,13 @@ class PostgresRepository:
         with self.db.session() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, tuple(values))
+        return self.get_project(project_id)
+
+    def update_project_source_checksum(self, project_id: str, checksum: str):
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE projects SET source_checksum=%s, updated_at=%s WHERE id=%s;",
+                            (checksum, utc_now_iso(), project_id))
         return self.get_project(project_id)
 
     def list_projects(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -728,6 +736,7 @@ class PostgresRepository:
         image_id: Optional[str] = None,
         page_start: Optional[int] = None,
         page_end: Optional[int] = None,
+        page_numbers: Optional[List[int]] = None,
         max_attempts: int = 3
     ) -> Dict[str, Any]:
         now = utc_now_iso()
@@ -736,13 +745,67 @@ class PostgresRepository:
                 cur.execute(
                     """
                     INSERT INTO jobs (
-                        id, project_id, image_id, job_type, page_start, page_end,
+                        id, project_id, image_id, job_type, page_start, page_end, page_numbers,
                         status, attempt_count, max_attempts, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, 'queued', 0, %s, %s);
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, %s);
                     """,
-                    (job_id, project_id, image_id, job_type, page_start, page_end, max_attempts, now)
+                    (job_id, project_id, image_id, job_type, page_start, page_end,
+                     json.dumps(page_numbers) if page_numbers else None, max_attempts, now)
                 )
         return self.get_job(job_id)
+
+    def claim_job(self, job_id: str, stale_before: str, now: str) -> Optional[Dict[str, Any]]:
+        """Atomically claim a queued job or reclaim an abandoned running job."""
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE jobs SET status='running', attempt_count=attempt_count+1,
+                       started_at=COALESCE(started_at, %s), lease_updated_at=%s, error_message=NULL
+                       WHERE id=%s AND attempt_count < max_attempts
+                       AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < %s));""",
+                    (now, now, job_id, stale_before),
+                )
+                claimed = cur.rowcount == 1
+        return self.get_job(job_id) if claimed else None
+
+    def list_recoverable_jobs(self, stale_before: str, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id FROM jobs WHERE job_type='extraction' AND attempt_count < max_attempts
+                       AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < %s))
+                       ORDER BY created_at LIMIT %s;""", (stale_before, limit)
+                )
+                ids = [row["id"] for row in cur.fetchall()]
+        return [job for job_id in ids if (job := self.get_job(job_id))]
+
+    def fail_exhausted_jobs(self, stale_before: str) -> List[str]:
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT project_id FROM jobs WHERE job_type='extraction' AND status='running' AND attempt_count >= max_attempts AND COALESCE(lease_updated_at, started_at) < %s;",
+                    (stale_before,),
+                )
+                projects = sorted({row["project_id"] for row in cur.fetchall()})
+                cur.execute(
+                    "UPDATE jobs SET status='failed', error_message='Worker stopped during final retry', completed_at=%s WHERE job_type='extraction' AND status='running' AND attempt_count >= max_attempts AND COALESCE(lease_updated_at, started_at) < %s;",
+                    (now, stale_before),
+                )
+        for project_id in projects:
+            self.update_project_status(project_id, status="failed")
+        return projects
+
+    def find_image_asset_by_source(self, project_id: str, page_number: int, xref: int, placement_index: int):
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM image_assets WHERE project_id=%s AND page_number=%s AND xref=%s AND placement_index=%s LIMIT 1;",
+                    (project_id, page_number, xref, placement_index),
+                )
+                row = cur.fetchone()
+                image_id = row["id"] if row else None
+        return self.get_image_asset(image_id) if image_id else None
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self.db.session() as conn:
@@ -755,6 +818,7 @@ class PostgresRepository:
                 data["started_at"] = _to_iso(data.get("started_at"))
                 data["completed_at"] = _to_iso(data.get("completed_at"))
                 data["created_at"] = _to_iso(data.get("created_at"))
+                data["page_numbers"] = json.loads(data["page_numbers"]) if data.get("page_numbers") else None
                 return data
 
     def update_job_status(
@@ -782,10 +846,11 @@ class PostgresRepository:
                         attempt_count = %s,
                         error_message = %s,
                         started_at = COALESCE(started_at, %s),
-                        completed_at = %s
+                        completed_at = %s,
+                        lease_updated_at = CASE WHEN %s = 'running' THEN %s ELSE lease_updated_at END
                     WHERE id = %s;
                     """,
-                    (status, attempts, error_message, started_at, completed_at, job_id)
+                    (status, attempts, error_message, started_at, completed_at, status, now, job_id)
                 )
         return self.get_job(job_id)
 
@@ -800,6 +865,7 @@ class PostgresRepository:
                     data["started_at"] = _to_iso(data.get("started_at"))
                     data["completed_at"] = _to_iso(data.get("completed_at"))
                     data["created_at"] = _to_iso(data.get("created_at"))
+                    data["page_numbers"] = json.loads(data["page_numbers"]) if data.get("page_numbers") else None
                     result.append(data)
                 return result
 
@@ -1359,3 +1425,234 @@ class PostgresRepository:
             "flagged_for_review": flagged_image_ids,
             "audit_event_id": grp_audit_id,
         }
+
+    # ============================================================
+    # Upload Keys (Direct-to-Blob Upload Tracking)
+    # ============================================================
+
+    def create_upload_key(
+        self,
+        upload_key: str,
+        content_type: str,
+        expires_at: str,
+        owner_id: Optional[str] = None,
+        filename: str = "upload.pdf",
+        expected_size: int = 0,
+        blob_key: Optional[str] = None,
+        total_chunks: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a pending upload key record for direct-to-Blob upload."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO upload_keys (
+                        id, upload_key, project_id, status, content_type,
+                        owner_id, filename, expected_size, blob_key,
+                        source_storage_key, source_checksum, source_size,
+                        total_chunks, chunk_size, uploaded_chunks, temp_dir,
+                        expires_at, error_message, created_at, updated_at
+                    ) VALUES (%s, %s, NULL, 'uploading', %s, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s, 0, NULL, %s, NULL, %s, %s);
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        upload_key,
+                        content_type,
+                        owner_id,
+                        filename,
+                        expected_size,
+                        blob_key,
+                        total_chunks,
+                        chunk_size,
+                        expires_at,
+                        now,
+                        now,
+                    )
+                )
+        return self.get_upload_key(upload_key)
+
+    def claim_upload_token(self, upload_key: str, owner_id: Optional[str], now: str) -> bool:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_keys SET token_issued=TRUE, updated_at=%s WHERE upload_key=%s AND status='uploading' AND token_issued=FALSE AND expires_at>%s AND owner_id IS NOT DISTINCT FROM %s;",
+                    (now, upload_key, now, owner_id),
+                )
+                return cur.rowcount == 1
+
+    def claim_upload_finalization(self, upload_key: str, owner_id: Optional[str], now: str) -> bool:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_keys SET status='finalizing', updated_at=%s WHERE upload_key=%s AND status='uploading' AND token_issued=TRUE AND owner_id IS NOT DISTINCT FROM %s AND expires_at>%s;",
+                    (now, upload_key, owner_id, now),
+                )
+                return cur.rowcount == 1
+
+    def finalize_upload_project(self, *, upload_key, project_id, job_id, owner_id,
+                                name, source_filename, source_storage_key,
+                                source_checksum, source_size, page_start=None, page_end=None, page_numbers=None):
+        """Atomically create project/job and consume the upload intent."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO projects (id,name,source_filename,source_storage_key,source_checksum,
+                       language_variant,status,cleanup_status,owner_id,created_at,updated_at)
+                       VALUES (%s,%s,%s,%s,%s,'en-GB','queued','retained',%s,%s,%s) ON CONFLICT(id) DO NOTHING;""",
+                    (project_id, name, source_filename, source_storage_key, source_checksum, owner_id, now, now),
+                )
+                cur.execute(
+                    """INSERT INTO jobs (id,project_id,job_type,page_start,page_end,page_numbers,status,attempt_count,max_attempts,created_at)
+                       VALUES (%s,%s,'extraction',%s,%s,%s,'queued',0,3,%s) ON CONFLICT(id) DO NOTHING;""",
+                    (job_id, project_id, page_start, page_end,
+                     json.dumps(page_numbers) if page_numbers else None, now),
+                )
+                cur.execute(
+                    """UPDATE upload_keys SET status='completed',project_id=%s,source_storage_key=%s,
+                       source_checksum=%s,source_size=%s,updated_at=%s WHERE upload_key=%s
+                       AND owner_id IS NOT DISTINCT FROM %s AND status IN ('finalizing','completed');""",
+                    (project_id, source_storage_key, source_checksum, source_size, now, upload_key, owner_id),
+                )
+        return {"project": self.get_project(project_id), "job": self.get_job(job_id)}
+
+    def get_upload_key(self, upload_key: str) -> Optional[Dict[str, Any]]:
+        """Get upload key record by upload_key."""
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM upload_keys WHERE upload_key = %s;",
+                    (upload_key,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                data = dict(row)
+                data["expires_at"] = _to_iso(data.get("expires_at"))
+                data["created_at"] = _to_iso(data.get("created_at"))
+                data["updated_at"] = _to_iso(data.get("updated_at"))
+                return data
+
+    def update_upload_key(
+        self,
+        upload_key: str,
+        status: Optional[str] = None,
+        source_storage_key: Optional[str] = None,
+        source_checksum: Optional[str] = None,
+        source_size: Optional[int] = None,
+        total_chunks: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        uploaded_chunks: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+        error_message: Optional[str] = None,
+        project_id: Optional[str] = None,
+        token_issued: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update an upload key record."""
+        now = utc_now_iso()
+        fields = []
+        values = []
+        if status is not None:
+            fields.append("status = %s")
+            values.append(status)
+        if source_storage_key is not None:
+            fields.append("source_storage_key = %s")
+            values.append(source_storage_key)
+        if source_checksum is not None:
+            fields.append("source_checksum = %s")
+            values.append(source_checksum)
+        if source_size is not None:
+            fields.append("source_size = %s")
+            values.append(source_size)
+        if total_chunks is not None:
+            fields.append("total_chunks = %s")
+            values.append(total_chunks)
+        if chunk_size is not None:
+            fields.append("chunk_size = %s")
+            values.append(chunk_size)
+        if uploaded_chunks is not None:
+            fields.append("uploaded_chunks = %s")
+            values.append(uploaded_chunks)
+        if temp_dir is not None:
+            fields.append("temp_dir = %s")
+            values.append(temp_dir)
+        if error_message is not None:
+            fields.append("error_message = %s")
+            values.append(error_message)
+        if project_id is not None:
+            fields.append("project_id = %s")
+            values.append(project_id)
+        if token_issued is not None:
+            fields.append("token_issued = %s")
+            values.append(token_issued)
+        if not fields:
+            return self.get_upload_key(upload_key)
+
+        fields.append("updated_at = %s")
+        values.append(now)
+        values.append(upload_key)
+
+        query = f"UPDATE upload_keys SET {', '.join(fields)} WHERE upload_key = %s;"
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(values))
+        return self.get_upload_key(upload_key)
+
+    def complete_upload(
+        self,
+        upload_key: str,
+        project_id: str,
+        source_storage_key: str,
+        source_checksum: str,
+        source_size: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark an upload as completed and link it to a project."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE upload_keys
+                    SET status = 'completed',
+                        project_id = %s,
+                        source_storage_key = %s,
+                        source_checksum = %s,
+                        source_size = %s,
+                        updated_at = %s
+                    WHERE upload_key = %s;
+                    """,
+                    (project_id, source_storage_key, source_checksum, source_size, now, upload_key)
+                )
+        return self.get_upload_key(upload_key)
+
+    def expire_upload_keys(self) -> int:
+        """Mark expired upload keys as 'expired'. Returns count of expired keys."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_keys SET status = 'expired', updated_at = %s WHERE status = 'uploading' AND expires_at < %s;",
+                    (now, now)
+                )
+                return cur.rowcount or 0
+
+    def list_upload_keys_by_project(self, project_id: str) -> List[Dict[str, Any]]:
+        """List upload keys associated with a project."""
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM upload_keys WHERE project_id = %s ORDER BY created_at DESC;",
+                    (project_id,)
+                )
+                rows = cur.fetchall()
+                result = []
+                for r in rows:
+                    data = dict(r)
+                    data["expires_at"] = _to_iso(data.get("expires_at"))
+                    data["created_at"] = _to_iso(data.get("created_at"))
+                    data["updated_at"] = _to_iso(data.get("updated_at"))
+                    result.append(data)
+                return result

@@ -16,6 +16,8 @@ import os
 import re
 import uuid
 import secrets
+import hashlib
+import tempfile
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -119,6 +121,30 @@ class LoginPayload(BaseModel):
     email: str
     password: str
 
+
+class UploadAuthorizeRequest(BaseModel):
+    filename: str
+    size_bytes: int
+    content_type: Optional[str] = "application/pdf"
+    project_name: Optional[str] = None
+    pages: Optional[str] = None
+
+
+class UploadAuthorizeResponse(BaseModel):
+    upload_key: str
+    project_id: str
+    pathname: str
+    handle_upload_url: str
+    expires_at: str
+    max_size_mb: int
+
+
+class UploadCompleteRequest(BaseModel):
+    project_name: Optional[str] = None
+    pages: Optional[str] = None
+
+
+UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # retained for older client compatibility only
 
 DEFAULT_DEV_CORS_ORIGINS = [
     "http://localhost:8000",
@@ -843,6 +869,190 @@ def create_app(
                 "cross_page_groups": sum(1 for g in saved_groups if g["is_cross_page"]),
             },
             "images": saved_images
+        }
+
+    # ============================================================
+    # Direct browser-to-Blob upload intents
+    # ============================================================
+
+    @app.post("/api/uploads/authorize")
+    async def upload_authorize(request: Request, payload: UploadAuthorizeRequest):
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        owner_id = user.get("id") if user else auth.get_single_user_id()
+        filename = (payload.filename or "").strip()
+        if (not filename or len(filename) > 255 or any(ord(ch) < 32 for ch in filename)
+                or filename != Path(filename).name or "/" in filename or "\\" in filename
+                or not filename.lower().endswith(".pdf")):
+            raise HTTPException(status_code=400, detail="Only a plain PDF filename is allowed.")
+        if payload.content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="Invalid content type. Expected application/pdf.")
+        max_bytes = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+        if payload.size_bytes <= 0 or payload.size_bytes > max_bytes:
+            raise HTTPException(status_code=413, detail="Invalid PDF size or file exceeds the upload limit.")
+        upload_key = str(uuid.uuid4())
+        project_id = str(uuid.uuid4())
+        pathname = f"{project_id}/source/{upload_key}.pdf"
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        record = repo.create_upload_key(
+            upload_key=upload_key, content_type="application/pdf", expires_at=expires_at,
+            owner_id=owner_id, filename=filename, expected_size=payload.size_bytes,
+            blob_key=pathname,
+        )
+        if not record:
+            raise HTTPException(status_code=500, detail="Could not create upload intent.")
+        return {
+            "upload_key": upload_key, "project_id": project_id, "pathname": pathname,
+            "handle_upload_url": "/api/blob-upload", "expires_at": expires_at,
+            "max_size_bytes": max_bytes,
+        }
+
+    @app.post("/api/uploads/{upload_key}/claim-token")
+    async def claim_upload_token(request: Request, upload_key: str):
+        """One-use token gate called by the Node handleUpload route."""
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        owner_id = user.get("id") if user else auth.get_single_user_id()
+        record = repo.get_upload_key(upload_key)
+        if not record or record.get("owner_id") != owner_id:
+            raise HTTPException(status_code=404, detail="Upload intent not found.")
+        if record.get("status") != "uploading":
+            raise HTTPException(status_code=409, detail="Upload intent is no longer available.")
+        try:
+            expiry = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=410, detail="Upload intent expired.")
+        if expiry <= datetime.now(timezone.utc):
+            repo.update_upload_key(upload_key, status="expired")
+            raise HTTPException(status_code=410, detail="Upload intent expired.")
+        now = datetime.now(timezone.utc).isoformat()
+        if not repo.claim_upload_token(upload_key, owner_id, now):
+            raise HTTPException(status_code=409, detail="Upload token has already been issued.")
+        return {"pathname": record["blob_key"], "max_size_bytes": int(record["expected_size"]),
+                "valid_until": int(expiry.timestamp() * 1000)}
+
+    @app.post("/api/uploads/{upload_key}/complete")
+    async def upload_complete(request: Request, upload_key: str, payload: Optional[UploadCompleteRequest] = None):
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        owner_id = user.get("id") if user else auth.get_single_user_id()
+        record = repo.get_upload_key(upload_key)
+        if not record or record.get("owner_id") != owner_id:
+            raise HTTPException(status_code=404, detail="Upload intent not found.")
+        if record.get("status") == "completed" and record.get("project_id"):
+            project = repo.get_project(record["project_id"])
+            return {"project_id": record["project_id"], "status": project.get("status", "queued"), "already_completed": True}
+        if record.get("status") not in {"uploading", "finalizing"} or not record.get("token_issued"):
+            raise HTTPException(status_code=409, detail="Upload token was not issued or intent is no longer active.")
+        project_name = ((payload.project_name if payload else None) or f"Inspection - {record['filename']}").strip()
+        raw_pages = (payload.pages if payload else None) or ""
+        page_tokens = raw_pages.replace(",", " ").split()
+        if any(not token.isdecimal() or int(token) < 1 for token in page_tokens):
+            raise HTTPException(status_code=400, detail="Invalid page selection.")
+        target_pages = sorted({int(token) for token in page_tokens})
+        expiry = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if record.get("status") == "uploading" and expiry <= datetime.now(timezone.utc):
+            repo.update_upload_key(upload_key, status="expired")
+            raise HTTPException(status_code=410, detail="Upload intent expired.")
+        project_id = record["blob_key"].split("/", 1)[0]
+        relative_key = "/".join(record["blob_key"].split("/")[1:])
+        try:
+            metadata = filestore.head(project_id, relative_key)
+            meta_size = metadata.get("size") if isinstance(metadata, dict) else metadata.size
+            meta_type = metadata.get("content_type") if isinstance(metadata, dict) else metadata.content_type
+            meta_path = metadata.get("pathname") if isinstance(metadata, dict) else metadata.pathname
+            meta_etag = metadata.get("etag") if isinstance(metadata, dict) else metadata.etag
+            if meta_path and meta_path != record["blob_key"]:
+                raise HTTPException(status_code=400, detail="Uploaded object path does not match the upload intent.")
+            if int(meta_size) != int(record["expected_size"]):
+                raise HTTPException(status_code=400, detail="Uploaded object size does not match the upload intent.")
+            if meta_type != "application/pdf":
+                raise HTTPException(status_code=400, detail="Uploaded object content type does not match the upload intent.")
+            source_size = int(meta_size)
+            # Vercel Blob's ETag is metadata, not necessarily a SHA-256 digest.
+            # The Render worker computes and stores SHA-256 after download.
+            checksum = meta_etag or hashlib.sha256(f"{record['blob_key']}:{source_size}".encode()).hexdigest()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Blob verification failed for upload %s", upload_key)
+            raise HTTPException(status_code=502, detail="Could not verify uploaded Blob object.") from exc
+
+        if record.get("status") == "uploading":
+            now = datetime.now(timezone.utc).isoformat()
+            if not repo.claim_upload_finalization(upload_key, owner_id, now):
+                refreshed = repo.get_upload_key(upload_key)
+                if refreshed and refreshed.get("status") == "completed" and refreshed.get("project_id"):
+                    project = repo.get_project(refreshed["project_id"])
+                    return {"project_id": refreshed["project_id"], "status": project.get("status", "queued"), "already_completed": True}
+                if not refreshed or refreshed.get("status") != "finalizing":
+                    raise HTTPException(status_code=409, detail="Upload is already being finalized.")
+
+        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"alttext-extraction:{upload_key}"))
+        project_preexisting = repo.get_project(project_id) is not None
+        finalized = repo.finalize_upload_project(
+            upload_key=upload_key, project_id=project_id, job_id=job_id, owner_id=owner_id,
+            name=project_name, source_filename=record["filename"], source_storage_key=relative_key,
+            source_checksum=checksum, source_size=source_size,
+            page_start=min(target_pages) if target_pages else None,
+            page_end=max(target_pages) if target_pages else None,
+            page_numbers=target_pages or None,
+        )
+        project = finalized["project"]
+        if not project_preexisting:
+            repo.record_audit_event(event_id=str(uuid.uuid4()), project_id=project_id,
+                event_type="project_created", target_type="project", target_id=project_id,
+                details={"source_filename": record["filename"], "source_size": source_size,
+                         "upload_key": upload_key, "target_pages": target_pages or None}, actor_id=owner_id)
+        try:
+            if isinstance(repo, PostgresRepository):
+                from src.worker.queueing import publish_extraction_job
+                await publish_extraction_job(job_id)
+        except Exception:
+            # The durable queued row is the outbox; worker reconciliation will publish/claim it.
+            logger.exception("Queue publish failed for job %s; database recovery will retry", job_id)
+        return {"project_id": project["id"], "status": "queued", "already_completed": False}
+
+    @app.get("/api/projects/{project_id}/status")
+    async def get_project_status(request: Request, project_id: str):
+        """
+        Get project processing status. Used by the frontend to poll
+        for extraction completion.
+        """
+        project = repo.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        # Authorize access
+        user = getattr(request.state, "user", None)
+        if auth.is_auth_enabled():
+            if not user:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            if project.get("owner_id") != user.get("id"):
+                raise HTTPException(status_code=403, detail="Not authorized to access this project")
+        else:
+            auth.verify_single_user_access(request)
+            if project.get("owner_id") not in auth.get_allowed_single_user_owners():
+                raise HTTPException(status_code=403, detail="Not authorized to access this project")
+
+        # Get latest job for this project
+        jobs = repo.list_project_jobs(project_id)
+        latest_job = jobs[0] if jobs else None
+
+        images = repo.list_project_images(project_id)
+        groups = repo.list_project_groups(project_id)
+
+        return {
+            "project_id": project_id,
+            "status": project.get("status"),
+            "cleanup_status": project.get("cleanup_status"),
+            "total_images": len(images),
+            "groups": len(groups),
+            "job": latest_job,
+            "images": images,
+            "groups": groups,
+            "error": latest_job.get("error_message") if latest_job and latest_job.get("status") == "failed" else None,
         }
 
     # ============================================================
