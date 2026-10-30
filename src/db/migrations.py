@@ -194,4 +194,12 @@ def apply_migrations(db: DatabaseConnection) -> int:
             )
             current_version = 5
 
+        # Ensure owner_id column exists on projects for multi-user authorization
+        cursor = conn.execute("PRAGMA table_info(projects);")
+        existing_project_cols = {col[1] for col in cursor.fetchall()}
+        if existing_project_cols and "owner_id" not in existing_project_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN owner_id TEXT;")
+        if existing_project_cols:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);")
+
     return current_version

@@ -29,11 +29,15 @@ class PostgresConnection:
     """
 
     def __init__(self, database_url: Optional[str] = None):
-        self.database_url = database_url or os.environ.get("DATABASE_URL")
+        self.database_url = (
+            database_url
+            or os.environ.get("DATABASE_URL")
+            or os.environ.get("NEON_DB_URL")
+        )
         if not self.database_url:
             raise ValueError(
-                "DATABASE_URL is required for PostgreSQL connections. "
-                "Set it to your Vercel Postgres connection string."
+                "DATABASE_URL or NEON_DB_URL is required for PostgreSQL connections. "
+                "Set it to your PostgreSQL connection string."
             )
 
     def get_connection(self) -> pg_connection:

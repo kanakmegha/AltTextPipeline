@@ -13,8 +13,10 @@ run_inspector.py.
 import json
 import logging
 import os
+import re
 import uuid
 import secrets
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -33,8 +35,19 @@ from src.db.migrations import apply_migrations as sqlite_apply_migrations
 from src.db.postgres_migrations import apply_migrations as postgres_apply_migrations
 from src.db.repository import Repository
 from src.db.postgres_repository import PostgresRepository
-from src.storage.filestore import FileStore
-from src.storage.base_storage import BaseStorage
+from src.storage.filestore import (
+    FileStore,
+    PathTraversalError as FileStorePathTraversalError,
+    CleanupBlockedError as FileStoreCleanupBlockedError,
+)
+from src.storage.base_storage import (
+    BaseStorage,
+    PathTraversalError as BasePathTraversalError,
+    CleanupBlockedError as BaseCleanupBlockedError,
+)
+
+PATH_TRAVERSAL_ERRORS = (FileStorePathTraversalError, BasePathTraversalError)
+CLEANUP_BLOCKED_ERRORS = (FileStoreCleanupBlockedError, BaseCleanupBlockedError)
 from src.extraction.engine import ExtractionEngine
 from src.ai.config import AIConfig
 from src.ai.providers import AIProvider, HuggingFaceInferenceProvider, MockAIProvider
@@ -107,6 +120,73 @@ class LoginPayload(BaseModel):
     password: str
 
 
+DEFAULT_DEV_CORS_ORIGINS = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+ALLOWED_CORS_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+ALLOWED_CORS_HEADERS = ["Accept", "Authorization", "Content-Type", "X-CSRF-Token"]
+
+
+def parse_cors_origins(
+    raw_origins: Optional[str] = None,
+    is_production: Optional[bool] = None,
+) -> List[str]:
+    """
+    Parse and validate comma-separated CORS_ALLOWED_ORIGINS.
+    - Rejects wildcard ('*') origins when credentials are enabled.
+    - Validates scheme (http/https), netloc, and absence of paths/queries/fragments.
+    - Defaults to localhost origins only in non-production environments.
+    """
+    prod = auth.is_production_env() if is_production is None else bool(is_production)
+    effective_raw = os.environ.get("CORS_ALLOWED_ORIGINS") if raw_origins is None else raw_origins
+
+    if effective_raw is not None and effective_raw.strip():
+        origins: List[str] = []
+        for item in effective_raw.split(","):
+            candidate = item.strip()
+            if not candidate:
+                continue
+            if "*" in candidate:
+                raise ValueError(
+                    "Invalid CORS configuration: wildcard origins ('*') are prohibited when credentials are enabled."
+                )
+            parsed = urlparse(candidate)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path not in {"", "/"}
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    f"Invalid CORS origin syntax: {candidate!r}. Expected 'http(s)://host[:port]'."
+                )
+            normalized = f"{parsed.scheme}://{parsed.netloc}"
+            if normalized not in origins:
+                origins.append(normalized)
+        return origins
+
+    if prod:
+        vercel_host = (
+            os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "").strip()
+            or os.environ.get("VERCEL_URL", "").strip()
+        )
+        if vercel_host:
+            if vercel_host.startswith(("http://", "https://")):
+                return parse_cors_origins(vercel_host, is_production=True)
+            return [f"https://{vercel_host}"]
+        return []
+
+    return list(DEFAULT_DEV_CORS_ORIGINS)
+
+
+def _sanitize_disposition_filename(filename: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", filename or "download")
+    return cleaned.strip("._") or "download"
+
+
 def create_app(
     db_conn=None,
     storage=None,
@@ -115,71 +195,55 @@ def create_app(
     # Backward-compatible parameters for existing tests and local dev
     db_path: Optional[str] = None,
     storage_dir: Optional[str] = None,
+    cors_allowed_origins: Optional[str] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application.
-
-    Parameters
-    ----------
-    db_conn : DatabaseConnection | PostgresConnection, optional
-        Database connection. If None, one is created from DATABASE_URL (Postgres)
-        or DB_PATH (SQLite) environment variables, or from db_path.
-    storage : BaseStorage | FileStore, optional
-        Storage backend. If None, one is created from BLOB_READ_WRITE_TOKEN
-        (Vercel Blob) or STORAGE_DIR (local) environment variables, or from storage_dir.
-    db_path : str, optional
-        Path to SQLite database (backward compat, local dev only).
-    storage_dir : str, optional
-        Path to local storage directory (backward compat, local dev only).
     """
+    auth.validate_auth_config()
+    allowed_origins = parse_cors_origins(cors_allowed_origins)
+
     app = FastAPI(
         title="AltTextPipeline - Extraction Inspector",
         description="Local web interface to inspect image extraction, caption matching, and alt-text generation",
         version="0.4.0",
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
     # ------------------------------------------------------------------
     # Database & storage initialization
     # ------------------------------------------------------------------
     if db_conn is None:
-        backend = "postgres" if os.environ.get("DATABASE_URL") else "sqlite"
+        backend = "postgres" if (os.environ.get("DATABASE_URL") or os.environ.get("NEON_DB_URL")) else "sqlite"
         if backend == "postgres":
             db_conn = create_connection(backend="postgres")
         else:
-            # Backward compat: use db_path if provided
             effective_db_path = db_path or os.environ.get("DB_PATH", DEFAULT_DB_PATH)
             db_conn = create_connection(backend="sqlite", db_path=effective_db_path)
 
     if storage is None:
-        # Backward compat: use storage_dir if provided
         effective_storage_dir = storage_dir or os.environ.get("STORAGE_DIR", DEFAULT_STORAGE_DIR)
         storage = create_storage(backend="local", base_dir=effective_storage_dir)
 
     # Run migrations appropriate to the backend
     if type(db_conn).__name__ == "PostgresConnection":
         postgres_apply_migrations(db_conn)
-        if auth.AUTH_ENABLED:
-            auth.ensure_auth_schema(db_conn)
+        auth.ensure_auth_schema(db_conn)
         repo = PostgresRepository(db_conn)
     else:
         sqlite_apply_migrations(db_conn)
-        if auth.AUTH_ENABLED:
-            auth.ensure_auth_schema(db_conn)
+        auth.ensure_auth_schema(db_conn)
         repo = Repository(db_conn)
 
     filestore = storage
 
     engine = ExtractionEngine()
 
-    cfg = ai_config or AIConfig.from_env()
+    if ai_config is not None:
+        cfg = ai_config
+    else:
+        in_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        live_tests = os.environ.get("AI_ENABLE_LIVE_TESTS", "").strip().lower() in {"1", "true", "yes"}
+        cfg = AIConfig.from_env(read_dotenv=(not in_pytest or live_tests))
 
     # Determine AI provider: injected provider -> Hugging Face (if configured) -> Mock provider fallback
     if ai_provider is not None:
@@ -221,16 +285,23 @@ def create_app(
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     # ------------------------------------------------------------------
-    # Authentication middleware
+    # Authentication & CSRF middleware
     # ------------------------------------------------------------------
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         request.state.repo = repo
+        method = (request.method or "GET").upper()
 
-        if auth.AUTH_ENABLED and not auth._is_public_path(request.url.path):
-            if request.url.path.startswith("/api/"):
+        if method == "OPTIONS":
+            return await call_next(request)
+
+        if auth.is_auth_enabled():
+            path = request.url.path
+            is_public = auth._is_public_path(path)
+
+            if not is_public:
                 try:
-                    user = auth.require_auth(request)
+                    user = await auth.require_auth(request)
                     request.state.user = user
                 except HTTPException as exc:
                     return JSONResponse(
@@ -239,28 +310,91 @@ def create_app(
                         headers=exc.headers or {},
                     )
             else:
-                request.state.user = None
+                try:
+                    request.state.user = await auth.require_auth(request)
+                except HTTPException:
+                    request.state.user = None
+
+            if method not in auth.SAFE_HTTP_METHODS:
+                try:
+                    auth.require_csrf(request)
+                except HTTPException as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                        headers=exc.headers or {},
+                    )
         else:
-            request.state.user = (
-                auth.require_auth(request)
-                if auth.AUTH_ENABLED
-                else {"id": "dev", "email": "dev@local", "is_active": True}
-            )
+            request.state.user = {"id": "dev", "email": "dev@local", "is_active": True}
 
         response = await call_next(request)
         return response
+
+    # Register CORSMiddleware after auth_middleware so CORSMiddleware wraps outermost
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=ALLOWED_CORS_METHODS,
+        allow_headers=ALLOWED_CORS_HEADERS,
+    )
+
+    def _authorize_project_access(
+        request: Request,
+        project_id: str,
+        include_id_in_404: bool = False,
+    ) -> Dict[str, Any]:
+        """Verify that the project exists and the authenticated user owns it."""
+        project = repo.get_project(project_id)
+        if not project:
+            msg = f"Project '{project_id}' not found" if include_id_in_404 else "Project not found"
+            raise HTTPException(status_code=404, detail=msg)
+        if auth.is_auth_enabled():
+            user = getattr(request.state, "user", None)
+            if not user:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            owner_id = project.get("owner_id")
+            if owner_id != user.get("id"):
+                raise HTTPException(status_code=403, detail="Not authorized to access this project")
+        return project
+
+    def _resolve_actor_id(request: Request, fallback: str = "editor") -> str:
+        if auth.is_auth_enabled():
+            user = getattr(request.state, "user", None)
+            if user:
+                return user.get("email") or user.get("id") or fallback
+        return fallback
 
     # ------------------------------------------------------------------
     # Auth endpoints
     # ------------------------------------------------------------------
     @app.post("/api/auth/login")
-    async def login(payload: LoginPayload):
-        if not auth.AUTH_ENABLED:
+    async def login(request: Request, payload: LoginPayload):
+        if not auth.is_auth_enabled():
             return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
 
-        user = repo.verify_user_password(payload.email, payload.password)
+        email = (payload.email or "").strip()
+        password = payload.password or ""
+        if not email or not password:
+            raise HTTPException(status_code=400, detail="Email and password are required")
+        if len(email) > 254 or len(password) > auth.MAX_PASSWORD_LENGTH:
+            raise HTTPException(status_code=400, detail="Invalid credentials format")
+
+        auth.check_login_rate_limit(request, email)
+
+        user = repo.verify_user_password(email, password)
         if not user:
+            auth.record_login_failure(request, email)
             raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        auth.clear_login_failures(request, email)
+
+        # Prevent session fixation by invalidating any prior session cookie
+        prior_token = auth.get_session_cookie(request)
+        if prior_token:
+            repo.delete_session(prior_token)
+
+        repo.cleanup_expired_sessions()
 
         token = auth._make_session_token()
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=auth.SESSION_COOKIE_MAX_AGE)).isoformat()
@@ -268,16 +402,21 @@ def create_app(
         repo.create_session(session_id, user["id"], token, expires_at)
 
         signed_token = auth._sign(token)
-        csrf_token = secrets.token_urlsafe(16)
+        csrf_token = auth.generate_csrf_token(session_token=token)
+        secure_flag = auth.is_secure_cookie(request)
 
         response = JSONResponse(
-            {"status": "logged_in", "user": {"id": user["id"], "email": user["email"]}}
+            {
+                "status": "logged_in",
+                "user": {"id": user["id"], "email": user["email"]},
+                "csrf_token": csrf_token,
+            }
         )
         response.set_cookie(
             key=auth.SESSION_COOKIE_NAME,
             value=signed_token,
             httponly=True,
-            secure=True,
+            secure=secure_flag,
             samesite="lax",
             max_age=auth.SESSION_COOKIE_MAX_AGE,
             path="/",
@@ -286,7 +425,7 @@ def create_app(
             key=auth.CSRF_TOKEN_NAME,
             value=csrf_token,
             httponly=False,
-            secure=True,
+            secure=secure_flag,
             samesite="lax",
             max_age=auth.SESSION_COOKIE_MAX_AGE,
             path="/",
@@ -295,34 +434,64 @@ def create_app(
 
     @app.post("/api/auth/logout")
     async def logout(request: Request):
-        if not auth.AUTH_ENABLED:
+        if not auth.is_auth_enabled():
             return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
         token = auth.get_session_cookie(request)
         if token:
             repo.delete_session(token)
+        secure_flag = auth.is_secure_cookie(request)
         response = JSONResponse({"status": "logged_out"})
-        response.delete_cookie(key=auth.SESSION_COOKIE_NAME, path="/")
-        response.delete_cookie(key=auth.CSRF_TOKEN_NAME, path="/")
+        response.delete_cookie(
+            key=auth.SESSION_COOKIE_NAME,
+            path="/",
+            secure=secure_flag,
+            httponly=True,
+            samesite="lax",
+        )
+        response.delete_cookie(
+            key=auth.CSRF_TOKEN_NAME,
+            path="/",
+            secure=secure_flag,
+            httponly=False,
+            samesite="lax",
+        )
         return response
 
     @app.get("/api/auth/session")
     async def get_session(request: Request):
-        if not auth.AUTH_ENABLED:
+        if not auth.is_auth_enabled():
             return JSONResponse({"auth_enabled": False, "user": {"id": "dev", "email": "dev@local"}})
         try:
-            user = auth.require_auth(request)
+            user = await auth.require_auth(request)
             return JSONResponse({"auth_enabled": True, "user": {"id": user["id"], "email": user["email"]}})
         except HTTPException:
             return JSONResponse({"auth_enabled": True, "user": None}, status_code=401)
 
     @app.get("/api/auth/csrf-token")
     async def get_csrf_token(request: Request):
-        if not auth.AUTH_ENABLED:
-            return JSONResponse({"detail": "Authentication is disabled"}, status_code=400)
+        if not auth.is_auth_enabled():
+            token = auth.generate_csrf_token(session_token=None)
+            return JSONResponse({"csrf_token": token, "auth_enabled": False})
+
+        session_token = auth.get_session_cookie(request)
         existing = request.cookies.get(auth.CSRF_TOKEN_NAME)
-        if not existing:
-            existing = secrets.token_urlsafe(16)
-        return JSONResponse({"csrf_token": existing})
+        if existing and auth.verify_csrf_token(existing, session_token=session_token, allow_preauth=(session_token is None)):
+            csrf_token = existing
+        else:
+            csrf_token = auth.generate_csrf_token(session_token=session_token)
+
+        secure_flag = auth.is_secure_cookie(request)
+        response = JSONResponse({"csrf_token": csrf_token})
+        response.set_cookie(
+            key=auth.CSRF_TOKEN_NAME,
+            value=csrf_token,
+            httponly=False,
+            secure=secure_flag,
+            samesite="lax",
+            max_age=auth.SESSION_COOKIE_MAX_AGE,
+            path="/",
+        )
+        return response
 
     # ------------------------------------------------------------------
     # Existing routes
@@ -336,10 +505,8 @@ def create_app(
         return HTMLResponse(index_file.read_text(encoding="utf-8"))
 
     @app.get("/review/{project_id}", response_class=HTMLResponse)
-    async def review_mode_page(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    async def review_mode_page(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id, include_id_in_404=True)
         review_file = STATIC_DIR / "review.html"
         if not review_file.exists():
             return HTMLResponse("<h2>Review Mode frontend static files missing.</h2>", status_code=404)
@@ -348,10 +515,8 @@ def create_app(
         return HTMLResponse(content)
 
     @app.get("/export/{project_id}", response_class=HTMLResponse)
-    async def export_page(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    async def export_page(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id, include_id_in_404=True)
         export_file = STATIC_DIR / "export.html"
         if not export_file.exists():
             return HTMLResponse("<h2>DOCX Export frontend static files missing.</h2>", status_code=404)
@@ -375,15 +540,18 @@ def create_app(
         }
 
     @app.get("/api/projects")
-    async def list_projects():
-        projects = repo.list_projects()
+    async def list_projects(request: Request):
+        if auth.is_auth_enabled():
+            user = getattr(request.state, "user", None)
+            owner_id = user["id"] if user else ""
+            projects = repo.list_projects(owner_id=owner_id)
+        else:
+            projects = repo.list_projects()
         return {"projects": projects}
 
     @app.get("/api/projects/{project_id}")
-    async def get_project(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def get_project(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id)
         images = repo.list_project_images(project_id)
         groups = repo.list_project_groups(project_id)
         total_pages = max([img["page_number"] for img in images], default=1)
@@ -405,17 +573,47 @@ def create_app(
             }
         }
 
+    @app.delete("/api/projects/{project_id}")
+    async def delete_project_endpoint(
+        request: Request,
+        project_id: str,
+        cancel: bool = True,
+    ):
+        _authorize_project_access(request, project_id)
+        if hasattr(repo, "has_active_jobs"):
+            active_jobs = repo.has_active_jobs(project_id)
+        else:
+            jobs = repo.list_project_jobs(project_id)
+            active_jobs = any(j.get("status") in {"queued", "running"} for j in jobs)
+        latest_export = repo.get_latest_project_export(project_id, "docx")
+        export_delivered = bool(latest_export and latest_export.get("status") == "delivered")
+
+        try:
+            filestore.cleanup_project(
+                project_id=project_id,
+                export_verified_and_delivered=export_delivered,
+                project_cancelled=bool(cancel),
+                active_jobs_running=active_jobs,
+            )
+        except CLEANUP_BLOCKED_ERRORS as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception:
+            logger.error("Storage cleanup failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail="Failed to clean up project storage.")
+
+        repo.delete_project(project_id)
+        return {"status": "deleted", "project_id": project_id}
+
     @app.get("/api/projects/{project_id}/images")
-    async def list_project_images(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def list_project_images(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
         images = repo.list_project_images(project_id)
         return {"images": images}
 
     @app.get("/api/projects/{project_id}/images/{image_id}/file")
     @app.head("/api/projects/{project_id}/images/{image_id}/file")
-    async def get_image_file(project_id: str, image_id: str):
+    async def get_image_file(request: Request, project_id: str, image_id: str):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -424,18 +622,23 @@ def create_app(
             data = filestore.read_bytes(project_id, asset["file_storage_key"])
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Image binary not found in storage")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        except PATH_TRAVERSAL_ERRORS:
+            raise HTTPException(status_code=400, detail="Invalid storage key")
+        except Exception:
+            logger.error("Failed reading image binary %s for project %s", image_id, project_id)
+            raise HTTPException(status_code=500, detail="Failed to retrieve image binary")
 
         media_type = f"image/{asset['image_format']}" if asset["image_format"] != "jpg" else "image/jpeg"
+        safe_name = _sanitize_disposition_filename(asset.get("suggested_filename") or "image.png")
         return Response(
             content=data,
             media_type=media_type,
-            headers={"Content-Disposition": f'inline; filename="{asset["suggested_filename"]}"'}
+            headers={"Content-Disposition": f'inline; filename="{safe_name}"'}
         )
 
     @app.post("/api/upload-and-extract")
     async def upload_and_extract(
+        request: Request,
         file: Optional[UploadFile] = File(None),
         use_sample_pdf: bool = Form(False),
         pages: Optional[str] = Form(None),
@@ -471,11 +674,17 @@ def create_app(
                 detail=f"File too large. Maximum size is {max_upload_mb} MB."
             )
 
+        if not source_bytes.lstrip().startswith(b"%PDF-"):
+            raise HTTPException(status_code=400, detail="Uploaded file is not a valid PDF document.")
+
         rel_key, checksum, _ = filestore.save_source_pdf(
             project_id=project_id,
             source_path_or_bytes=source_bytes,
             original_filename=original_filename,
         )
+
+        user = getattr(request.state, "user", None)
+        owner_id = user.get("id") if user else None
 
         name = project_name or f"Inspection - {original_filename}"
         project = repo.create_project(
@@ -485,7 +694,8 @@ def create_app(
             source_storage_key=rel_key,
             source_checksum=checksum,
             language_variant="en-GB",
-            status="extracting"
+            status="extracting",
+            owner_id=owner_id,
         )
 
         target_page_numbers: Optional[List[int]] = None
@@ -554,9 +764,10 @@ def create_app(
 
             repo.update_project_status(project_id, status="ready_for_review")
 
-        except Exception as e:
+        except Exception:
+            logger.error("PDF extraction failed for project %s", project_id)
             repo.update_project_status(project_id, status="failed")
-            raise HTTPException(status_code=500, detail=f"Extraction failure: {repr(e)}")
+            raise HTTPException(status_code=500, detail="Extraction failure while processing PDF document.")
         finally:
             if tmp_pdf_path and os.path.exists(tmp_pdf_path):
                 try:
@@ -624,7 +835,8 @@ def create_app(
         }
 
     @app.get("/api/projects/{project_id}/images/{image_id}/versions")
-    async def get_image_versions(project_id: str, image_id: str):
+    async def get_image_versions(request: Request, project_id: str, image_id: str):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -657,10 +869,12 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/images/{image_id}/generate")
     async def generate_alt_text(
+        request: Request,
         project_id: str,
         image_id: str,
         payload: Optional[GenerateRequestPayload] = None,
     ):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -690,18 +904,17 @@ def create_app(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+        except Exception:
+            logger.error("Alt-text generation failed for image %s", image_id)
+            raise HTTPException(status_code=500, detail="Generation failed due to an internal error.")
 
     # ============================================================
     # Figure Group Review & Approval Endpoints (Phase 4.1)
     # ============================================================
 
     @app.get("/api/projects/{project_id}/groups")
-    async def list_project_groups_endpoint(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def list_project_groups_endpoint(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
         groups = repo.list_project_groups(project_id)
         images = repo.list_project_images(project_id)
         images_by_group = {}
@@ -715,12 +928,11 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/groups/create-from-selection")
     async def create_group_from_selection_endpoint(
+        request: Request,
         project_id: str,
         payload: CreateGroupFromSelectionPayload,
     ):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+        _authorize_project_access(request, project_id)
 
         if not payload.image_ids:
             raise HTTPException(status_code=400, detail="image_ids cannot be empty")
@@ -739,6 +951,7 @@ def create_app(
                 detail=f"Invalid decision_mode '{payload.decision_mode}'. Allowed values: {sorted(list(valid_modes))}"
             )
 
+        actor_id = _resolve_actor_id(request, "editor")
         try:
             result = repo.create_group_from_selection(
                 project_id=project_id,
@@ -746,7 +959,7 @@ def create_app(
                 caption=clean_caption,
                 caption_position=payload.caption_position or "below",
                 figure_label=payload.figure_label,
-                actor_id="editor",
+                actor_id=actor_id,
                 allow_reassignment=bool(payload.allow_reassignment),
                 decision_mode=payload.decision_mode,
             )
@@ -755,8 +968,8 @@ def create_app(
             if "not found" in err_msg.lower():
                 raise HTTPException(status_code=404, detail=err_msg)
             raise HTTPException(status_code=400, detail=err_msg)
-        except Exception as e:
-            logger.error(f"Unexpected error in create_group_from_selection: {e}")
+        except Exception:
+            logger.error("Unexpected error in create_group_from_selection for project %s", project_id)
             raise HTTPException(status_code=500, detail="Failed to create figure group from selection.")
 
         return {
@@ -770,7 +983,8 @@ def create_app(
         }
 
     @app.post("/api/projects/{project_id}/groups/{group_id}/confirm")
-    async def confirm_group_endpoint(project_id: str, group_id: str):
+    async def confirm_group_endpoint(request: Request, project_id: str, group_id: str):
+        _authorize_project_access(request, project_id)
         grp = repo.get_figure_group(group_id)
         if not grp or grp["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Figure group not found")
@@ -788,7 +1002,8 @@ def create_app(
         return {"status": "confirmed", "group_id": group_id}
 
     @app.post("/api/projects/{project_id}/groups/{group_id}/remove-image")
-    async def remove_image_from_group_endpoint(project_id: str, group_id: str, payload: GroupImageActionPayload):
+    async def remove_image_from_group_endpoint(request: Request, project_id: str, group_id: str, payload: GroupImageActionPayload):
+        _authorize_project_access(request, project_id)
         grp = repo.get_figure_group(group_id)
         if not grp or grp["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Figure group not found")
@@ -799,7 +1014,8 @@ def create_app(
         return {"status": "removed", "image_id": payload.image_id, "group_id": group_id}
 
     @app.post("/api/projects/{project_id}/groups/{group_id}/add-image")
-    async def add_image_to_group_endpoint(project_id: str, group_id: str, payload: GroupImageActionPayload):
+    async def add_image_to_group_endpoint(request: Request, project_id: str, group_id: str, payload: GroupImageActionPayload):
+        _authorize_project_access(request, project_id)
         grp = repo.get_figure_group(group_id)
         if not grp or grp["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Figure group not found")
@@ -822,7 +1038,8 @@ def create_app(
         return {"status": "added", "image_id": payload.image_id, "group_id": group_id}
 
     @app.post("/api/projects/{project_id}/groups/{group_id}/split")
-    async def split_group_endpoint(project_id: str, group_id: str):
+    async def split_group_endpoint(request: Request, project_id: str, group_id: str):
+        _authorize_project_access(request, project_id)
         grp = repo.get_figure_group(group_id)
         if not grp or grp["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Figure group not found")
@@ -834,7 +1051,8 @@ def create_app(
         return {"status": "split", "group_id": group_id}
 
     @app.put("/api/projects/{project_id}/images/{image_id}/association")
-    async def update_image_association_endpoint(project_id: str, image_id: str, payload: ImageAssociationUpdatePayload):
+    async def update_image_association_endpoint(request: Request, project_id: str, image_id: str, payload: ImageAssociationUpdatePayload):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -854,10 +1072,12 @@ def create_app(
 
     @app.put("/api/projects/{project_id}/images/{image_id}/caption")
     async def update_image_caption_endpoint(
+        request: Request,
         project_id: str,
         image_id: str,
         payload: CaptionUpdatePayload,
     ):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -921,6 +1141,7 @@ def create_app(
             "new_reasons": reasons,
             "resolved": bool(payload.resolve_review or payload.needs_caption_review is False),
         }
+        actor_id = _resolve_actor_id(request, "editor")
         repo.record_audit_event(
             event_id=str(uuid.uuid4()),
             project_id=project_id,
@@ -928,17 +1149,19 @@ def create_app(
             target_type="image",
             target_id=image_id,
             details=audit_details,
-            actor_id="editor",
+            actor_id=actor_id,
         )
 
         return {"status": "updated", "image": updated}
 
     @app.post("/api/projects/{project_id}/images/{image_id}/draft")
     async def save_manual_draft(
+        request: Request,
         project_id: str,
         image_id: str,
         payload: DraftSavePayload,
     ):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -962,10 +1185,12 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/images/{image_id}/clean-draft")
     async def clean_image_draft_endpoint(
+        request: Request,
         project_id: str,
         image_id: str,
         payload: Optional[Dict[str, Any]] = None,
     ):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -989,10 +1214,12 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/images/{image_id}/approve")
     async def approve_image_draft(
+        request: Request,
         project_id: str,
         image_id: str,
         payload: Optional[ApproveRequestPayload] = None,
     ):
+        _authorize_project_access(request, project_id)
         asset = repo.get_image_asset(image_id)
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
@@ -1025,7 +1252,11 @@ def create_app(
             version_id = latest["id"]
 
         approval_id = str(uuid.uuid4())
-        reviewer_id = (payload.reviewer_id if payload and payload.reviewer_id else None) or "editor"
+        if auth.is_auth_enabled():
+            reviewer_id = _resolve_actor_id(request, "editor")
+        else:
+            reviewer_id = (payload.reviewer_id if payload and payload.reviewer_id else None) or "editor"
+
         approval = repo.create_approval(
             approval_id=approval_id,
             image_id=image_id,
@@ -1061,10 +1292,8 @@ def create_app(
     # ============================================================
 
     @app.get("/api/projects/{project_id}/exports/status")
-    async def get_project_export_status(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def get_project_export_status(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
         eligibility = check_export_eligibility(repo, project_id)
 
         def _enrich_export_item(exp: Dict[str, Any]) -> Dict[str, Any]:
@@ -1142,10 +1371,8 @@ def create_app(
         }
 
     @app.post("/api/projects/{project_id}/exports/docx")
-    async def export_docx_endpoint(project_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def export_docx_endpoint(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
         try:
             export_record = export_project_docx(repo, filestore, project_id)
             return {
@@ -1158,15 +1385,13 @@ def create_app(
             }
         except ValueError as ve:
             raise HTTPException(status_code=400, detail={"message": str(ve)})
-        except Exception as e:
+        except Exception:
             logger.exception("DOCX export failed for project %s", project_id)
-            raise HTTPException(status_code=500, detail=f"DOCX export generation failed: {e}")
+            raise HTTPException(status_code=500, detail="DOCX export generation failed.")
 
     @app.get("/api/projects/{project_id}/exports/{export_id}/download")
-    async def download_export_endpoint(project_id: str, export_id: str):
-        project = repo.get_project(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+    async def download_export_endpoint(request: Request, project_id: str, export_id: str):
+        _authorize_project_access(request, project_id)
         export_record = repo.get_export(export_id)
         if not export_record or export_record["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Export not found")
@@ -1175,26 +1400,38 @@ def create_app(
             data = filestore.read_bytes(project_id, export_record["file_storage_key"])
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Export file missing from storage")
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"File asset missing: {e}")
+        except PATH_TRAVERSAL_ERRORS:
+            raise HTTPException(status_code=400, detail="Invalid storage key")
+        except Exception:
+            logger.error("Failed reading export binary %s for project %s", export_id, project_id)
+            raise HTTPException(status_code=404, detail="Export file asset missing from storage")
 
         repo.update_export_status(export_id, status="delivered", mark_delivered=True)
 
         filename = Path(export_record["file_storage_key"]).name
         if filename.startswith(f"{export_id}_"):
             filename = filename[len(f"{export_id}_"):]
+        safe_filename = _sanitize_disposition_filename(filename)
 
         return Response(
             content=data,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
         )
 
     return app
 
 
-app = create_app()
+
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.web.app:app", host="127.0.0.1", port=8000, reload=True)
+
+    uvicorn.run(
+        "src.web.app:create_app",
+        factory=True,
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+    )

@@ -24,3 +24,5 @@ pydantic-core==2.50.1
 # Testing (dev only, installed in CI)
 pytest==8.4.2
 pytest-asyncio==0.26.0
+vercel-blob==0.5.0
+python-dotenv==1.2.4

@@ -439,3 +439,27 @@ def test_postgres_figure_groups(repo):
 
     groups = repo.list_project_groups(project_id)
     assert len(groups) == 1
+
+
+def test_postgres_auth_schema_and_project_owner_isolation(pg_db, repo):
+    from src.web import auth
+
+    auth.ensure_auth_schema(pg_db)
+
+    u1_id = str(uuid.uuid4())
+    u2_id = str(uuid.uuid4())
+    repo.create_user(u1_id, f"pg_u1_{u1_id[:8]}@example.com", "PgPass123!")
+    repo.create_user(u2_id, f"pg_u2_{u2_id[:8]}@example.com", "PgPass456!")
+
+    p1_id = str(uuid.uuid4())
+    p2_id = str(uuid.uuid4())
+    repo.create_project(p1_id, "U1 Proj", "u1.pdf", "s/u1.pdf", "c1", owner_id=u1_id)
+    repo.create_project(p2_id, "U2 Proj", "u2.pdf", "s/u2.pdf", "c2", owner_id=u2_id)
+
+    u1_projs = repo.list_projects(owner_id=u1_id)
+    assert any(p["id"] == p1_id for p in u1_projs)
+    assert not any(p["id"] == p2_id for p in u1_projs)
+
+    # Deactivating u1 prevents password verification
+    repo.set_user_active(u1_id, False)
+    assert repo.verify_user_password(f"pg_u1_{u1_id[:8]}@example.com", "PgPass123!") is None

@@ -64,7 +64,8 @@ class Repository:
         source_storage_key: str,
         source_checksum: str,
         language_variant: str = "en-GB",
-        status: str = "created"
+        status: str = "created",
+        owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = utc_now_iso()
         with self.db.session() as conn:
@@ -73,12 +74,12 @@ class Repository:
                 INSERT INTO projects (
                     id, name, source_filename, source_storage_key,
                     source_checksum, language_variant, status,
-                    cleanup_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'retained', ?, ?);
+                    cleanup_status, owner_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'retained', ?, ?, ?);
                 """,
                 (
                     project_id, name, source_filename, source_storage_key,
-                    source_checksum, language_variant, status, now, now
+                    source_checksum, language_variant, status, owner_id, now, now
                 )
             )
         return self.get_project(project_id)
@@ -117,10 +118,21 @@ class Repository:
 
         return self.get_project(project_id)
 
-    def list_projects(self) -> List[Dict[str, Any]]:
+    def list_projects(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.db.session() as conn:
-            cursor = conn.execute("SELECT * FROM projects ORDER BY created_at DESC;")
+            if owner_id is not None:
+                cursor = conn.execute(
+                    "SELECT * FROM projects WHERE owner_id = ? ORDER BY created_at DESC;",
+                    (owner_id,),
+                )
+            else:
+                cursor = conn.execute("SELECT * FROM projects ORDER BY created_at DESC;")
             return [dict(r) for r in cursor.fetchall()]
+
+    def delete_project(self, project_id: str) -> bool:
+        with self.db.session() as conn:
+            cursor = conn.execute("DELETE FROM projects WHERE id = ?;", (project_id,))
+            return (cursor.rowcount or 0) > 0
 
     # ============================================================
     # Image Assets
@@ -866,16 +878,19 @@ class Repository:
         user_id: str,
         email: str,
         password: str,
+        is_active: bool = True,
     ) -> Dict[str, Any]:
+        if not password or len(password) > 256:
+            raise ValueError("Password must be between 1 and 256 characters.")
         now = utc_now_iso()
         password_hash, password_salt = _hash_password(password)
         with self.db.session() as conn:
             conn.execute(
                 """
                 INSERT INTO users (id, email, password_hash, password_salt, is_active, created_at)
-                VALUES (?, ?, ?, ?, 1, ?);
+                VALUES (?, ?, ?, ?, ?, ?);
                 """,
-                (user_id, email, password_hash, password_salt, now)
+                (user_id, email, password_hash, password_salt, 1 if is_active else 0, now)
             )
         return self.get_user(user_id)
 
@@ -883,17 +898,40 @@ class Repository:
         with self.db.session() as conn:
             cursor = conn.execute("SELECT * FROM users WHERE id = ?;", (user_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            data = dict(row)
+            data["is_active"] = bool(data.get("is_active"))
+            return data
 
     def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         with self.db.session() as conn:
             cursor = conn.execute("SELECT * FROM users WHERE email = ?;", (email,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            data = dict(row)
+            data["is_active"] = bool(data.get("is_active"))
+            return data
+
+    def set_user_active(self, user_id: str, is_active: bool) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            conn.execute(
+                "UPDATE users SET is_active = ? WHERE id = ?;",
+                (1 if is_active else 0, user_id),
+            )
+        return self.get_user(user_id)
 
     def verify_user_password(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        if not email or not password or len(password) > 256:
+            return None
         user = self.get_user_by_email(email)
         if not user:
+            # Perform dummy hash computation to mitigate timing attacks
+            _hash_password(password, b"\x00" * 16)
+            return None
+        if not user.get("is_active"):
+            _hash_password(password, b"\x00" * 16)
             return None
         if _verify_password(password, user["password_hash"], user["password_salt"]):
             return user
@@ -907,13 +945,14 @@ class Repository:
         expires_at: str,
     ) -> Dict[str, Any]:
         token_hash = _hash_token(token)
+        now = utc_now_iso()
         with self.db.session() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
                 VALUES (?, ?, ?, ?, ?);
                 """,
-                (session_id, user_id, token_hash, expires_at, now := utc_now_iso())
+                (session_id, user_id, token_hash, expires_at, now)
             )
         return self.get_session_by_token(token)
 
@@ -936,14 +975,53 @@ class Repository:
             )
             return cursor.rowcount > 0
 
+    def delete_user_sessions(self, user_id: str) -> int:
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE user_id = ?;",
+                (user_id,)
+            )
+            return cursor.rowcount or 0
+
     def cleanup_expired_sessions(self) -> int:
         now = utc_now_iso()
         with self.db.session() as conn:
             cursor = conn.execute(
-                "DELETE FROM sessions WHERE expires_at < ?;",
+                "DELETE FROM sessions WHERE expires_at <= ?;",
                 (now,)
             )
             return cursor.rowcount or 0
+
+    def record_failed_login(self, identifier: str, ip_address: str) -> None:
+        import uuid
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO login_attempts (id, identifier, ip_address, attempted_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                (str(uuid.uuid4()), identifier.lower().strip(), ip_address, now),
+            )
+
+    def count_failed_logins(self, identifier: str, ip_address: str, since_iso: str) -> int:
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM login_attempts
+                WHERE (identifier = ? OR ip_address = ?) AND attempted_at >= ?;
+                """,
+                (identifier.lower().strip(), ip_address, since_iso),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def clear_failed_logins(self, identifier: str, ip_address: str) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                "DELETE FROM login_attempts WHERE identifier = ? OR ip_address = ?;",
+                (identifier.lower().strip(), ip_address),
+            )
 
     # ============================================================
     # Figure Grouping (existing)

@@ -55,9 +55,14 @@ class AIConfig:
         file_env = load_dotenv_values(env_file_path) if read_dotenv else {}
 
         def get_val(key: str, default: str) -> str:
-            return os.environ.get(key) or file_env.get(key) or default
+            if key in os.environ:
+                return os.environ[key] or default
+            return file_env.get(key) or default
 
-        token = os.environ.get("HF_TOKEN") or file_env.get("HF_TOKEN") or None
+        if "HF_TOKEN" in os.environ:
+            token = os.environ["HF_TOKEN"] or None
+        else:
+            token = file_env.get("HF_TOKEN") or None
 
         raw_model = get_val("HF_MODEL", "zai-org/GLM-5.3-Flash")
         explicit_provider = get_val("HF_PROVIDER", "novita")

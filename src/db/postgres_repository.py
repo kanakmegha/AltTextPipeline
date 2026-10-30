@@ -76,6 +76,7 @@ class PostgresRepository:
         source_checksum: str,
         language_variant: str = "en-GB",
         status: str = "created",
+        owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = utc_now_iso()
         with self.db.session() as conn:
@@ -85,12 +86,12 @@ class PostgresRepository:
                     INSERT INTO projects (
                         id, name, source_filename, source_storage_key,
                         source_checksum, language_variant, status,
-                        cleanup_status, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'retained', %s, %s);
+                        cleanup_status, owner_id, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'retained', %s, %s, %s);
                     """,
                     (
                         project_id, name, source_filename, source_storage_key,
-                        source_checksum, language_variant, status, now, now
+                        source_checksum, language_variant, status, owner_id, now, now
                     )
                 )
         return self.get_project(project_id)
@@ -135,10 +136,16 @@ class PostgresRepository:
                 cur.execute(query, tuple(values))
         return self.get_project(project_id)
 
-    def list_projects(self) -> List[Dict[str, Any]]:
+    def list_projects(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.db.session() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM projects ORDER BY created_at DESC;")
+                if owner_id is not None:
+                    cur.execute(
+                        "SELECT * FROM projects WHERE owner_id = %s ORDER BY created_at DESC;",
+                        (owner_id,),
+                    )
+                else:
+                    cur.execute("SELECT * FROM projects ORDER BY created_at DESC;")
                 rows = cur.fetchall()
                 result = []
                 for r in rows:
@@ -147,6 +154,12 @@ class PostgresRepository:
                     data["updated_at"] = _to_iso(data.get("updated_at"))
                     result.append(data)
                 return result
+
+    def delete_project(self, project_id: str) -> bool:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM projects WHERE id = %s;", (project_id,))
+                return (cur.rowcount or 0) > 0
 
     # ============================================================
     # Image Assets
@@ -971,7 +984,10 @@ class PostgresRepository:
         user_id: str,
         email: str,
         password: str,
+        is_active: bool = True,
     ) -> Dict[str, Any]:
+        if not password or len(password) > 256:
+            raise ValueError("Password must be between 1 and 256 characters.")
         now = utc_now_iso()
         password_hash, password_salt = _hash_password(password)
         with self.db.session() as conn:
@@ -979,9 +995,9 @@ class PostgresRepository:
                 cur.execute(
                     """
                     INSERT INTO users (id, email, password_hash, password_salt, is_active, created_at)
-                    VALUES (%s, %s, %s, %s, TRUE, %s);
+                    VALUES (%s, %s, %s, %s, %s, %s);
                     """,
-                    (user_id, email, password_hash, password_salt, now)
+                    (user_id, email, password_hash, password_salt, bool(is_active), now)
                 )
         return self.get_user(user_id)
 
@@ -993,6 +1009,7 @@ class PostgresRepository:
                 if not row:
                     return None
                 data = dict(row)
+                data["is_active"] = bool(data.get("is_active"))
                 data["created_at"] = _to_iso(data.get("created_at"))
                 return data
 
@@ -1004,12 +1021,28 @@ class PostgresRepository:
                 if not row:
                     return None
                 data = dict(row)
+                data["is_active"] = bool(data.get("is_active"))
                 data["created_at"] = _to_iso(data.get("created_at"))
                 return data
 
+    def set_user_active(self, user_id: str, is_active: bool) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET is_active = %s WHERE id = %s;",
+                    (bool(is_active), user_id),
+                )
+        return self.get_user(user_id)
+
     def verify_user_password(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        if not email or not password or len(password) > 256:
+            return None
         user = self.get_user_by_email(email)
         if not user:
+            _hash_password(password, b"\x00" * 16)
+            return None
+        if not user.get("is_active"):
+            _hash_password(password, b"\x00" * 16)
             return None
         if _verify_password(password, user["password_hash"], user["password_salt"]):
             return user
@@ -1061,15 +1094,58 @@ class PostgresRepository:
                 )
                 return cur.rowcount > 0
 
+    def delete_user_sessions(self, user_id: str) -> int:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sessions WHERE user_id = %s;",
+                    (user_id,)
+                )
+                return cur.rowcount or 0
+
     def cleanup_expired_sessions(self) -> int:
         now = utc_now_iso()
         with self.db.session() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM sessions WHERE expires_at < %s;",
+                    "DELETE FROM sessions WHERE expires_at <= %s;",
                     (now,)
                 )
                 return cur.rowcount or 0
+
+    def record_failed_login(self, identifier: str, ip_address: str) -> None:
+        import uuid
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO login_attempts (id, identifier, ip_address, attempted_at)
+                    VALUES (%s, %s, %s, %s);
+                    """,
+                    (str(uuid.uuid4()), identifier.lower().strip(), ip_address, now),
+                )
+
+    def count_failed_logins(self, identifier: str, ip_address: str, since_iso: str) -> int:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt FROM login_attempts
+                    WHERE (identifier = %s OR ip_address = %s) AND attempted_at >= %s;
+                    """,
+                    (identifier.lower().strip(), ip_address, since_iso),
+                )
+                row = cur.fetchone()
+                return int(row["cnt"]) if row and row.get("cnt") is not None else 0
+
+    def clear_failed_logins(self, identifier: str, ip_address: str) -> None:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM login_attempts WHERE identifier = %s OR ip_address = %s;",
+                    (identifier.lower().strip(), ip_address),
+                )
 
     # ============================================================
     # Figure Grouping (existing)

@@ -37,11 +37,11 @@ def create_connection(
     """
     if backend == "postgres":
         if not database_url:
-            database_url = os_get("DATABASE_URL")
+            database_url = os_get("DATABASE_URL") or os_get("NEON_DB_URL")
         if not database_url:
             raise ValueError(
-                "DATABASE_URL is required when backend='postgres'. "
-                "Set it to your Vercel Postgres connection string."
+                "DATABASE_URL or NEON_DB_URL is required when backend='postgres'. "
+                "Set it to your PostgreSQL connection string."
             )
         return PostgresConnection(database_url=database_url)
 

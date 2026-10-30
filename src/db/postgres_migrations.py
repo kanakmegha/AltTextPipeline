@@ -54,17 +54,33 @@ def _execute_sql_script(conn, sql: str) -> None:
                     cur.execute(stmt)
 
 
+
 def _current_version(conn) -> int:
     """Return the current schema migration version."""
+
     try:
         with conn.session() as c:
             with c.cursor() as cur:
-                cur.execute("SELECT MAX(version) FROM schema_migrations;")
+                cur.execute("""
+                    SELECT MAX(version) AS max_version
+                    FROM schema_migrations;
+                """)
+
                 row = cur.fetchone()
-                return int(row[0]) if (row and row[0] is not None) else 0
-    except Exception:
-        # schema_migrations table doesn't exist yet (fresh database)
-        return 0
+
+                if not row:
+                    return 0
+
+                version = row["max_version"]
+
+                return int(version) if version is not None else 0
+
+    except Exception as exc:
+        # Only treat a genuinely missing migration table as version 0.
+        # Do not silently hide connection, permission or query errors.
+        if "does not exist" in str(exc).lower():
+            return 0
+        raise
 
 
 def _record_version(conn, version: int) -> None:
@@ -234,5 +250,16 @@ def apply_migrations(db: PostgresConnection) -> int:
                         pass
         _record_version(db, 5)
         current_version = 5
+
+    # Ensure owner_id column exists on projects for multi-user authorization
+    if not _column_exists(db, "projects", "owner_id"):
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS owner_id TEXT;"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);"
+                )
 
     return current_version
