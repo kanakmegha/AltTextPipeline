@@ -817,6 +817,7 @@ class PostgresRepository:
                 data = dict(row)
                 data["started_at"] = _to_iso(data.get("started_at"))
                 data["completed_at"] = _to_iso(data.get("completed_at"))
+                data["lease_updated_at"] = _to_iso(data.get("lease_updated_at"))
                 data["created_at"] = _to_iso(data.get("created_at"))
                 data["page_numbers"] = json.loads(data["page_numbers"]) if data.get("page_numbers") else None
                 return data
@@ -829,6 +830,17 @@ class PostgresRepository:
         error_message: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
+        if status == "running" and not increment_attempt:
+            with self.db.session() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE jobs SET status='running', error_message=NULL,
+                           started_at=COALESCE(started_at, %s), lease_updated_at=%s
+                           WHERE id=%s AND status IN ('queued','running');""",
+                        (now, now, job_id),
+                    )
+            return self.get_job(job_id)
+
         job = self.get_job(job_id)
         if not job:
             return None
@@ -848,7 +860,7 @@ class PostgresRepository:
                         started_at = COALESCE(started_at, %s),
                         completed_at = %s,
                         lease_updated_at = CASE WHEN %s = 'running' THEN %s ELSE lease_updated_at END
-                    WHERE id = %s;
+                    WHERE id = %s AND status NOT IN ('completed','cancelled');
                     """,
                     (status, attempts, error_message, started_at, completed_at, status, now, job_id)
                 )
@@ -864,6 +876,7 @@ class PostgresRepository:
                     data = dict(r)
                     data["started_at"] = _to_iso(data.get("started_at"))
                     data["completed_at"] = _to_iso(data.get("completed_at"))
+                    data["lease_updated_at"] = _to_iso(data.get("lease_updated_at"))
                     data["created_at"] = _to_iso(data.get("created_at"))
                     data["page_numbers"] = json.loads(data["page_numbers"]) if data.get("page_numbers") else None
                     result.append(data)

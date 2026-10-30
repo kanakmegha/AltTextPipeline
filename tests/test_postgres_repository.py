@@ -510,3 +510,27 @@ def test_postgres_job_claim_is_atomic_and_reclaimable(repo):
             cur.execute("UPDATE jobs SET lease_updated_at='2000-01-01T00:00:00+00:00' WHERE id=%s;", (job_id,))
     assert repo.claim_job(job_id, "2020-01-01T00:00:00+00:00", utc_now_iso()) is not None
     assert repo.get_job(job_id)["attempt_count"] == 2
+
+
+def test_postgres_running_status_renews_lease_without_resurrecting_terminal_job(repo):
+    from src.db.repository import utc_now_iso
+
+    project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    repo.create_project(project_id, "Lease renewal", "x.pdf", "source/x.pdf", "checksum")
+    repo.create_job(job_id, project_id, "extraction")
+    repo.update_job_status(job_id, "running")
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE jobs SET lease_updated_at='2000-01-01T00:00:00+00:00' WHERE id=%s;", (job_id,))
+
+    repo.update_job_status(job_id, "running")
+    renewed = repo.get_job(job_id)
+    assert renewed["lease_updated_at"] > "2000-01-01T00:00:00+00:00"
+
+    repo.update_job_status(job_id, "completed")
+    completed = repo.get_job(job_id)
+    repo.update_job_status(job_id, "running")
+    after_late_heartbeat = repo.get_job(job_id)
+    assert after_late_heartbeat["status"] == "completed"
+    assert after_late_heartbeat["completed_at"] == completed["completed_at"]
+    assert after_late_heartbeat["lease_updated_at"] == completed["lease_updated_at"]

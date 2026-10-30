@@ -1,4 +1,5 @@
 import { upload } from "@vercel/blob/client";
+import { getProjectReviewUrl } from "./upload-status.js";
 
 /**
  * AltTextPipeline — Stage 1: Upload & Extract Frontend Controller
@@ -248,12 +249,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const data = await res.json();
         const status = data.status;
 
-        if (status === "completed") {
+        const reviewUrl = getProjectReviewUrl(status, projectId);
+        if (reviewUrl) {
           clearInterval(statusPollInterval);
           statusPollInterval = null;
           hideProgress();
           // Navigate to Review & Edit
-          window.location.href = `/review/${projectId}`;
+          window.location.href = reviewUrl;
         } else if (status === "failed") {
           clearInterval(statusPollInterval);
           statusPollInterval = null;

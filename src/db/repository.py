@@ -744,6 +744,16 @@ class Repository:
         error_message: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
+        if status == "running" and not increment_attempt:
+            with self.db.session() as conn:
+                conn.execute(
+                    """UPDATE jobs SET status='running', error_message=NULL,
+                       started_at=COALESCE(started_at, ?), lease_updated_at=?
+                       WHERE id=? AND status IN ('queued','running');""",
+                    (now, now, job_id),
+                )
+            return self.get_job(job_id)
+
         job = self.get_job(job_id)
         if not job:
             return None
@@ -762,7 +772,7 @@ class Repository:
                     started_at = COALESCE(started_at, ?),
                         completed_at = ?,
                         lease_updated_at = CASE WHEN ? = 'running' THEN ? ELSE lease_updated_at END
-                WHERE id = ?;
+                WHERE id = ? AND status NOT IN ('completed','cancelled');
                 """,
                     (status, attempts, error_message, started_at, completed_at, status, now, job_id)
             )

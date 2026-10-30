@@ -189,6 +189,26 @@ def test_worker_reclaims_abandoned_running_job_after_restart(tmp_path):
     assert repo.get_job(job_id)["status"] == "completed"
 
 
+def test_running_status_renews_lease_without_resurrecting_terminal_job(tmp_path):
+    repo, _, job_id = _make_job(tmp_path)
+    repo.update_job_status(job_id, "running")
+    with repo.db.session() as conn:
+        conn.execute("UPDATE jobs SET lease_updated_at='2000-01-01T00:00:00+00:00' WHERE id=?", (job_id,))
+
+    repo.update_job_status(job_id, "running")
+    renewed = repo.get_job(job_id)
+    assert renewed["lease_updated_at"] > "2000-01-01T00:00:00+00:00"
+    assert renewed["status"] == "running"
+
+    repo.update_job_status(job_id, "completed")
+    completed = repo.get_job(job_id)
+    repo.update_job_status(job_id, "running")
+    after_late_heartbeat = repo.get_job(job_id)
+    assert after_late_heartbeat["status"] == "completed"
+    assert after_late_heartbeat["completed_at"] == completed["completed_at"]
+    assert after_late_heartbeat["lease_updated_at"] == completed["lease_updated_at"]
+
+
 def test_queue_publish_failure_leaves_job_recoverable_from_database(tmp_path, monkeypatch):
     repo, _, job_id = _make_job(tmp_path)
     monkeypatch.setenv("REDIS_URL", "redis://queue.invalid/0")

@@ -4784,6 +4784,17 @@ ${newlined}
     }
   });
 
+  // src/web/static/upload-status.js
+  var require_upload_status = __commonJS({
+    "src/web/static/upload-status.js"(exports, module) {
+      function getProjectReviewUrl2(status, projectId) {
+        if (status !== "completed" && status !== "ready_for_review") return null;
+        return `/review/${encodeURIComponent(projectId)}`;
+      }
+      module.exports = { getProjectReviewUrl: getProjectReviewUrl2 };
+    }
+  });
+
   // node_modules/is-node-process/lib/index.mjs
   function isNodeProcess() {
     if (typeof navigator !== "undefined" && navigator.product === "ReactNative") {
@@ -6499,6 +6510,7 @@ ${newlined}
   }
 
   // src/web/static/upload.js
+  var import_upload_status = __toESM(require_upload_status());
   document.addEventListener("DOMContentLoaded", () => {
     const dropzone = document.getElementById("dropzone");
     const fileInput = document.getElementById("pdfFile");
@@ -6699,11 +6711,12 @@ ${newlined}
           }
           const data = await res.json();
           const status = data.status;
-          if (status === "completed") {
+          const reviewUrl = (0, import_upload_status.getProjectReviewUrl)(status, projectId);
+          if (reviewUrl) {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
             hideProgress();
-            window.location.href = `/review/${projectId}`;
+            window.location.href = reviewUrl;
           } else if (status === "failed") {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
