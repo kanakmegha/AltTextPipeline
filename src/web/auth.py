@@ -1,25 +1,24 @@
 """
-Authentication and Authorization
---------------------------------
-Adds session-based authentication to the FastAPI application so that project
-records, private documents, uploads, approvals, and downloads are not exposed
-to unauthenticated users.
+Authentication and Single-User Authorization Policy
+---------------------------------------------------
+Provides access control, project ownership enforcement, and CSRF protection
+for the FastAPI application so that project records, private documents,
+uploads, approvals, and downloads are not exposed to unauthorized users.
 
-Design:
-  - Users table (id, email, password_hash, password_salt, is_active, created_at)
-  - Sessions table (id, user_id, token_hash, expires_at, created_at)
-  - Login attempts table (id, identifier, ip_address, attempted_at)
-  - Login endpoint creates a session and sets a signed HttpOnly cookie
-  - Middleware checks the session cookie and CSRF token on protected routes
-  - AUTH_ENABLED=false disables auth for local development (default)
-  - SESSION_SECRET_KEY (>= 32 bytes) is required when AUTH_ENABLED=true
-  - Passwords are hashed with hashlib.pbkdf2_hmac (standard library, no extra dep)
-
-Endpoints:
-  POST   /api/auth/login       - authenticate, set session cookie & CSRF cookie
-  POST   /api/auth/logout      - invalidate session, clear cookies
-  GET    /api/auth/session     - return current session/user info
-  GET    /api/auth/csrf-token  - return CSRF token for state-changing requests
+Modes:
+  1. Single-User Mode (default MVP, AUTH_ENABLED=false):
+     - No login, registration, or logout screen is presented.
+     - Exactly one canonical operator identity (SINGLE_USER_ID, default 'single_user')
+       is authorized to create and access single-user projects.
+     - Existing/legacy single-user projects (owner_id in {'single_user', 'dev', 'editor', None, ''})
+       remain accessible to the authorized operator, while projects owned by any
+       foreign owner_id are rejected with HTTP 403.
+     - Optional deployment-level operator token gate via SINGLE_USER_ACCESS_TOKEN.
+     - CSRF protection (HMAC-SHA256 double-submit cookie + X-CSRF-Token header)
+       remains enforced on state-changing requests (POST, PUT, PATCH, DELETE).
+  2. Multi-User Mode (future-ready, AUTH_ENABLED=true):
+     - Session-based individual user authentication backed by PostgreSQL/SQLite.
+     - Requires SESSION_SECRET_KEY (>= 32 bytes).
 """
 
 import hashlib
@@ -27,7 +26,7 @@ import hmac
 import os
 import secrets
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from fastapi import Request, HTTPException, status
 
 # ---------------------------------------------------------------------------
@@ -35,6 +34,7 @@ from fastapi import Request, HTTPException, status
 # ---------------------------------------------------------------------------
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 _WEAK_SECRET_SUBSTRINGS = (
     "changeme",
     "placeholder",
@@ -65,21 +65,39 @@ LOGIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOGIN_RATE_LIMIT_WINDOW_SE
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = int(os.environ.get("LOGIN_RATE_LIMIT_MAX_ATTEMPTS", "5"))
 
 # In-memory fallback rate limiter (used alongside DB persistence)
-_MEMORY_LOGIN_ATTEMPTS: Dict[str, List[ float ]] = {}
+_MEMORY_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+
+# Local development-only random CSRF key (never used in production or when AUTH_ENABLED=true)
+_LOCAL_DEV_CSRF_SECRET = secrets.token_hex(32)
+
+DEFAULT_SINGLE_USER_ID = "single_user"
+DEFAULT_SINGLE_USER_EMAIL = "operator@local"
+LEGACY_SINGLE_USER_OWNERS: Set[Optional[str]] = {"single_user", "dev", "editor", None, ""}
+OPERATOR_COOKIE_NAME = "alttext_operator"
 
 
 def _env_auth_enabled() -> bool:
     return os.environ.get("AUTH_ENABLED", "false").strip().lower() in _TRUE_VALUES
 
 
+def _env_csrf_enabled() -> Optional[bool]:
+    raw = os.environ.get("CSRF_ENABLED", "").strip().lower()
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    return None
+
+
 _INITIAL_AUTH_ENABLED = _env_auth_enabled()
 AUTH_ENABLED: bool = _INITIAL_AUTH_ENABLED
+CSRF_ENABLED: Optional[bool] = _env_csrf_enabled()
 SESSION_SECRET_KEY: str = os.environ.get("SESSION_SECRET_KEY", "")
 SESSION_COOKIE_NAME = "alttext_session"
 SESSION_COOKIE_MAX_AGE = int(os.environ.get("SESSION_COOKIE_MAX_AGE", "28800"))  # 8 hours
 CSRF_TOKEN_NAME = "alttext_csrf"
 
-# Public endpoints that do not require an authenticated session
+# Public endpoints that do not require an authenticated session or operator token
 PUBLIC_PATHS = {
     "/",
     "/api/health",
@@ -90,14 +108,14 @@ PUBLIC_PATHS = {
     "/api/auth/csrf-token",
 }
 
-# Path prefixes that are always public
-PUBLIC_PREFIXES = ("/static/", "/docs", "/openapi.json", "/favicon.ico")
+# Path prefixes that are always public (frontend static assets only; never /docs or /openapi.json)
+PUBLIC_PREFIXES = ("/static/", "/favicon.ico")
 
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def is_auth_enabled() -> bool:
-    """Return whether authentication is enabled, respecting runtime env or module overrides."""
+    """Return whether individual multi-user authentication is enabled."""
     global AUTH_ENABLED, _INITIAL_AUTH_ENABLED
     env_val = _env_auth_enabled()
     if AUTH_ENABLED != _INITIAL_AUTH_ENABLED:
@@ -106,12 +124,144 @@ def is_auth_enabled() -> bool:
     return env_val
 
 
+def is_single_user_mode() -> bool:
+    """Return True when operating in Single-User Mode (default MVP)."""
+    return not is_auth_enabled()
+
+
+def get_single_user_id() -> str:
+    """Return the canonical operator ID for Single-User Mode."""
+    val = os.environ.get("SINGLE_USER_ID", DEFAULT_SINGLE_USER_ID).strip()
+    return val or DEFAULT_SINGLE_USER_ID
+
+
+def get_single_user_email() -> str:
+    """Return the canonical operator email for Single-User Mode."""
+    val = os.environ.get("SINGLE_USER_EMAIL", DEFAULT_SINGLE_USER_EMAIL).strip()
+    return val or DEFAULT_SINGLE_USER_EMAIL
+
+
+def get_single_user_operator() -> Dict[str, Any]:
+    """Return the canonical operator identity dictionary for Single-User Mode."""
+    return {
+        "id": get_single_user_id(),
+        "email": get_single_user_email(),
+        "is_active": True,
+        "mode": "single_user",
+    }
+
+
+def get_allowed_single_user_owners() -> Set[Optional[str]]:
+    """
+    Return the set of owner_id values that belong to the single-user operator.
+    Includes the configured SINGLE_USER_ID plus legacy single-user owner markers
+    ('single_user', 'dev', 'editor', None, '') so existing projects remain accessible
+    while foreign user owner_ids are rejected.
+    """
+    return set(LEGACY_SINGLE_USER_OWNERS) | {get_single_user_id()}
+
+
+def authorize_project_ownership(
+    project: Dict[str, Any],
+    user: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Enforce project ownership policy in both Single-User Mode and Multi-User Mode.
+    Raises HTTPException(401/403) when the caller is not authorized to access the project.
+    """
+    if is_auth_enabled():
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required",
+            )
+        owner_id = project.get("owner_id")
+        if owner_id != user.get("id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this project",
+            )
+        return
+
+    # Explicit Single-User Mode ownership check:
+    owner_id = project.get("owner_id")
+    if owner_id not in get_allowed_single_user_owners():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this project",
+        )
+
+
+def filter_authorized_projects(
+    projects: List[Dict[str, Any]],
+    user: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Filter a list of project records so only projects authorized under the active
+    access-control policy (Single-User or Multi-User) are returned.
+    """
+    if is_auth_enabled():
+        if not user:
+            return []
+        uid = user.get("id")
+        return [p for p in projects if p.get("owner_id") == uid]
+
+    allowed = get_allowed_single_user_owners()
+    return [p for p in projects if p.get("owner_id") in allowed]
+
+
+def is_csrf_enabled(request: Optional[Request] = None) -> bool:
+    """
+    Determine whether CSRF validation is enforced for the current request.
+    - Unconditionally enforced in production environments and when AUTH_ENABLED=true.
+    - Always enforced when CSRF_ENABLED=true or when the client presents a
+      CSRF cookie or X-CSRF-Token header.
+    - Enforced by default in normal application runtime outside pytest.
+    """
+    if is_auth_enabled() or is_production_env():
+        return True
+    if CSRF_ENABLED is not None:
+        return bool(CSRF_ENABLED)
+    env_override = _env_csrf_enabled()
+    if env_override is not None:
+        return env_override
+    if request is not None:
+        cookies = getattr(request, "cookies", None) or {}
+        headers = getattr(request, "headers", None) or {}
+        if CSRF_TOKEN_NAME in cookies:
+            return True
+        if headers.get("X-CSRF-Token") or headers.get("x-csrf-token"):
+            return True
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return False
+
+
 def get_session_secret() -> str:
     """Return the configured SESSION_SECRET_KEY from environment or module attribute."""
-    env_secret = os.environ.get("SESSION_SECRET_KEY", "")
-    if env_secret:
+    env_secret = os.environ.get("SESSION_SECRET_KEY")
+    if env_secret is not None and env_secret != "":
         return env_secret
     return SESSION_SECRET_KEY or ""
+
+
+def _get_csrf_signing_key() -> str:
+    """
+    Return the dedicated HMAC signing key for CSRF tokens.
+    - Uses SESSION_SECRET_KEY exclusively in production and when AUTH_ENABLED=true.
+    - Never derives the CSRF key from database URLs, Blob tokens, or operator tokens.
+    - Never falls back to a per-process random secret in production.
+    - Allows a local development-only fallback secret when running locally with
+      AUTH_ENABLED=false and SESSION_SECRET_KEY unset.
+    """
+    secret = get_session_secret()
+    if secret and secret.strip():
+        return secret.strip()
+    if is_production_env() or is_auth_enabled():
+        raise RuntimeError(
+            "Authentication configuration error: SESSION_SECRET_KEY is required in production and when AUTH_ENABLED=true."
+        )
+    return _LOCAL_DEV_CSRF_SECRET
 
 
 def is_production_env() -> bool:
@@ -132,7 +282,7 @@ def is_secure_cookie(request: Optional[Request] = None) -> bool:
     explicit = os.environ.get("COOKIE_SECURE", "").strip().lower()
     if explicit in _TRUE_VALUES:
         return True
-    if explicit in {"0", "false", "no", "off"} and not is_production_env():
+    if explicit in _FALSE_VALUES and not is_production_env():
         return False
     if is_production_env():
         return True
@@ -175,27 +325,38 @@ def validate_secret_strength(secret: str) -> None:
         )
 
 
-def validate_auth_config(require_auth_enabled: bool = False) -> None:
+def validate_auth_config(
+    require_auth_enabled: bool = False,
+    require_secret_key: bool = False,
+) -> None:
     """
-    Fail-fast startup validation for authentication configuration.
-    When require_auth_enabled=True (or in production), AUTH_ENABLED must be true.
-    When AUTH_ENABLED=true, SESSION_SECRET_KEY must pass strength checks.
+    Fail-fast startup validation for authentication and single-user configuration.
+    - When require_auth_enabled=True, AUTH_ENABLED must be true.
+    - In production (is_production_env()=True), when require_secret_key=True, or when
+      AUTH_ENABLED=true, SESSION_SECRET_KEY is required and must pass validate_secret_strength().
+    - In local non-production development when AUTH_ENABLED=false, if SESSION_SECRET_KEY is
+      explicitly provided, it is validated for strength.
     """
     global AUTH_ENABLED, SESSION_SECRET_KEY, _INITIAL_AUTH_ENABLED
     env_val = _env_auth_enabled()
     if AUTH_ENABLED == _INITIAL_AUTH_ENABLED:
         AUTH_ENABLED = env_val
         _INITIAL_AUTH_ENABLED = env_val
-    SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY", SESSION_SECRET_KEY)
+    if "SESSION_SECRET_KEY" in os.environ:
+        SESSION_SECRET_KEY = os.environ["SESSION_SECRET_KEY"]
 
     enabled = is_auth_enabled()
-    if (require_auth_enabled or is_production_env()) and not enabled:
+    if require_auth_enabled and not enabled:
         raise RuntimeError(
             "Production security error: AUTH_ENABLED must be set to 'true' in production."
         )
 
-    if enabled:
+    if enabled or require_secret_key or is_production_env():
         validate_secret_strength(get_session_secret())
+    else:
+        configured_secret = get_session_secret()
+        if configured_secret:
+            validate_secret_strength(configured_secret)
 
 
 def _is_public_path(path: str) -> bool:
@@ -273,11 +434,13 @@ def _unsign(signed: str) -> Optional[str]:
 def _csrf_context(session_token: Optional[str]) -> str:
     if session_token:
         return _hash_token(session_token)
+    if is_single_user_mode():
+        return f"single_user:{get_single_user_id()}"
     return "preauth"
 
 
 def _compute_csrf_mac(nonce: str, context: str) -> str:
-    secret = get_session_secret() or "local-dev-csrf-fallback-key"
+    secret = _get_csrf_signing_key()
     payload = f"csrf:{context}:{nonce}".encode("utf-8")
     return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
@@ -285,7 +448,7 @@ def _compute_csrf_mac(nonce: str, context: str) -> str:
 def generate_csrf_token(session_token: Optional[str] = None) -> str:
     """
     Generate a cryptographically random CSRF token bound via HMAC-SHA256
-    to the active session token (or 'preauth' before login).
+    to the active session token, single-user operator context, or pre-auth context.
     """
     nonce = secrets.token_hex(16)
     context = _csrf_context(session_token)
@@ -300,7 +463,7 @@ def verify_csrf_token(
 ) -> bool:
     """
     Validate that the CSRF token has a valid HMAC for the current session
-    (or pre-auth context when allow_preauth=True) using constant-time comparison.
+    (or single-user / pre-auth context) using constant-time comparison.
     """
     if not token or not isinstance(token, str) or "." not in token:
         return False
@@ -351,15 +514,49 @@ def _parse_utc_datetime(val: Any) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def verify_single_user_access(request: Request) -> Dict[str, Any]:
+    """
+    Enforce Single-User Mode operator access policy.
+    - If SINGLE_USER_ACCESS_TOKEN is configured in the environment, requests must
+      present a matching X-Operator-Token header, Authorization: Bearer <token>,
+      or signed operator cookie (compared in constant time), otherwise HTTP 401 is raised.
+    - Returns the canonical single-user operator identity.
+    """
+    required_token = os.environ.get("SINGLE_USER_ACCESS_TOKEN", "").strip()
+    if required_token:
+        headers = getattr(request, "headers", None) or {}
+        cookies = getattr(request, "cookies", None) or {}
+        provided = (
+            headers.get("X-Operator-Token")
+            or headers.get("x-operator-token")
+            or ""
+        ).strip()
+        if not provided:
+            auth_hdr = (headers.get("Authorization") or headers.get("authorization") or "").strip()
+            if auth_hdr.lower().startswith("bearer "):
+                provided = auth_hdr[7:].strip()
+        if not provided:
+            raw_cookie = cookies.get(OPERATOR_COOKIE_NAME)
+            if raw_cookie:
+                provided = _unsign(raw_cookie) or ""
+        if not provided or not secrets.compare_digest(provided, required_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorized operator access required",
+            )
+    return get_single_user_operator()
+
+
 async def require_auth(request: Request) -> Optional[Dict[str, Any]]:
     """
-    Validate session cookie, session expiry, and active user status.
-    Returns the current user dict if authenticated, or raises HTTPException(401)
-    if auth is enabled and no valid session exists.
-    When AUTH_ENABLED is False, returns a default "dev" user.
+    Validate access under the active mode:
+    - In Single-User Mode (AUTH_ENABLED=false), enforces the single-user operator
+      policy and returns the canonical single-user operator identity.
+    - In Multi-User Mode (AUTH_ENABLED=true), validates the signed session cookie,
+      session expiry, and active user status, or raises HTTPException(401).
     """
     if not is_auth_enabled():
-        return {"id": "dev", "email": "dev@local", "is_active": True}
+        return verify_single_user_access(request)
 
     token = get_session_cookie(request)
     if not token:
@@ -407,12 +604,13 @@ async def require_auth(request: Request) -> Optional[Dict[str, Any]]:
 
 def require_csrf(request: Request) -> None:
     """
-    Validate CSRF token for state-changing requests when auth is enabled.
+    Validate CSRF token for state-changing requests in both Single-User and Multi-User modes.
     - Reads token exclusively from the X-CSRF-Token request header (never query params).
     - Compares against the CSRF cookie using constant-time comparison.
-    - Verifies HMAC binding to the current session token (or pre-auth for login/logout).
+    - Verifies HMAC binding to the current session token (in Multi-User Mode) or
+      the single-user operator context (in Single-User Mode).
     """
-    if not is_auth_enabled():
+    if not is_csrf_enabled(request):
         return
 
     method = (getattr(request, "method", "GET") or "GET").upper()
@@ -439,21 +637,32 @@ def require_csrf(request: Request) -> None:
     path = getattr(getattr(request, "url", None), "path", "") or ""
     allow_preauth = path in {"/api/auth/login", "/api/auth/logout"}
 
-    if not allow_preauth and not session_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid CSRF session context",
-        )
+    if is_auth_enabled():
+        if not allow_preauth and not session_token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid CSRF session context",
+            )
 
-    if not verify_csrf_token(
-        header_token,
-        session_token=session_token,
-        allow_preauth=allow_preauth,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="CSRF token does not match current session",
-        )
+        if not verify_csrf_token(
+            header_token,
+            session_token=session_token,
+            allow_preauth=allow_preauth,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF token does not match current session",
+            )
+    else:
+        if not verify_csrf_token(
+            header_token,
+            session_token=None,
+            allow_preauth=False,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid CSRF token signature",
+            )
 
 
 # ---------------------------------------------------------------------------

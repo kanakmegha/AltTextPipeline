@@ -21,12 +21,13 @@ def validate_environment():
     database_url = (
         os.environ.get("DATABASE_URL")
         or os.environ.get("NEON_DB_URL")
+        or os.environ.get("POSTGRES_URL")
     )
 
     if not database_url:
         raise RuntimeError(
             "Missing database configuration. "
-            "Set DATABASE_URL or NEON_DB_URL."
+            "Set DATABASE_URL, NEON_DB_URL, or POSTGRES_URL."
         )
 
     if not os.environ.get("BLOB_READ_WRITE_TOKEN"):
@@ -38,8 +39,8 @@ def validate_environment():
     from src.web import auth
     from src.web.app import parse_cors_origins
 
-    # Enforce production authentication and secret strength
-    auth.validate_auth_config(require_auth_enabled=True)
+    # Validate single-user or multi-user auth configuration and require SESSION_SECRET_KEY in production
+    auth.validate_auth_config(require_auth_enabled=False, require_secret_key=True)
 
     # Validate CORS allowed origins syntax & reject wildcards
     parse_cors_origins(os.environ.get("CORS_ALLOWED_ORIGINS"), is_production=True)

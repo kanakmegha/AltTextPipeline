@@ -33,10 +33,11 @@ class PostgresConnection:
             database_url
             or os.environ.get("DATABASE_URL")
             or os.environ.get("NEON_DB_URL")
+            or os.environ.get("POSTGRES_URL")
         )
         if not self.database_url:
             raise ValueError(
-                "DATABASE_URL or NEON_DB_URL is required for PostgreSQL connections. "
+                "DATABASE_URL, NEON_DB_URL, or POSTGRES_URL is required for PostgreSQL connections. "
                 "Set it to your PostgreSQL connection string."
             )
 

@@ -125,7 +125,7 @@ DEFAULT_DEV_CORS_ORIGINS = [
     "http://127.0.0.1:8000",
 ]
 ALLOWED_CORS_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-ALLOWED_CORS_HEADERS = ["Accept", "Authorization", "Content-Type", "X-CSRF-Token"]
+ALLOWED_CORS_HEADERS = ["Accept", "Authorization", "Content-Type", "X-CSRF-Token", "X-Operator-Token"]
 
 
 def parse_cors_origins(
@@ -213,7 +213,12 @@ def create_app(
     # Database & storage initialization
     # ------------------------------------------------------------------
     if db_conn is None:
-        backend = "postgres" if (os.environ.get("DATABASE_URL") or os.environ.get("NEON_DB_URL")) else "sqlite"
+        has_pg_url = bool(
+            os.environ.get("DATABASE_URL")
+            or os.environ.get("NEON_DB_URL")
+            or os.environ.get("POSTGRES_URL")
+        )
+        backend = "postgres" if has_pg_url else "sqlite"
         if backend == "postgres":
             db_conn = create_connection(backend="postgres")
         else:
@@ -295,10 +300,10 @@ def create_app(
         if method == "OPTIONS":
             return await call_next(request)
 
-        if auth.is_auth_enabled():
-            path = request.url.path
-            is_public = auth._is_public_path(path)
+        path = request.url.path
+        is_public = auth._is_public_path(path)
 
+        if auth.is_auth_enabled():
             if not is_public:
                 try:
                     user = await auth.require_auth(request)
@@ -325,7 +330,29 @@ def create_app(
                         headers=exc.headers or {},
                     )
         else:
-            request.state.user = {"id": "dev", "email": "dev@local", "is_active": True}
+            # Explicit Single-User Mode access & CSRF policy
+            if not is_public:
+                try:
+                    user = await auth.require_auth(request)
+                    request.state.user = user
+                except HTTPException as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                        headers=exc.headers or {},
+                    )
+            else:
+                request.state.user = auth.get_single_user_operator()
+
+            if method not in auth.SAFE_HTTP_METHODS:
+                try:
+                    auth.require_csrf(request)
+                except HTTPException as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                        headers=exc.headers or {},
+                    )
 
         response = await call_next(request)
         return response
@@ -344,18 +371,18 @@ def create_app(
         project_id: str,
         include_id_in_404: bool = False,
     ) -> Dict[str, Any]:
-        """Verify that the project exists and the authenticated user owns it."""
+        """
+        Verify that the caller is an authorized operator/user, that the project
+        exists, and that the project is authorized under the active ownership policy.
+        """
+        if not auth.is_auth_enabled():
+            auth.verify_single_user_access(request)
         project = repo.get_project(project_id)
         if not project:
             msg = f"Project '{project_id}' not found" if include_id_in_404 else "Project not found"
             raise HTTPException(status_code=404, detail=msg)
-        if auth.is_auth_enabled():
-            user = getattr(request.state, "user", None)
-            if not user:
-                raise HTTPException(status_code=401, detail="Authentication required")
-            owner_id = project.get("owner_id")
-            if owner_id != user.get("id"):
-                raise HTTPException(status_code=403, detail="Not authorized to access this project")
+        user = getattr(request.state, "user", None)
+        auth.authorize_project_ownership(project, user)
         return project
 
     def _resolve_actor_id(request: Request, fallback: str = "editor") -> str:
@@ -460,28 +487,44 @@ def create_app(
     @app.get("/api/auth/session")
     async def get_session(request: Request):
         if not auth.is_auth_enabled():
-            return JSONResponse({"auth_enabled": False, "user": {"id": "dev", "email": "dev@local"}})
+            try:
+                operator = await auth.require_auth(request)
+            except HTTPException as exc:
+                return JSONResponse({"auth_enabled": False, "single_user_mode": True, "user": None}, status_code=exc.status_code)
+            return JSONResponse(
+                {
+                    "auth_enabled": False,
+                    "single_user_mode": True,
+                    "user": {"id": operator["id"], "email": operator["email"]},
+                }
+            )
         try:
             user = await auth.require_auth(request)
-            return JSONResponse({"auth_enabled": True, "user": {"id": user["id"], "email": user["email"]}})
+            return JSONResponse({"auth_enabled": True, "single_user_mode": False, "user": {"id": user["id"], "email": user["email"]}})
         except HTTPException:
-            return JSONResponse({"auth_enabled": True, "user": None}, status_code=401)
+            return JSONResponse({"auth_enabled": True, "single_user_mode": False, "user": None}, status_code=401)
 
     @app.get("/api/auth/csrf-token")
     async def get_csrf_token(request: Request):
-        if not auth.is_auth_enabled():
-            token = auth.generate_csrf_token(session_token=None)
-            return JSONResponse({"csrf_token": token, "auth_enabled": False})
-
-        session_token = auth.get_session_cookie(request)
+        session_token = auth.get_session_cookie(request) if auth.is_auth_enabled() else None
         existing = request.cookies.get(auth.CSRF_TOKEN_NAME)
-        if existing and auth.verify_csrf_token(existing, session_token=session_token, allow_preauth=(session_token is None)):
+        if existing and auth.verify_csrf_token(
+            existing,
+            session_token=session_token,
+            allow_preauth=(session_token is None),
+        ):
             csrf_token = existing
         else:
             csrf_token = auth.generate_csrf_token(session_token=session_token)
 
         secure_flag = auth.is_secure_cookie(request)
-        response = JSONResponse({"csrf_token": csrf_token})
+        response = JSONResponse(
+            {
+                "csrf_token": csrf_token,
+                "auth_enabled": auth.is_auth_enabled(),
+                "single_user_mode": auth.is_single_user_mode(),
+            }
+        )
         response.set_cookie(
             key=auth.CSRF_TOKEN_NAME,
             value=csrf_token,
@@ -541,12 +584,13 @@ def create_app(
 
     @app.get("/api/projects")
     async def list_projects(request: Request):
+        user = getattr(request.state, "user", None)
         if auth.is_auth_enabled():
-            user = getattr(request.state, "user", None)
             owner_id = user["id"] if user else ""
             projects = repo.list_projects(owner_id=owner_id)
         else:
-            projects = repo.list_projects()
+            all_projects = repo.list_projects()
+            projects = auth.filter_authorized_projects(all_projects, user)
         return {"projects": projects}
 
     @app.get("/api/projects/{project_id}")
@@ -683,8 +727,8 @@ def create_app(
             original_filename=original_filename,
         )
 
-        user = getattr(request.state, "user", None)
-        owner_id = user.get("id") if user else None
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        owner_id = user.get("id") if user else auth.get_single_user_id()
 
         name = project_name or f"Inspection - {original_filename}"
         project = repo.create_project(

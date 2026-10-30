@@ -227,11 +227,17 @@ def test_cleanup_expired_sessions(env):
 def test_auth_disabled_by_default(env):
     os.environ["AUTH_ENABLED"] = "false"
     assert auth.AUTH_ENABLED is False
+    assert auth.is_single_user_mode() is True
 
-    # require_auth should return dev user when disabled
+    # require_auth should return single_user operator when multi-user auth is disabled
     import asyncio
-    user = asyncio.get_event_loop().run_until_complete(auth.require_auth(type("Request", (), {"cookies": {}, "url": type("URL", (), {"path": "/api/test"})()})()))
-    assert user["id"] == "dev"
+    user = asyncio.get_event_loop().run_until_complete(
+        auth.require_auth(
+            type("Request", (), {"cookies": {}, "headers": {}, "url": type("URL", (), {"path": "/api/test"})()})()
+        )
+    )
+    assert user["id"] == "single_user"
+    assert user["mode"] == "single_user"
 
 
 def test_is_public_path():
@@ -857,3 +863,580 @@ def test_user_a_vs_user_b_project_isolation_across_all_resources(auth_app_env):
     )
     assert del_ok.status_code == 200
     assert repo.get_project(proj_id) is None
+
+
+# ==================================================================
+# 6. Single-User Mode MVP Authorization, Cross-Project & CSRF Suite
+# ==================================================================
+
+
+@pytest.fixture
+def single_user_app_env(tmp_path, monkeypatch):
+    """Provides a FastAPI TestClient in Single-User Mode (AUTH_ENABLED=false, CSRF_ENABLED=true)."""
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("CSRF_ENABLED", "true")
+    monkeypatch.delenv("SINGLE_USER_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "_INITIAL_AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "CSRF_ENABLED", True)
+
+    db_file = str(tmp_path / "single_user.db")
+    storage_dir = str(tmp_path / "single_user_storage")
+    app = create_app(db_path=db_file, storage_dir=storage_dir)
+
+    yield {
+        "app": app,
+        "repo": app.state.repo,
+        "filestore": app.state.filestore,
+        "tmp_path": tmp_path,
+    }
+
+    monkeypatch.setattr(auth, "CSRF_ENABLED", None)
+    monkeypatch.delenv("CSRF_ENABLED", raising=False)
+
+
+def test_single_user_mode_no_login_ui_and_full_operator_workflow(single_user_app_env):
+    app = single_user_app_env["app"]
+    repo = single_user_app_env["repo"]
+    client = TestClient(app)
+
+    # 1. Frontend api-client.js must not include any login modal or sign-out UI
+    js_resp = client.get("/static/api-client.js")
+    assert js_resp.status_code == 200
+    assert "auth-login-modal" not in js_resp.text
+    assert "Sign In Required" not in js_resp.text
+    assert "showLoginModal" not in js_resp.text
+
+    # 2. Session endpoint reports single_user_mode=True and canonical single_user operator without login
+    sess_resp = client.get("/api/auth/session")
+    assert sess_resp.status_code == 200
+    sess_data = sess_resp.json()
+    assert sess_data["auth_enabled"] is False
+    assert sess_data["single_user_mode"] is True
+    assert sess_data["user"]["id"] == "single_user"
+
+    # 3. Legacy projects (owner_id=None and owner_id='dev') remain accessible to the single-user operator
+    legacy_null_id = str(uuid.uuid4())
+    legacy_dev_id = str(uuid.uuid4())
+    repo.create_project(legacy_null_id, "Legacy Null Project", "n.pdf", "source/n.pdf", "chk", owner_id=None)
+    repo.create_project(legacy_dev_id, "Legacy Dev Project", "d.pdf", "source/d.pdf", "chk", owner_id="dev")
+
+    assert client.get(f"/api/projects/{legacy_null_id}").status_code == 200
+    assert client.get(f"/api/projects/{legacy_dev_id}").status_code == 200
+
+    # 4. Operator fetches CSRF token and runs full upload -> review -> approve -> DOCX export workflow
+    csrf_resp = client.get("/api/auth/csrf-token")
+    assert csrf_resp.status_code == 200
+    csrf_token = csrf_resp.json()["csrf_token"]
+    assert client.cookies.get(auth.CSRF_TOKEN_NAME) == csrf_token
+
+    pdf_bytes = _make_sample_pdf_bytes()
+    up_resp = client.post(
+        "/api/upload-and-extract",
+        files={"file": ("operator_book.pdf", pdf_bytes, "application/pdf")},
+        data={"project_name": "Single Operator Book"},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert up_resp.status_code == 200
+    proj_id = up_resp.json()["project_id"]
+    img_id = up_resp.json()["images"][0]["id"]
+
+    # Newly created project is owned by 'single_user'
+    created_proj = repo.get_project(proj_id)
+    assert created_proj["owner_id"] == "single_user"
+
+    # Caption update records audit event
+    cap_resp = client.put(
+        f"/api/projects/{proj_id}/images/{img_id}/caption",
+        json={"caption": "Figure 1: Verified caption in single-user mode.", "resolve_review": True},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert cap_resp.status_code == 200
+    audits = repo.list_project_audit_events(proj_id)
+    assert len(audits) >= 1
+
+    # Approve alt text and export DOCX
+    appr_resp = client.post(
+        f"/api/projects/{proj_id}/images/{img_id}/approve",
+        json={"alt_text": "Detailed illustration of an ancient bronze mirror."},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert appr_resp.status_code == 200
+
+    exp_resp = client.post(
+        f"/api/projects/{proj_id}/exports/docx",
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert exp_resp.status_code == 200
+    export_id = exp_resp.json()["export_id"]
+    assert client.get(f"/api/projects/{proj_id}/exports/{export_id}/download").status_code == 200
+
+
+def test_single_user_mode_blocks_foreign_owned_projects_and_arbitrary_ids(single_user_app_env):
+    """
+    Verifies that disabling multi-user login does NOT leave project ownership checks bypassed:
+    projects owned by a foreign owner_id are excluded from listings and return HTTP 403 on all routes.
+    """
+    app = single_user_app_env["app"]
+    repo = single_user_app_env["repo"]
+    client = TestClient(app)
+
+    csrf_token = client.get("/api/auth/csrf-token").json()["csrf_token"]
+
+    own_proj_id = str(uuid.uuid4())
+    foreign_proj_id = str(uuid.uuid4())
+    foreign_img_id = str(uuid.uuid4())
+    foreign_grp_id = str(uuid.uuid4())
+
+    repo.create_project(own_proj_id, "Operator Project", "own.pdf", "source/own.pdf", "chk", owner_id="single_user")
+    repo.create_project(foreign_proj_id, "Foreign Project", "for.pdf", "source/for.pdf", "chk", owner_id="unauthorized_other_user")
+    repo.create_figure_group(foreign_grp_id, foreign_proj_id, "Cap", 1, "below", "Fig 1", False, "candidate", [])
+    repo.create_image_asset(
+        image_id=foreign_img_id,
+        project_id=foreign_proj_id,
+        page_number=1,
+        xref=10,
+        placement_index=1,
+        bbox={"x0": 0, "y0": 0, "x1": 50, "y1": 50},
+        original_caption="Cap",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="Fig1.png",
+        file_storage_key="images/Fig1.png",
+        file_checksum="chk",
+        image_format="png",
+    )
+
+    # 1. GET /api/projects returns operator's project but hides foreign project
+    listed_ids = {p["id"] for p in client.get("/api/projects").json()["projects"]}
+    assert own_proj_id in listed_ids
+    assert foreign_proj_id not in listed_ids
+
+    # 2. Arbitrary nonexistent project ID returns 404
+    random_id = str(uuid.uuid4())
+    assert client.get(f"/api/projects/{random_id}").status_code == 404
+    assert client.get(f"/review/{random_id}").status_code == 404
+    assert client.get(f"/export/{random_id}").status_code == 404
+
+    # 3. Foreign-owned project returns 403 across all read and write endpoints
+    assert client.get(f"/review/{foreign_proj_id}").status_code == 403
+    assert client.get(f"/export/{foreign_proj_id}").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}/images").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}/images/{foreign_img_id}/file").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}/images/{foreign_img_id}/versions").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}/groups").status_code == 403
+    assert client.get(f"/api/projects/{foreign_proj_id}/exports/status").status_code == 403
+
+    assert client.post(
+        f"/api/projects/{foreign_proj_id}/images/{foreign_img_id}/draft",
+        json={"text": "Tamper"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+    assert client.post(
+        f"/api/projects/{foreign_proj_id}/images/{foreign_img_id}/approve",
+        json={"alt_text": "Tamper"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+    assert client.put(
+        f"/api/projects/{foreign_proj_id}/images/{foreign_img_id}/caption",
+        json={"caption": "Tamper"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+    assert client.post(
+        f"/api/projects/{foreign_proj_id}/groups/{foreign_grp_id}/confirm",
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+    assert client.post(
+        f"/api/projects/{foreign_proj_id}/exports/docx",
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+    assert client.delete(
+        f"/api/projects/{foreign_proj_id}",
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 403
+
+
+def test_single_user_mode_blocks_cross_project_resource_access(single_user_app_env):
+    """
+    Verifies that child resources (images, figure groups, exports) from Project B
+    cannot be read or modified through Project A's URLs.
+    """
+    app = single_user_app_env["app"]
+    repo = single_user_app_env["repo"]
+    client = TestClient(app)
+
+    csrf_token = client.get("/api/auth/csrf-token").json()["csrf_token"]
+
+    proj_a = str(uuid.uuid4())
+    proj_b = str(uuid.uuid4())
+    img_a = str(uuid.uuid4())
+    img_b = str(uuid.uuid4())
+    grp_a = str(uuid.uuid4())
+    grp_b = str(uuid.uuid4())
+    exp_b = str(uuid.uuid4())
+
+    repo.create_project(proj_a, "Project A", "a.pdf", "source/a.pdf", "chk", owner_id="single_user")
+    repo.create_project(proj_b, "Project B", "b.pdf", "source/b.pdf", "chk", owner_id="single_user")
+
+    repo.create_figure_group(grp_a, proj_a, "Group A", 1, "below", "Fig 1", False, "candidate", [])
+    repo.create_figure_group(grp_b, proj_b, "Group B", 1, "below", "Fig 2", False, "candidate", [])
+
+    for pid, iid, gid in [(proj_a, img_a, grp_a), (proj_b, img_b, grp_b)]:
+        repo.create_image_asset(
+            image_id=iid,
+            project_id=pid,
+            page_number=1,
+            xref=10,
+            placement_index=1,
+            bbox={"x0": 0, "y0": 0, "x1": 50, "y1": 50},
+            original_caption="Cap",
+            caption_position="below",
+            needs_caption_review=False,
+            review_reasons=[],
+            suggested_filename="Fig.png",
+            file_storage_key="images/Fig.png",
+            file_checksum="chk",
+            image_format="png",
+            group_id=gid,
+        )
+
+    repo.create_export(exp_b, proj_b, "docx", "exports/b.docx", "chk", "completed", figure_count=1)
+
+    # Accessing Project B's image, group, or export via Project A's route must fail with 404
+    assert client.get(f"/api/projects/{proj_a}/images/{img_b}/file").status_code == 404
+    assert client.get(f"/api/projects/{proj_a}/images/{img_b}/versions").status_code == 404
+    assert client.post(
+        f"/api/projects/{proj_a}/images/{img_b}/draft",
+        json={"text": "Cross project draft"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 404
+    assert client.post(
+        f"/api/projects/{proj_a}/images/{img_b}/approve",
+        json={"alt_text": "Cross project approve"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 404
+    assert client.put(
+        f"/api/projects/{proj_a}/images/{img_b}/caption",
+        json={"caption": "Cross project caption"},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 404
+    assert client.post(
+        f"/api/projects/{proj_a}/groups/{grp_b}/confirm",
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 404
+    assert client.post(
+        f"/api/projects/{proj_a}/groups/{grp_a}/add-image",
+        json={"image_id": img_b},
+        headers={"X-CSRF-Token": csrf_token},
+    ).status_code == 404
+    assert client.get(f"/api/projects/{proj_a}/exports/{exp_b}/download").status_code == 404
+
+
+def test_single_user_mode_csrf_enforced_on_state_changing_endpoints(single_user_app_env):
+    """
+    Verifies that CSRF protection remains active in Single-User Mode for all
+    state-changing requests (POST, PUT, DELETE).
+    """
+    app = single_user_app_env["app"]
+    repo = single_user_app_env["repo"]
+    client = TestClient(app)
+
+    proj_id = str(uuid.uuid4())
+    img_id = str(uuid.uuid4())
+    grp_id = str(uuid.uuid4())
+    repo.create_project(proj_id, "Single User CSRF", "c.pdf", "source/c.pdf", "chk", owner_id="single_user")
+    repo.create_figure_group(grp_id, proj_id, "Cap", 1, "below", "Fig 1", False, "candidate", [])
+    repo.create_image_asset(
+        image_id=img_id,
+        project_id=proj_id,
+        page_number=1,
+        xref=10,
+        placement_index=1,
+        bbox={"x0": 0, "y0": 0, "x1": 50, "y1": 50},
+        original_caption="Cap",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="Fig1.png",
+        file_storage_key="images/Fig1.png",
+        file_checksum="chk",
+        image_format="png",
+    )
+
+    csrf_token = client.get("/api/auth/csrf-token").json()["csrf_token"]
+
+    # Missing header -> 403
+    assert client.post(f"/api/projects/{proj_id}/images/{img_id}/draft", json={"text": "Draft"}).status_code == 403
+    assert client.put(f"/api/projects/{proj_id}/images/{img_id}/caption", json={"caption": "New"}).status_code == 403
+    assert client.delete(f"/api/projects/{proj_id}").status_code == 403
+
+    # Invalid header -> 403
+    assert client.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Draft"},
+        headers={"X-CSRF-Token": "forged.token"},
+    ).status_code == 403
+
+    # Query parameter only -> 403
+    assert client.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft?csrf_token={csrf_token}",
+        json={"text": "Draft"},
+    ).status_code == 403
+
+    # Valid X-CSRF-Token header + cookie -> 200
+    ok_resp = client.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Valid single-user draft"},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert ok_resp.status_code == 200
+
+
+def test_single_user_mode_operator_token_gate_blocks_unauthenticated_access(single_user_app_env, monkeypatch):
+    """
+    Verifies that when SINGLE_USER_ACCESS_TOKEN is configured in Single-User Mode,
+    unauthenticated requests without the operator token are rejected with HTTP 401
+    across all project, upload, review, approval, image, group, and export routes.
+    """
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "operator-secret-token-987654321")
+    app = single_user_app_env["app"]
+    repo = single_user_app_env["repo"]
+
+    proj_id = str(uuid.uuid4())
+    img_id = str(uuid.uuid4())
+    grp_id = str(uuid.uuid4())
+    exp_id = str(uuid.uuid4())
+    repo.create_project(proj_id, "Gated Project", "g.pdf", "source/g.pdf", "chk", owner_id="single_user")
+    repo.create_figure_group(grp_id, proj_id, "Cap", 1, "below", "Fig 1", False, "candidate", [])
+    repo.create_image_asset(
+        image_id=img_id,
+        project_id=proj_id,
+        page_number=1,
+        xref=10,
+        placement_index=1,
+        bbox={"x0": 0, "y0": 0, "x1": 50, "y1": 50},
+        original_caption="Cap",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="Fig1.png",
+        file_storage_key="images/Fig1.png",
+        file_checksum="chk",
+        image_format="png",
+    )
+    repo.create_export(exp_id, proj_id, "docx", "exports/g.docx", "chk", "completed", figure_count=1)
+
+    anon = TestClient(app)
+    csrf_token = anon.get("/api/auth/csrf-token").json()["csrf_token"]
+    csrf_hdr = {"X-CSRF-Token": csrf_token}
+
+    # Protected read & HTML routes reject requests without operator token (401)
+    assert anon.get("/api/projects").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/images").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/images/{img_id}/file").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/images/{img_id}/versions").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/groups").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/exports/status").status_code == 401
+    assert anon.get(f"/api/projects/{proj_id}/exports/{exp_id}/download").status_code == 401
+    assert anon.get(f"/review/{proj_id}").status_code == 401
+    assert anon.get(f"/export/{proj_id}").status_code == 401
+    assert anon.get("/api/ai/config").status_code == 401
+    assert anon.get("/api/ai/budget").status_code == 401
+    assert anon.get("/api/ai/usage").status_code == 401
+    assert anon.get("/api/auth/session").status_code == 401
+
+    # Protected state-changing routes (upload, draft, approve, caption, group, export, delete) reject without operator token (401)
+    pdf_bytes = _make_sample_pdf_bytes()
+    assert anon.post(
+        "/api/upload-and-extract",
+        files={"file": ("doc.pdf", pdf_bytes, "application/pdf")},
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Draft"},
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.post(
+        f"/api/projects/{proj_id}/images/{img_id}/approve",
+        json={"alt_text": "Approve"},
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.put(
+        f"/api/projects/{proj_id}/images/{img_id}/caption",
+        json={"caption": "Caption"},
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.post(
+        f"/api/projects/{proj_id}/groups/{grp_id}/confirm",
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.post(
+        f"/api/projects/{proj_id}/exports/docx",
+        headers=csrf_hdr,
+    ).status_code == 401
+    assert anon.delete(
+        f"/api/projects/{proj_id}",
+        headers=csrf_hdr,
+    ).status_code == 401
+
+    # Public health endpoint remains intentionally accessible and exposes no sensitive data
+    health_resp = anon.get("/api/health")
+    assert health_resp.status_code == 200
+    assert health_resp.json()["status"] == "ok"
+    assert "operator-secret-token-987654321" not in health_resp.text
+
+    # OpenAPI / Swagger docs are not in PUBLIC_PREFIXES
+    assert auth._is_public_path("/docs") is False
+    assert auth._is_public_path("/openapi.json") is False
+
+    # Authorized operator with X-Operator-Token header succeeds
+    operator_headers = {
+        "X-Operator-Token": "operator-secret-token-987654321",
+        "X-CSRF-Token": csrf_token,
+    }
+    assert anon.get("/api/projects", headers=operator_headers).status_code == 200
+    assert anon.get(f"/api/projects/{proj_id}", headers=operator_headers).status_code == 200
+    assert anon.get(f"/review/{proj_id}", headers=operator_headers).status_code == 200
+    assert anon.get(f"/export/{proj_id}", headers=operator_headers).status_code == 200
+    assert anon.get("/api/auth/session", headers=operator_headers).status_code == 200
+    assert anon.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Authorized draft"},
+        headers=operator_headers,
+    ).status_code == 200
+
+
+def test_single_user_production_startup_fails_when_session_secret_missing_or_weak(tmp_path, monkeypatch):
+    """
+    Verifies that production startup in single-user mode (AUTH_ENABLED=false) requires
+    SESSION_SECRET_KEY, rejects weak secrets, and never derives a fallback CSRF key
+    from BLOB_READ_WRITE_TOKEN, DATABASE_URL, NEON_DB_URL, POSTGRES_URL, or SINGLE_USER_ACCESS_TOKEN.
+    """
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_token_value")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@ep-host.neon.tech/neondb")
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "operator_token_value")
+    monkeypatch.delenv("SESSION_SECRET_KEY", raising=False)
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "_INITIAL_AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "SESSION_SECRET_KEY", "")
+
+    # 1. Missing SESSION_SECRET_KEY in single-user production fails startup even when other tokens are present
+    with pytest.raises(RuntimeError, match="SESSION_SECRET_KEY is required"):
+        create_app(db_path=str(tmp_path / "prod_fail.db"), storage_dir=str(tmp_path / "prod_s"))
+
+    with pytest.raises(RuntimeError, match="SESSION_SECRET_KEY is required"):
+        auth._get_csrf_signing_key()
+
+    # 2. Weak SESSION_SECRET_KEY in single-user production is rejected
+    for weak in ("short", "changeme_placeholder_secret_key_over_32_bytes", "a" * 40):
+        monkeypatch.setenv("SESSION_SECRET_KEY", weak)
+        monkeypatch.setattr(auth, "SESSION_SECRET_KEY", weak)
+        with pytest.raises(RuntimeError):
+            create_app(db_path=str(tmp_path / "prod_weak.db"), storage_dir=str(tmp_path / "prod_w"))
+
+
+def test_csrf_tokens_verifiable_across_instances_with_same_secret_and_rejected_with_different_secret(tmp_path, monkeypatch):
+    """
+    Verifies that:
+    - Independently initialized application instances sharing the same SESSION_SECRET_KEY
+      accept each other's CSRF tokens (serverless multi-instance compatibility).
+    - CSRF tokens signed with a different SESSION_SECRET_KEY are rejected with HTTP 403.
+    """
+    secret_1 = "v9K3mP8xQ2wL7nJ4rT6yU1zB5cV0fG9hJ2kL5mN8pQ1rS4tV"
+    secret_2 = "m2P9xL4kW8qN3vB7tR1yZ6cF0jH5gD8sA4eU9iO3pL7nK2wQ"
+
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("CSRF_ENABLED", "true")
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "_INITIAL_AUTH_ENABLED", False)
+    monkeypatch.setattr(auth, "CSRF_ENABLED", True)
+
+    db_file = str(tmp_path / "multi_instance.db")
+    storage_dir = str(tmp_path / "multi_instance_storage")
+
+    # Initialize Instance 1 and Instance 2 with the same SESSION_SECRET_KEY
+    monkeypatch.setenv("SESSION_SECRET_KEY", secret_1)
+    monkeypatch.setattr(auth, "SESSION_SECRET_KEY", secret_1)
+    app_instance_1 = create_app(db_path=db_file, storage_dir=storage_dir)
+    app_instance_2 = create_app(db_path=db_file, storage_dir=storage_dir)
+
+    repo = app_instance_1.state.repo
+    proj_id = str(uuid.uuid4())
+    img_id = str(uuid.uuid4())
+    repo.create_project(proj_id, "Serverless CSRF Proj", "s.pdf", "source/s.pdf", "chk", owner_id="single_user")
+    repo.create_image_asset(
+        image_id=img_id,
+        project_id=proj_id,
+        page_number=1,
+        xref=10,
+        placement_index=1,
+        bbox={"x0": 0, "y0": 0, "x1": 50, "y1": 50},
+        original_caption="Cap",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="Fig1.png",
+        file_storage_key="images/Fig1.png",
+        file_checksum="chk",
+        image_format="png",
+    )
+
+    # Fetch CSRF token from Instance 1
+    client_1 = TestClient(app_instance_1)
+    csrf_resp = client_1.get("/api/auth/csrf-token")
+    assert csrf_resp.status_code == 200
+    token_from_instance_1 = csrf_resp.json()["csrf_token"]
+
+    # Send state-changing request to Instance 2 with the token & cookie from Instance 1 -> 200 OK
+    client_2 = TestClient(app_instance_2)
+    client_2.cookies.set(auth.CSRF_TOKEN_NAME, token_from_instance_1)
+    cross_instance_resp = client_2.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Draft verified on second serverless instance"},
+        headers={"X-CSRF-Token": token_from_instance_1},
+    )
+    assert cross_instance_resp.status_code == 200
+
+    # Switch active secret to secret_2 -> token signed with secret_1 must be rejected (403)
+    monkeypatch.setenv("SESSION_SECRET_KEY", secret_2)
+    monkeypatch.setattr(auth, "SESSION_SECRET_KEY", secret_2)
+    assert auth.verify_csrf_token(token_from_instance_1, session_token=None, allow_preauth=False) is False
+
+    rejected_resp = client_2.post(
+        f"/api/projects/{proj_id}/images/{img_id}/draft",
+        json={"text": "Should fail with different secret"},
+        headers={"X-CSRF-Token": token_from_instance_1},
+    )
+    assert rejected_resp.status_code == 403
+
+
+def test_no_frontend_source_contains_hardcoded_operator_token_and_static_exposes_no_private_files():
+    """
+    Verifies that no frontend asset in src/web/static/ contains a hardcoded
+    SINGLE_USER_ACCESS_TOKEN or operator secret, and only frontend assets exist in /static/.
+    """
+    from pathlib import Path
+    from src.web.app import STATIC_DIR
+
+    allowed_extensions = {".html", ".css", ".js"}
+    forbidden_patterns = (
+        "SINGLE_USER_ACCESS_TOKEN",
+        "X-Operator-Token",
+        "operator-secret-token",
+    )
+
+    static_files = list(Path(STATIC_DIR).rglob("*"))
+    assert len(static_files) > 0
+
+    for path in static_files:
+        if path.is_file():
+            assert path.suffix.lower() in allowed_extensions, f"Unexpected non-frontend file in /static/: {path.name}"
+            content = path.read_text(encoding="utf-8")
+            for pattern in forbidden_patterns:
+                assert pattern not in content, f"Forbidden operator token reference {pattern!r} found in {path.name}"
