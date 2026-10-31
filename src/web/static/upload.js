@@ -20,6 +20,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const progressContainer = document.getElementById("progressContainer");
   const progressText = document.getElementById("progressText");
   const progressBarFill = document.getElementById("progressBarFill");
+  const progressiveResults = document.getElementById("progressiveResults");
+  const progressiveImageList = document.getElementById("progressiveImageList");
   const uploadErrorBox = document.getElementById("uploadErrorBox");
   const recentProjectsList = document.getElementById("recentProjectsList");
 
@@ -33,6 +35,7 @@ document.addEventListener("DOMContentLoaded", () => {
   let isProcessing = false; // Prevent duplicate submissions
   let currentProjectId = null;
   let statusPollInterval = null;
+  const renderedProgressImageIds = new Set();
 
   // --- Accessible Text Size Controls ---
   function applyTextSize(size) {
@@ -229,17 +232,40 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // --- Status Polling ---
-  async function pollProjectStatus(projectId) {
+  function appendProgressImages(projectId, images) {
+    if (!progressiveImageList || !Array.isArray(images)) return;
+    for (const image of images) {
+      if (!image.id || renderedProgressImageIds.has(image.id)) continue;
+      renderedProgressImageIds.add(image.id);
+      const card = document.createElement("article");
+      card.className = "progressive-image-card";
+      card.dataset.page = String(image.page_number || 0);
+      card.dataset.placement = String(image.placement_index || 0);
+      const preview = document.createElement("img");
+      preview.loading = "lazy";
+      preview.src = `/api/projects/${encodeURIComponent(projectId)}/images/${encodeURIComponent(image.id)}/file`;
+      preview.alt = image.original_caption || `Extracted image from page ${image.page_number}`;
+      const description = document.createElement("p");
+      description.textContent = `Page ${image.page_number}${image.original_caption ? ` · ${image.original_caption}` : " · No caption found"}`;
+      card.append(preview, description);
+      progressiveImageList.appendChild(card);
+    }
+    const ordered = [...progressiveImageList.children].sort((a, b) =>
+      Number(a.dataset.page) - Number(b.dataset.page) || Number(a.dataset.placement) - Number(b.dataset.placement)
+    );
+    ordered.forEach(card => progressiveImageList.appendChild(card));
+    if (progressiveResults && ordered.length) progressiveResults.style.display = "block";
+  }
+
+  async function pollProjectStatus(projectId, jobId) {
     if (statusPollInterval) {
       clearInterval(statusPollInterval);
     }
 
-    statusPollInterval = setInterval(async () => {
+    const poll = async () => {
       try {
-        const res = await fetch(`/api/projects/${projectId}/status`, {
-          method: "GET",
-          credentials: "include",
-        });
+        const endpoint = jobId ? `/api/jobs/${encodeURIComponent(jobId)}/progress` : `/api/projects/${encodeURIComponent(projectId)}/status`;
+        const res = await fetch(endpoint, { method: "GET", credentials: "include" });
 
         if (!res.ok) {
           console.warn("Status poll failed:", res.status);
@@ -247,16 +273,23 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         const data = await res.json();
-        const status = data.status;
+        let images = data.images || [];
+        if (jobId) {
+          const imagesRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/images`, { credentials: "include" });
+          if (imagesRes.ok) images = (await imagesRes.json()).images || [];
+        }
+        appendProgressImages(projectId, images);
+        const status = data.project_status || data.status;
+        const jobStatus = data.job_status;
 
-        const reviewUrl = getProjectReviewUrl(status, projectId);
+        const reviewUrl = getProjectReviewUrl(status === "ready_for_review" || status === "completed" ? status : jobStatus, projectId);
         if (reviewUrl) {
           clearInterval(statusPollInterval);
           statusPollInterval = null;
           hideProgress();
           // Navigate to Review & Edit
           window.location.href = reviewUrl;
-        } else if (status === "failed") {
+        } else if (status === "failed" || jobStatus === "failed") {
           clearInterval(statusPollInterval);
           statusPollInterval = null;
           hideProgress();
@@ -267,15 +300,17 @@ document.addEventListener("DOMContentLoaded", () => {
         } else {
           // Still processing: queued, extracting, etc.
           const totalImages = data.total_images || 0;
-          setProgress(
-            50,
-            `Extracting images and captions${totalImages > 0 ? ` (${totalImages} found so far)` : ""}…`
-          );
+          const batches = data.total_batches ? `Batch ${data.completed_batches || 0}/${data.total_batches}` : "Preparing page batches";
+          const pages = data.pages_to_process ? ` · ${data.completed_pages || 0}/${data.pages_to_process} pages` : "";
+          const percent = data.total_batches ? Math.min(95, 60 + Math.round(35 * (data.completed_batches || 0) / data.total_batches)) : 60;
+          setProgress(percent, `${batches}${pages} · ${totalImages} images available as extracted…`);
         }
       } catch (err) {
         console.warn("Status poll error:", err);
       }
-    }, 3000);
+    };
+    poll();
+    statusPollInterval = setInterval(poll, 2500);
   }
 
   function stopPolling() {
@@ -432,7 +467,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Step 4: Poll for extraction completion
         setProgress(70, "Waiting for extraction to start…");
-        pollProjectStatus(projectId);
+        pollProjectStatus(projectId, completeData.job_id);
 
       } catch (err) {
         stopPolling();

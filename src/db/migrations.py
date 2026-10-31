@@ -283,4 +283,40 @@ def apply_migrations(db: DatabaseConnection) -> int:
             conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (9, now_iso))
             current_version = 9
 
+        if current_version < 10:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
+            if "jobs" in tables:
+                existing = {col[1] for col in conn.execute("PRAGMA table_info(jobs);").fetchall()}
+                for name, definition in (
+                    ("total_pages", "INTEGER NOT NULL DEFAULT 0"),
+                    ("completed_pages", "INTEGER NOT NULL DEFAULT 0"),
+                    ("pages_to_process", "INTEGER NOT NULL DEFAULT 0"),
+                    ("total_batches", "INTEGER NOT NULL DEFAULT 0"),
+                    ("completed_batches", "INTEGER NOT NULL DEFAULT 0"),
+                    ("worker_id", "TEXT"),
+                ):
+                    if name not in existing:
+                        conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition};")
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS job_batches (
+                        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                        batch_index INTEGER NOT NULL,
+                        page_numbers TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        max_attempts INTEGER NOT NULL DEFAULT 3,
+                        error_message TEXT,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        lease_updated_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (job_id, batch_index)
+                    );"""
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_job_batches_status ON job_batches(job_id,status);")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (10, now_iso))
+            current_version = 10
+
     return current_version

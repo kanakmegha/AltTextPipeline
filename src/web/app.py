@@ -990,7 +990,13 @@ def create_app(
                 refreshed = repo.get_upload_key(upload_key)
                 if refreshed and refreshed.get("status") == "completed" and refreshed.get("project_id"):
                     project = repo.get_project(refreshed["project_id"])
-                    return {"project_id": refreshed["project_id"], "status": project.get("status", "queued"), "already_completed": True}
+                    jobs = repo.list_project_jobs(refreshed["project_id"])
+                    return {
+                        "project_id": refreshed["project_id"],
+                        "job_id": jobs[-1]["id"] if jobs else None,
+                        "status": project.get("status", "queued"),
+                        "already_completed": True,
+                    }
                 if not refreshed or refreshed.get("status") != "finalizing":
                     raise HTTPException(status_code=409, detail="Upload is already being finalized.")
 
@@ -1017,7 +1023,39 @@ def create_app(
         except Exception:
             # The durable queued row is the outbox; worker reconciliation will publish/claim it.
             logger.exception("Queue publish failed for job %s; database recovery will retry", job_id)
-        return {"project_id": project["id"], "status": "queued", "already_completed": False}
+        return {"project_id": project["id"], "job_id": job_id, "status": "queued", "already_completed": False}
+
+    @app.get("/api/jobs/{job_id}/progress")
+    async def get_job_progress(request: Request, job_id: str):
+        job = repo.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        project = _authorize_project_access(request, job["project_id"])
+        batches = repo.list_job_batches(job_id)
+        images = repo.list_project_images(job["project_id"])
+        return {
+            "job_id": job_id,
+            "project_id": job["project_id"],
+            "job_status": job["status"],
+            "project_status": project.get("status"),
+            "total_pages": job.get("total_pages", 0),
+            "pages_to_process": job.get("pages_to_process", 0),
+            "completed_pages": job.get("completed_pages", 0),
+            "total_batches": job.get("total_batches", 0),
+            "completed_batches": job.get("completed_batches", 0),
+            "total_images": len(images),
+            "failed_batches": sum(1 for batch in batches if batch["status"] == "failed"),
+            "batches": batches,
+            "error": job.get("error_message"),
+        }
+
+    @app.get("/api/jobs/{job_id}/images")
+    async def get_job_images(request: Request, job_id: str):
+        job = repo.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        _authorize_project_access(request, job["project_id"])
+        return {"images": repo.list_project_images(job["project_id"])}
 
     @app.get("/api/projects/{project_id}/status")
     async def get_project_status(request: Request, project_id: str):

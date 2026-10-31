@@ -66,6 +66,7 @@ class ExtractionEngine:
         page_numbers: Optional[List[int]] = None,
         output_images_dir: Optional[str] = None,
         existing_filenames: Optional[Set[str]] = None,
+        group_results: bool = True,
     ) -> ExtractionResult:
         """
         Extracts images and captions from a PDF file.
@@ -227,17 +228,13 @@ class ExtractionEngine:
 
         doc.close()
 
-        # Step 3: Run Multi-Image Grouping & Cross-Page Association
-        grouper = FigureGrouper(
-            max_cluster_gap=self.max_caption_gap * 1.5,
-            max_caption_gap=self.max_caption_gap,
-            horizontal_tolerance=self.horizontal_tolerance,
-        )
-        final_images, groups = grouper.group_images_and_captions(
-            images_by_page=images_by_page,
-            text_blocks_by_page=text_blocks_by_page,
-            page_dimensions=page_dimensions,
-        )
+        if group_results:
+            final_images, groups = self.group_extracted_pages(
+                images_by_page, text_blocks_by_page, page_dimensions
+            )
+        else:
+            final_images = [image for page in sorted(images_by_page) for image in images_by_page[page]]
+            groups = []
 
         stats = {
             "total_images": len(final_images),
@@ -260,4 +257,22 @@ class ExtractionEngine:
             errors=errors,
             stats=stats,
             groups=groups,
+            grouping_context={
+                "images_by_page": images_by_page,
+                "text_blocks_by_page": text_blocks_by_page,
+                "page_dimensions": page_dimensions,
+            },
+        )
+
+    def group_extracted_pages(self, images_by_page, text_blocks_by_page, page_dimensions):
+        """Apply the document-wide figure and cross-page association pass."""
+        grouper = FigureGrouper(
+            max_cluster_gap=self.max_caption_gap * 1.5,
+            max_caption_gap=self.max_caption_gap,
+            horizontal_tolerance=self.horizontal_tolerance,
+        )
+        return grouper.group_images_and_captions(
+            images_by_page=images_by_page,
+            text_blocks_by_page=text_blocks_by_page,
+            page_dimensions=page_dimensions,
         )

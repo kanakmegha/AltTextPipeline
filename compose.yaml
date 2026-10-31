@@ -1,0 +1,25 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file:
+      - path: .env.worker
+        required: false
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 90s
+    read_only: true
+    tmpfs:
+      - /tmp/alttext-worker:rw,noexec,nosuid,size=${WORKER_MAX_MEMORY_MB:-2048}m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: ${WORKER_MAX_CPU:-2}
+    mem_limit: ${WORKER_MAX_MEMORY_MB:-2048}m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

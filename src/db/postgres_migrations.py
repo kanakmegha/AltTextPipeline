@@ -331,4 +331,34 @@ def apply_migrations(db: PostgresConnection) -> int:
         _record_version(db, 9)
         current_version = 9
 
+    if current_version < 10:
+        with db.session() as c:
+            with c.cursor() as cur:
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_pages INTEGER NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_pages INTEGER NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pages_to_process INTEGER NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_batches INTEGER NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_batches INTEGER NOT NULL DEFAULT 0;")
+                cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS worker_id TEXT;")
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS job_batches (
+                        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                        batch_index INTEGER NOT NULL,
+                        page_numbers TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        max_attempts INTEGER NOT NULL DEFAULT 3,
+                        error_message TEXT,
+                        started_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
+                        lease_updated_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (job_id, batch_index)
+                    );"""
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_job_batches_status ON job_batches(job_id,status);")
+        _record_version(db, 10)
+        current_version = 10
+
     return current_version

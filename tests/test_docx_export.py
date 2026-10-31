@@ -634,7 +634,7 @@ def test_backfill_migration_5_derives_figure_count_for_legacy_exports(tmp_path):
 
     # Apply the remaining migrations after the legacy export backfill.
     current_ver = apply_migrations(db_conn)
-    assert current_ver == 9
+    assert current_ver == 10
 
     repo = Repository(db_conn)
     exp = repo.get_export(exp_id)

@@ -6523,6 +6523,8 @@ ${newlined}
     const progressContainer = document.getElementById("progressContainer");
     const progressText = document.getElementById("progressText");
     const progressBarFill = document.getElementById("progressBarFill");
+    const progressiveResults = document.getElementById("progressiveResults");
+    const progressiveImageList = document.getElementById("progressiveImageList");
     const uploadErrorBox = document.getElementById("uploadErrorBox");
     const recentProjectsList = document.getElementById("recentProjectsList");
     const aiConfigBadge = document.getElementById("aiConfigBadge");
@@ -6533,6 +6535,7 @@ ${newlined}
     let isProcessing = false;
     let currentProjectId = null;
     let statusPollInterval = null;
+    const renderedProgressImageIds = /* @__PURE__ */ new Set();
     function applyTextSize(size) {
       if (!["normal", "large", "xlarge"].includes(size)) size = "normal";
       document.documentElement.setAttribute("data-text-size", size);
@@ -6695,29 +6698,58 @@ ${newlined}
       if (!str) return "";
       return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
-    async function pollProjectStatus(projectId) {
+    function appendProgressImages(projectId, images) {
+      if (!progressiveImageList || !Array.isArray(images)) return;
+      for (const image of images) {
+        if (!image.id || renderedProgressImageIds.has(image.id)) continue;
+        renderedProgressImageIds.add(image.id);
+        const card = document.createElement("article");
+        card.className = "progressive-image-card";
+        card.dataset.page = String(image.page_number || 0);
+        card.dataset.placement = String(image.placement_index || 0);
+        const preview = document.createElement("img");
+        preview.loading = "lazy";
+        preview.src = `/api/projects/${encodeURIComponent(projectId)}/images/${encodeURIComponent(image.id)}/file`;
+        preview.alt = image.original_caption || `Extracted image from page ${image.page_number}`;
+        const description = document.createElement("p");
+        description.textContent = `Page ${image.page_number}${image.original_caption ? ` \xB7 ${image.original_caption}` : " \xB7 No caption found"}`;
+        card.append(preview, description);
+        progressiveImageList.appendChild(card);
+      }
+      const ordered = [...progressiveImageList.children].sort(
+        (a, b) => Number(a.dataset.page) - Number(b.dataset.page) || Number(a.dataset.placement) - Number(b.dataset.placement)
+      );
+      ordered.forEach((card) => progressiveImageList.appendChild(card));
+      if (progressiveResults && ordered.length) progressiveResults.style.display = "block";
+    }
+    async function pollProjectStatus(projectId, jobId) {
       if (statusPollInterval) {
         clearInterval(statusPollInterval);
       }
-      statusPollInterval = setInterval(async () => {
+      const poll = async () => {
         try {
-          const res = await fetch(`/api/projects/${projectId}/status`, {
-            method: "GET",
-            credentials: "include"
-          });
+          const endpoint = jobId ? `/api/jobs/${encodeURIComponent(jobId)}/progress` : `/api/projects/${encodeURIComponent(projectId)}/status`;
+          const res = await fetch(endpoint, { method: "GET", credentials: "include" });
           if (!res.ok) {
             console.warn("Status poll failed:", res.status);
             return;
           }
           const data = await res.json();
-          const status = data.status;
-          const reviewUrl = (0, import_upload_status.getProjectReviewUrl)(status, projectId);
+          let images = data.images || [];
+          if (jobId) {
+            const imagesRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/images`, { credentials: "include" });
+            if (imagesRes.ok) images = (await imagesRes.json()).images || [];
+          }
+          appendProgressImages(projectId, images);
+          const status = data.project_status || data.status;
+          const jobStatus = data.job_status;
+          const reviewUrl = (0, import_upload_status.getProjectReviewUrl)(status === "ready_for_review" || status === "completed" ? status : jobStatus, projectId);
           if (reviewUrl) {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
             hideProgress();
             window.location.href = reviewUrl;
-          } else if (status === "failed") {
+          } else if (status === "failed" || jobStatus === "failed") {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
             hideProgress();
@@ -6727,15 +6759,17 @@ ${newlined}
             showError(`Extraction Error: ${errMsg}`);
           } else {
             const totalImages = data.total_images || 0;
-            setProgress(
-              50,
-              `Extracting images and captions${totalImages > 0 ? ` (${totalImages} found so far)` : ""}\u2026`
-            );
+            const batches = data.total_batches ? `Batch ${data.completed_batches || 0}/${data.total_batches}` : "Preparing page batches";
+            const pages = data.pages_to_process ? ` \xB7 ${data.completed_pages || 0}/${data.pages_to_process} pages` : "";
+            const percent = data.total_batches ? Math.min(95, 60 + Math.round(35 * (data.completed_batches || 0) / data.total_batches)) : 60;
+            setProgress(percent, `${batches}${pages} \xB7 ${totalImages} images available as extracted\u2026`);
           }
         } catch (err) {
           console.warn("Status poll error:", err);
         }
-      }, 3e3);
+      };
+      poll();
+      statusPollInterval = setInterval(poll, 2500);
     }
     function stopPolling() {
       if (statusPollInterval) {
@@ -6866,7 +6900,7 @@ ${newlined}
             setProgress(60, "Project created. Queuing extraction\u2026");
           }
           setProgress(70, "Waiting for extraction to start\u2026");
-          pollProjectStatus(projectId);
+          pollProjectStatus(projectId, completeData.job_id);
         } catch (err) {
           stopPolling();
           hideProgress();

@@ -1,0 +1,32 @@
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TMPDIR=/tmp/alttext-worker
+
+WORKDIR /app
+
+# PyMuPDF wheels and Pillow use bundled libraries; these packages cover common
+# image/font codecs used by the existing extraction stack.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libjpeg62-turbo \
+      libpng16-16 \
+      libtiff6 \
+      libwebp7 \
+      libopenjp2-7 \
+      fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system worker \
+    && useradd --system --gid worker --create-home worker \
+    && mkdir -p /tmp/alttext-worker \
+    && chown -R worker:worker /app /tmp/alttext-worker
+
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src ./src
+
+USER worker
+STOPSIGNAL SIGTERM
+CMD ["python", "-m", "src.worker"]

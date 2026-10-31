@@ -23,12 +23,15 @@ Configure these environment variables in Render:
 | `BLOB_READ_WRITE_TOKEN` | Yes | Server only. Use the same private Blob read/write token configured on the FastAPI deployment. |
 | `BLOB_STORE_ID` | Optional | Use the same store identifier as the FastAPI deployment when configured. |
 | `REDIS_URL` | No | Optional TLS Redis URL. When absent, the worker polls PostgreSQL directly. |
+| `PDF_BATCH_SIZE` | No | Pages per extraction batch; defaults to `5`. |
+| `MAX_PARALLEL_BATCHES` | No | Maximum concurrent page-batch processes; defaults to `2`. |
+| `MAX_RETRIES` | No | Maximum job and batch attempts; defaults to `3`. |
 | `EXTRACTION_QUEUE_STREAM` | Optional | Defaults to `alttext:extraction`. |
 | `EXTRACTION_QUEUE_GROUP` | Optional | Defaults to `render-workers`. Keep the same group for competing worker instances. |
 | `WORKER_POLL_SECONDS` | Optional | Defaults to `5` seconds between polling iterations. |
 | `RENDER_INSTANCE_ID` | Optional | Stable unique name per Render instance; defaults to a process-specific name. |
 
-If Redis is configured, use a service with persistence and a retention policy suitable for queue data. Permit network access from both Vercel Functions and Render. Redis messages contain only job IDs, never PDF contents. The worker acknowledges a stream message only after the handler returns; unacknowledged entries are reclaimed after their idle lease. PostgreSQL claims prevent duplicate extraction when messages are delivered more than once. No Redis service or `REDIS_URL` is needed for PostgreSQL polling mode.
+If Redis is configured, use a service with persistence and a retention policy suitable for queue data. Permit network access from both Vercel Functions and Render. Redis messages contain only job IDs, never PDF contents. The worker acknowledges a stream message only after the handler returns; unacknowledged entries are reclaimed after their idle lease. PostgreSQL claims prevent duplicate extraction when messages are delivered more than once. No Redis service or `REDIS_URL` is needed for PostgreSQL polling mode. For a self-hosted Docker deployment, see [Self-hosted worker](../SELF_HOSTED_WORKER.md).
 
 ## Vercel application
 

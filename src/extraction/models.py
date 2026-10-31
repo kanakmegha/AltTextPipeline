@@ -153,6 +153,7 @@ class ExtractionResult:
     errors: List[Dict[str, Any]]
     stats: Dict[str, Any]
     groups: List[FigureGroup] = field(default_factory=list)
+    grouping_context: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

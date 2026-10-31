@@ -208,6 +208,18 @@ def test_running_status_renews_lease_without_resurrecting_terminal_job(tmp_path)
     assert after_late_heartbeat["completed_at"] == completed["completed_at"]
     assert after_late_heartbeat["lease_updated_at"] == completed["lease_updated_at"]
 
+    # The worker's fenced heartbeat path is also a no-op after a terminal transition.
+    fenced_job = "lease-fenced-job"
+    repo.create_job(fenced_job, "project-1", "extraction")
+    now = "2026-10-31T00:00:00+00:00"
+    assert repo.claim_job(fenced_job, "2000-01-01T00:00:00+00:00", now, worker_id="lease-owner")
+    assert repo.renew_job_lease(fenced_job, "lease-owner", "2030-01-01T00:00:00+00:00") is True
+    assert repo.update_claimed_job_status(fenced_job, "lease-owner", "failed", "test failure") is True
+    failed = repo.get_job(fenced_job)
+    assert repo.renew_job_lease(fenced_job, "lease-owner", "2040-01-01T00:00:00+00:00") is False
+    assert repo.get_job(fenced_job)["status"] == "failed"
+    assert repo.get_job(fenced_job)["lease_updated_at"] == failed["lease_updated_at"]
+
 
 def test_queue_publish_failure_leaves_job_recoverable_from_database(tmp_path, monkeypatch):
     repo, _, job_id = _make_job(tmp_path)
@@ -277,6 +289,105 @@ def test_worker_processes_database_jobs_without_redis(tmp_path, monkeypatch):
 
     assert repo.get_job(job_id)["status"] == "completed"
     assert repo.get_project("project-1")["status"] == "ready_for_review"
+
+
+def test_worker_persists_parallel_batches_and_recovers_incomplete_batch(tmp_path, monkeypatch):
+    db = DatabaseConnection(str(tmp_path / "batched.db"))
+    apply_migrations(db)
+    repo = Repository(db)
+    store = FileStore(str(tmp_path / "batched-storage"))
+    doc = fitz.open()
+    for page_number in range(2):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Figure {page_number + 1}. Batched diagram")
+    pdf = doc.tobytes()
+    doc.close()
+    source_key, checksum, _ = store.save_source_pdf("batch-project", pdf, "batch.pdf")
+    repo.create_project("batch-project", "Batch project", "batch.pdf", source_key, checksum, status="queued")
+    repo.create_job("batch-job", "batch-project", "extraction")
+    monkeypatch.setenv("PDF_BATCH_SIZE", "1")
+    monkeypatch.setenv("MAX_PARALLEL_BATCHES", "2")
+
+    class FailSecondBatchOnce(ExtractionEngine):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.failed = False
+        def process_pdf(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 2 and not self.failed:
+                self.failed = True
+                raise OSError("temporary second batch error")
+            return super().process_pdf(*args, **kwargs)
+
+    # Injected engines use sequential batch execution; the first batch is durable before the second fails.
+    engine = FailSecondBatchOnce()
+    assert process_extraction_job("batch-job", repo, store, engine=engine) is False
+    batches_after_failure = repo.list_job_batches("batch-job")
+    assert batches_after_failure[0]["status"] == "completed"
+    assert batches_after_failure[1]["status"] == "queued"
+    assert process_extraction_job("batch-job", repo, store, engine=engine) is True
+    job = repo.get_job("batch-job")
+    assert job["status"] == "completed"
+    assert job["total_pages"] == 2
+    assert job["pages_to_process"] == job["completed_pages"] == 2
+    assert job["total_batches"] == job["completed_batches"] == 2
+    assert [batch["status"] for batch in repo.list_job_batches("batch-job")] == ["completed", "completed"]
+    assert len(repo.list_project_images("batch-project")) == 0
+
+
+def test_worker_executes_default_engine_batches_in_bounded_process_pool(tmp_path, monkeypatch):
+    repo, store, job_id = _make_job(tmp_path)
+    doc = fitz.open()
+    for page_number in range(3):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page batch {page_number + 1}")
+    pdf = doc.tobytes()
+    doc.close()
+    source_key, checksum, _ = store.save_source_pdf("project-1", pdf, "three-pages.pdf")
+    repo.update_project_source_checksum("project-1", checksum)
+    with repo.db.session() as conn:
+        conn.execute("UPDATE projects SET source_storage_key=? WHERE id=?", (source_key, "project-1"))
+    monkeypatch.setenv("PDF_BATCH_SIZE", "1")
+    monkeypatch.setenv("MAX_PARALLEL_BATCHES", "2")
+
+    assert process_extraction_job(job_id, repo, store) is True
+    job = repo.get_job(job_id)
+    assert job["status"] == "completed"
+    assert job["total_batches"] == job["completed_batches"] == 3
+    assert job["completed_pages"] == 3
+    assert [batch["status"] for batch in repo.list_job_batches(job_id)] == ["completed"] * 3
+
+
+def test_job_progress_and_images_api_returns_partial_results_in_page_order(local_app):
+    client, app, _ = local_app
+    repo = app.state.repo
+    project_id, job_id = "progress-project", "progress-job"
+    repo.create_project(project_id, "Progress", "source.pdf", "source/source.pdf", "checksum", status="extracting")
+    repo.create_job(job_id, project_id, "extraction")
+    repo.initialize_job_batches(job_id, [[1], [2]], total_document_pages=2)
+    now = "2026-10-31T00:00:00+00:00"
+    repo.claim_job(job_id, "2000-01-01T00:00:00+00:00", now, worker_id="progress-worker")
+    assert repo.start_job_batch(job_id, 0, now, worker_id="progress-worker")
+    repo.set_job_batch_status(job_id, 0, "completed", worker_id="progress-worker")
+    for page in (2, 1):
+        repo.create_image_asset(
+            image_id=f"progress-image-{page}", project_id=project_id, page_number=page,
+            xref=page, placement_index=1, bbox={"x0": 0, "y0": 0, "x1": 10, "y1": 10},
+            original_caption=f"Figure {page}", caption_position="below", needs_caption_review=False,
+            review_reasons=[], suggested_filename=f"page-{page}.png", file_storage_key=f"images/{page}.png",
+            file_checksum="checksum", image_format="png", processing_status="ready_for_review",
+        )
+
+    progress = client.get(f"/api/jobs/{job_id}/progress")
+    images = client.get(f"/api/jobs/{job_id}/images")
+    assert progress.status_code == 200, progress.text
+    assert progress.json()["completed_batches"] == 1
+    assert progress.json()["completed_pages"] == 1
+    assert progress.json()["total_batches"] == 2
+    assert progress.json()["total_images"] == 2
+    assert images.status_code == 200, images.text
+    assert [image["page_number"] for image in images.json()["images"]] == [1, 2]
 
 
 def _make_job_storage(_repo, tmp_path):

@@ -385,6 +385,7 @@ class Repository:
         caption_position: Optional[str] = None,
         needs_review: Optional[bool] = None,
         needs_caption_review: Optional[bool] = None,
+        review_reasons: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
         fields = [
@@ -405,6 +406,9 @@ class Repository:
         if review_flag is not None:
             fields.append("needs_caption_review = ?")
             values.append(1 if review_flag else 0)
+        if review_reasons is not None:
+            fields.append("review_reasons = ?")
+            values.append(json.dumps(review_reasons))
 
         values.append(image_id)
         query = f"UPDATE image_assets SET {', '.join(fields)} WHERE id = ?;"
@@ -680,19 +684,111 @@ class Repository:
             )
         return self.get_job(job_id)
 
-    def claim_job(self, job_id: str, stale_before: str, now: str) -> Optional[Dict[str, Any]]:
+    def claim_job(self, job_id: str, stale_before: str, now: str, worker_id: Optional[str] = None,
+                  max_attempts: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Atomically claim a queued job or reclaim an abandoned running job."""
         with self.db.session() as conn:
             cursor = conn.execute(
                 """UPDATE jobs SET status='running', attempt_count=attempt_count+1,
-                   started_at=COALESCE(started_at, ?), lease_updated_at=?, error_message=NULL
-                   WHERE id=? AND attempt_count < max_attempts
+                   started_at=COALESCE(started_at, ?), lease_updated_at=?, error_message=NULL,
+                   worker_id=?,max_attempts=COALESCE(?,max_attempts)
+                   WHERE id=? AND attempt_count < COALESCE(?,max_attempts)
                    AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?));""",
-                (now, now, job_id, stale_before),
+                (now, now, worker_id, max_attempts, job_id, max_attempts, stale_before),
             )
             if not cursor.rowcount:
                 return None
         return self.get_job(job_id)
+
+    def renew_job_lease(self, job_id: str, worker_id: str, now: str) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET lease_updated_at=? WHERE id=? AND status='running' AND worker_id=?;",
+                (now, job_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def initialize_job_batches(self, job_id: str, page_batches: List[List[int]], total_document_pages: int,
+                               max_attempts: int = 3):
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            for index, pages in enumerate(page_batches):
+                conn.execute(
+                    """INSERT INTO job_batches (job_id,batch_index,page_numbers,status,max_attempts,created_at,updated_at)
+                       VALUES (?,?,?,'queued',?,?,?) ON CONFLICT(job_id,batch_index) DO NOTHING;""",
+                    (job_id, index, json.dumps(pages), max_attempts, now, now),
+                )
+            conn.execute(
+                "UPDATE jobs SET total_pages=?,pages_to_process=?,total_batches=? WHERE id=?;",
+                (total_document_pages, sum(len(pages) for pages in page_batches), len(page_batches), job_id),
+            )
+            self._refresh_job_batch_counts(conn, job_id)
+
+    @staticmethod
+    def _refresh_job_batch_counts(conn, job_id: str):
+        rows = conn.execute(
+            "SELECT page_numbers FROM job_batches WHERE job_id=? AND status='completed';", (job_id,)
+        ).fetchall()
+        completed_pages = sum(len(json.loads(row[0])) for row in rows)
+        conn.execute(
+            "UPDATE jobs SET completed_batches=?,completed_pages=? WHERE id=?;",
+            (len(rows), completed_pages, job_id),
+        )
+
+    def list_job_batches(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_batches WHERE job_id=? ORDER BY batch_index;", (job_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["page_numbers"] = json.loads(data["page_numbers"])
+            result.append(data)
+        return result
+
+    def start_job_batch(self, job_id: str, batch_index: int, now: str, worker_id: Optional[str] = None) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE job_batches SET status='running',attempt_count=attempt_count+1,
+                   started_at=COALESCE(started_at,?),completed_at=NULL,lease_updated_at=?,
+                   error_message=NULL,updated_at=? WHERE job_id=? AND batch_index=?
+                   AND status!='completed' AND attempt_count<max_attempts
+                   AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='running'
+                               AND (? IS NULL OR worker_id=?));""",
+                (now, now, now, job_id, batch_index, job_id, worker_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def set_job_batch_status(self, job_id: str, batch_index: int, status: str,
+                             error_message: Optional[str] = None, worker_id: Optional[str] = None) -> bool:
+        now = utc_now_iso()
+        completed_at = now if status in {"completed", "failed"} else None
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE job_batches SET status=?,error_message=?,completed_at=?,lease_updated_at=?,updated_at=?
+                   WHERE job_id=? AND batch_index=?
+                   AND (? IS NULL OR EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='running' AND worker_id=?));""",
+                (status, error_message, completed_at, now if status == "running" else None,
+                 now, job_id, batch_index, worker_id, job_id, worker_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            self._refresh_job_batch_counts(conn, job_id)
+            return True
+
+    def update_claimed_job_status(self, job_id: str, worker_id: str, status: str,
+                                  error_message: Optional[str] = None) -> bool:
+        now = utc_now_iso()
+        completed_at = now if status in {"completed", "failed", "cancelled"} else None
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE jobs SET status=?,error_message=?,completed_at=?,
+                   lease_updated_at=CASE WHEN ?='running' THEN ? ELSE lease_updated_at END
+                   WHERE id=? AND status='running' AND worker_id=?;""",
+                (status, error_message, completed_at, status, now, job_id, worker_id),
+            )
+            return cur.rowcount == 1
 
     def list_recoverable_jobs(self, stale_before: str, limit: int = 100) -> List[Dict[str, Any]]:
         with self.db.session() as conn:

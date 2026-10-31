@@ -534,3 +534,25 @@ def test_postgres_running_status_renews_lease_without_resurrecting_terminal_job(
     assert after_late_heartbeat["status"] == "completed"
     assert after_late_heartbeat["completed_at"] == completed["completed_at"]
     assert after_late_heartbeat["lease_updated_at"] == completed["lease_updated_at"]
+
+
+def test_postgres_worker_lease_fences_batch_and_terminal_writes(repo):
+    from src.db.repository import utc_now_iso
+
+    project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    repo.create_project(project_id, "Fenced lease", "x.pdf", "source/x.pdf", "checksum")
+    repo.create_job(job_id, project_id, "extraction")
+    now = utc_now_iso()
+    assert repo.claim_job(job_id, "2000-01-01T00:00:00+00:00", now, worker_id="worker-a")
+    assert repo.renew_job_lease(job_id, "worker-a", utc_now_iso()) is True
+    repo.initialize_job_batches(job_id, [[1], [2]], total_document_pages=2)
+    assert repo.start_job_batch(job_id, 0, utc_now_iso(), worker_id="worker-a")
+    assert repo.set_job_batch_status(job_id, 0, "completed", worker_id="worker-a") is True
+    assert repo.get_job(job_id)["completed_pages"] == 1
+
+    assert repo.update_claimed_job_status(job_id, "worker-a", "completed") is True
+    completed = repo.get_job(job_id)
+    assert repo.renew_job_lease(job_id, "worker-a", utc_now_iso()) is False
+    assert repo.set_job_batch_status(job_id, 1, "completed", worker_id="worker-a") is False
+    assert repo.get_job(job_id)["status"] == "completed"
+    assert repo.get_job(job_id)["lease_updated_at"] == completed["lease_updated_at"]
