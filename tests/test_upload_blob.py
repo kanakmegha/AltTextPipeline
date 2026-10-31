@@ -64,7 +64,6 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     source = open("src/web/static/upload.js", encoding="utf-8").read()
     bundle = open("src/web/static/upload.bundle.js", encoding="utf-8").read()
     node_token_route = open("api/blob-upload.ts", encoding="utf-8").read()
-    token_helpers = open("api/blob-upload-helpers.mjs", encoding="utf-8").read()
     vercel_routes = json.load(open("vercel.json", encoding="utf-8"))["routes"]
     assert 'upload(authData.pathname, selectedFile' in source
     assert 'access: "private"' in source
@@ -72,9 +71,9 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     assert "handleUpload(" in node_token_route
     assert "BLOB_READ_WRITE_TOKEN" not in node_token_route
     assert 'buildClaimHeaders(req.headers, clientPayload.csrf_token)' in node_token_route
-    assert 'incomingHeaders.authorization' in token_helpers
-    assert 'incomingHeaders["x-operator-token"]' in token_helpers
-    assert '...incomingHeaders' not in token_helpers
+    assert 'incomingHeaders.authorization' in node_token_route
+    assert 'incomingHeaders["x-operator-token"]' in node_token_route
+    assert '...incomingHeaders' not in node_token_route
     assert 'Upload intent claim failed (HTTP ${claim.status})' in node_token_route
     assert 'claim.text()' in node_token_route
     assert 'safeClaimDetail' in node_token_route

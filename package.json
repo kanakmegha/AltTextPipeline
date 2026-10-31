@@ -1,6 +1,8 @@
 {
   "private": true,
   "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build": "npm run build:frontend",
     "build:frontend": "esbuild src/web/static/upload.js --bundle --format=iife --outfile=src/web/static/upload.bundle.js",
     "test:frontend": "node --test tests/*.test.mjs"
   },

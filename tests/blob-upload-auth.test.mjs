@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildClaimHeaders, safeClaimDetail } from "../api/blob-upload-helpers.mjs";
+import esbuild from "esbuild";
+import { buildClaimHeaders, safeClaimDetail } from "../api/blob-upload.ts";
 
 test("claim request forwards supported auth credentials and CSRF only", () => {
   const headers = buildClaimHeaders({
@@ -35,4 +36,18 @@ test("claim diagnostics cap plain-text details and remove control characters", (
   const detail = safeClaimDetail("failure\n" + "x".repeat(500), {}, "csrf");
   assert.equal(detail.length, 400);
   assert.equal(detail.includes("\n"), false);
+});
+
+test("CommonJS handler bundle has no runtime require of an ES module helper", async () => {
+  const result = await esbuild.build({
+    entryPoints: ["api/blob-upload.ts"],
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    external: ["@vercel/blob/client"],
+    write: false,
+  });
+  const bundle = result.outputFiles[0].text;
+  assert.doesNotMatch(bundle, /require\([^)]*\.mjs/);
+  assert.match(bundle, /Upload intent claim failed/);
 });
