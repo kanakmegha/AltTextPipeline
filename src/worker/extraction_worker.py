@@ -118,8 +118,30 @@ def _process_message(message_id, fields, repo, filestore):
         process_extraction_job(job_id, repo, filestore)
 
 
-def run_worker(repo, filestore, redis_url, poll_seconds=2, stop_event=None):
-    """Consume Redis Streams and reconcile queued DB jobs after lost publishes."""
+def _recover_database_jobs(repo, filestore):
+    """Process queued and abandoned jobs using PostgreSQL as the durable queue."""
+    now = datetime.now(timezone.utc)
+    stale_before = _iso(now - timedelta(seconds=LEASE_SECONDS))
+    repo.fail_exhausted_jobs(stale_before)
+    for job in repo.list_recoverable_jobs(stale_before, limit=100):
+        process_extraction_job(job["id"], repo, filestore)
+
+
+def run_worker(repo, filestore, redis_url=None, poll_seconds=5, stop_event=None):
+    """Poll durable database jobs; optionally consume Redis Streams as a wake-up path."""
+    if not redis_url:
+        logger.info("REDIS_URL is unset; running in PostgreSQL polling mode")
+        while stop_event is None or not stop_event.is_set():
+            try:
+                _recover_database_jobs(repo, filestore)
+            except Exception:
+                logger.exception("Database polling iteration failed; will retry")
+            if stop_event is not None:
+                stop_event.wait(poll_seconds)
+            else:
+                time.sleep(poll_seconds)
+        return
+
     from redis import Redis
     from redis.exceptions import ResponseError
     from src.worker.queueing import queue_settings
@@ -130,12 +152,7 @@ def run_worker(repo, filestore, redis_url, poll_seconds=2, stop_event=None):
     try:
         consumer = os.environ.get("RENDER_INSTANCE_ID", f"worker-{os.getpid()}")
         while stop_event is None or not stop_event.is_set():
-            now = datetime.now(timezone.utc)
-            stale_before = _iso(now - timedelta(seconds=LEASE_SECONDS))
-            repo.fail_exhausted_jobs(stale_before)
-            recoverable = repo.list_recoverable_jobs(stale_before, limit=100)
-            for job in recoverable:
-                process_extraction_job(job["id"], repo, filestore)
+            _recover_database_jobs(repo, filestore)
             try:
                 if not group_ready:
                     try:

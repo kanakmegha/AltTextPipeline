@@ -256,5 +256,28 @@ def test_worker_recovers_database_job_while_redis_is_unavailable(tmp_path, monke
     assert repo.get_job(job_id)["status"] == "completed"
 
 
+def test_worker_processes_database_jobs_without_redis(tmp_path, monkeypatch):
+    repo, store, job_id = _make_job(tmp_path)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setitem(sys.modules, "redis", None)
+    from src.worker.queueing import publish_extraction_job
+
+    # FastAPI's optional publish call is a no-op; the committed PostgreSQL row remains discoverable.
+    assert asyncio.run(publish_extraction_job(job_id)) is False
+    assert [job["id"] for job in repo.list_recoverable_jobs("9999-01-01T00:00:00+00:00")] == [job_id]
+
+    class StopAfterOneIteration:
+        waiting = False
+        def is_set(self):
+            return self.waiting
+        def wait(self, _seconds):
+            self.waiting = True
+
+    run_worker(repo, store, redis_url=None, poll_seconds=0.01, stop_event=StopAfterOneIteration())
+
+    assert repo.get_job(job_id)["status"] == "completed"
+    assert repo.get_project("project-1")["status"] == "ready_for_review"
+
+
 def _make_job_storage(_repo, tmp_path):
     return FileStore(str(tmp_path / "worker-storage"))
