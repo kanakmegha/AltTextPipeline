@@ -70,12 +70,12 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     assert "client/`upload` requires the 'handleUploadUrl' parameter" in bundle
     assert "handleUpload(" in node_token_route
     assert "BLOB_READ_WRITE_TOKEN" not in node_token_route
-    assert 'buildClaimHeaders(req.headers, clientPayload.csrf_token)' in node_token_route
+    assert 'claimUploadIntent(host, clientPayload.upload_key, clientPayload.csrf_token, req.headers)' in node_token_route
     assert 'incomingHeaders.authorization' in node_token_route
     assert 'incomingHeaders["x-operator-token"]' in node_token_route
     assert '...incomingHeaders' not in node_token_route
-    assert 'Upload intent claim failed (HTTP ${claim.status})' in node_token_route
-    assert 'claim.text()' in node_token_route
+    assert 'Upload intent claim failed (HTTP ${response.status})' in node_token_route
+    assert 'response.text()' in node_token_route
     assert 'safeClaimDetail' in node_token_route
     disabled_legacy = next(route for route in vercel_routes if route.get("src") == "/api/upload-and-extract")
     assert disabled_legacy["status"] == 410
