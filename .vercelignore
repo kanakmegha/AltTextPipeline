@@ -1,0 +1,33 @@
+# Local Python environment
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+
+# Local databases and uploaded/extracted files
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Test and diagnostic files
+tests/
+diagnostic_output/
+phase1_baseline_report.json
+phase2_comparison_report.json
+phase2_comparison_report.json
+run_phase1_harness.py
+run_phase2_benchmark.py
+baseline_extraction.py
+evaluate_models.py
+
+# Sample documents
+*.pdf
+
+# Development dependencies and repository metadata
+node_modules/
+.git/
+.DS_Store
+.env
+.env.*
+!.env.example

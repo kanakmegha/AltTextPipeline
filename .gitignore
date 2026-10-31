@@ -1,19 +1,25 @@
 .venv/
+venv/
 node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
+
+# Environment secrets
 .env
 .env.*
 !.env.example
+.vercel/
+
+# Local databases and runtime storage
 *.db
 *.sqlite
 *.sqlite3
+data/
 
-# Large source documents and generated artifacts
+# Large source documents and generated diagnostics
 *.pdf
 diagnostic_output/
 phase1_baseline_report.json
 phase2_comparison_report.json
-data/
