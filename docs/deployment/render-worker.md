@@ -20,8 +20,8 @@ Configure these environment variables in Render:
 | Variable | Required | Value |
 | --- | --- | --- |
 | `DATABASE_URL` | Yes | Neon/PostgreSQL connection string for the same database used by Vercel. Use a connection mode appropriate for a continuously running worker. |
-| `BLOB_READ_WRITE_TOKEN` | Yes | Server only. Private Blob read/write token for the store containing source PDFs and extracted images. |
-| `BLOB_STORE_ID` | Optional | Store identifier if the application configuration requires it. |
+| `BLOB_READ_WRITE_TOKEN` | Yes | Server only. Use the same private Blob read/write token configured on the FastAPI deployment. |
+| `BLOB_STORE_ID` | Optional | Use the same store identifier as the FastAPI deployment when configured. |
 | `REDIS_URL` | Yes | TLS Redis URL for a persistent Redis service reachable by both Vercel and Render. |
 | `EXTRACTION_QUEUE_STREAM` | Optional | Defaults to `alttext:extraction`. |
 | `EXTRACTION_QUEUE_GROUP` | Optional | Defaults to `render-workers`. Keep the same group for competing worker instances. |
@@ -38,6 +38,7 @@ Use a Redis service with persistence and a retention policy suitable for queue d
    - `DATABASE_URL`
    - `BLOB_READ_WRITE_TOKEN`
    - `BLOB_STORE_ID` if used
+   - Vercel automatically selects Blob storage; set `STORAGE_BACKEND=blob` for non-Vercel FastAPI deployments that should use the same store.
    - `REDIS_URL`
    - `MAX_UPLOAD_MB` (defaults to 50)
    - existing authentication and CSRF configuration, including `SESSION_SECRET_KEY`

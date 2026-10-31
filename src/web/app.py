@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("alttext.web")
 
 from src.db.connection_factory import create_connection
-from src.storage.storage_factory import create_storage
+from src.storage.storage_factory import create_storage, resolve_storage_backend
 from src.db.migrations import apply_migrations as sqlite_apply_migrations
 from src.db.postgres_migrations import apply_migrations as postgres_apply_migrations
 from src.db.repository import Repository
@@ -253,7 +253,12 @@ def create_app(
 
     if storage is None:
         effective_storage_dir = storage_dir or os.environ.get("STORAGE_DIR", DEFAULT_STORAGE_DIR)
-        storage = create_storage(backend="local", base_dir=effective_storage_dir)
+        storage = create_storage(
+            backend=resolve_storage_backend(),
+            base_dir=effective_storage_dir,
+            blob_token=os.environ.get("BLOB_READ_WRITE_TOKEN"),
+            blob_store_id=os.environ.get("BLOB_STORE_ID"),
+        )
 
     # Run migrations appropriate to the backend
     if type(db_conn).__name__ == "PostgresConnection":

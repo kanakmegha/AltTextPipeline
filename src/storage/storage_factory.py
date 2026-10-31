@@ -11,6 +11,17 @@ from .base_storage import BaseStorage
 from .blob_storage import BlobStorage
 
 
+def resolve_storage_backend(backend: Optional[str] = None) -> str:
+    """Resolve an explicit backend, deployment setting, or safe local default."""
+    if os.environ.get("VERCEL", "").strip().lower() in {"1", "true", "yes"}:
+        return "blob"
+
+    configured = backend or os.environ.get("STORAGE_BACKEND")
+    if configured:
+        return configured.strip().lower()
+    return "local"
+
+
 def create_storage(
     backend: Optional[str] = None,
     base_dir: Optional[str] = None,
@@ -24,8 +35,8 @@ def create_storage(
     ----------
     backend : str, optional
         "local" for filesystem storage, "blob" for Vercel Blob.
-        If omitted, defaults to "blob" when BLOB_READ_WRITE_TOKEN is set,
-        otherwise "local".
+        If omitted, uses STORAGE_BACKEND, selects "blob" on Vercel, and
+        otherwise defaults to "local".
     base_dir : str, optional
         Base directory for local storage (defaults to STORAGE_DIR env or ./data/storage).
     blob_token : str, optional
@@ -37,8 +48,7 @@ def create_storage(
     -------
     A BaseStorage implementation.
     """
-    if backend is None:
-        backend = "blob" if os.environ.get("BLOB_READ_WRITE_TOKEN") else "local"
+    backend = resolve_storage_backend(backend)
 
     if backend == "blob":
         token = blob_token or os.environ.get("BLOB_READ_WRITE_TOKEN")
