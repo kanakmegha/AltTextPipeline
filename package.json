@@ -2,7 +2,7 @@
   "private": true,
   "scripts": {
     "build:frontend": "esbuild src/web/static/upload.js --bundle --format=iife --outfile=src/web/static/upload.bundle.js",
-    "test:frontend": "node --test tests/upload-status.test.mjs"
+    "test:frontend": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@vercel/blob": "^2.0.0"

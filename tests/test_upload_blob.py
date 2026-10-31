@@ -64,12 +64,20 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     source = open("src/web/static/upload.js", encoding="utf-8").read()
     bundle = open("src/web/static/upload.bundle.js", encoding="utf-8").read()
     node_token_route = open("api/blob-upload.ts", encoding="utf-8").read()
+    token_helpers = open("api/blob-upload-helpers.mjs", encoding="utf-8").read()
     vercel_routes = json.load(open("vercel.json", encoding="utf-8"))["routes"]
     assert 'upload(authData.pathname, selectedFile' in source
     assert 'access: "private"' in source
     assert "client/`upload` requires the 'handleUploadUrl' parameter" in bundle
     assert "handleUpload(" in node_token_route
     assert "BLOB_READ_WRITE_TOKEN" not in node_token_route
+    assert 'buildClaimHeaders(req.headers, clientPayload.csrf_token)' in node_token_route
+    assert 'incomingHeaders.authorization' in token_helpers
+    assert 'incomingHeaders["x-operator-token"]' in token_helpers
+    assert '...incomingHeaders' not in token_helpers
+    assert 'Upload intent claim failed (HTTP ${claim.status})' in node_token_route
+    assert 'claim.text()' in node_token_route
+    assert 'safeClaimDetail' in node_token_route
     disabled_legacy = next(route for route in vercel_routes if route.get("src") == "/api/upload-and-extract")
     assert disabled_legacy["status"] == 410
     assert vercel_routes.index(disabled_legacy) < next(i for i, route in enumerate(vercel_routes) if route.get("src") == "/(.*)")
@@ -142,6 +150,73 @@ def test_upload_mutations_keep_csrf_protection(local_app, monkeypatch):
         "filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 12,
     })
     assert response.status_code == 200
+
+
+def test_claim_token_accepts_single_user_operator_cookie_and_csrf(local_app, monkeypatch):
+    from src.web import auth
+
+    client, _, _ = local_app
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "test-operator-cookie-token")
+    monkeypatch.setenv("CSRF_ENABLED", "true")
+    csrf = client.get("/api/auth/csrf-token").json()["csrf_token"]
+    authorized = client.post("/api/uploads/authorize", headers={
+        "X-Operator-Token": "test-operator-cookie-token", "X-CSRF-Token": csrf,
+    }, json={"filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 20})
+    assert authorized.status_code == 200, authorized.text
+    # The cookie is signed exactly as the production operator-cookie auth path expects.
+    client.cookies.set(auth.OPERATOR_COOKIE_NAME, auth._sign("test-operator-cookie-token"))
+    response = client.post(f"/api/uploads/{authorized.json()['upload_key']}/claim-token",
+                           headers={"X-CSRF-Token": csrf}, json={})
+    assert response.status_code == 200, response.text
+
+
+def test_claim_token_accepts_single_user_operator_header_and_csrf(local_app, monkeypatch):
+    client, _, _ = local_app
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "test-operator-header-token")
+    monkeypatch.setenv("CSRF_ENABLED", "true")
+    csrf = client.get("/api/auth/csrf-token").json()["csrf_token"]
+    headers = {"X-Operator-Token": "test-operator-header-token", "X-CSRF-Token": csrf}
+    authorized = client.post("/api/uploads/authorize", headers=headers, json={
+        "filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 20,
+    })
+    assert authorized.status_code == 200, authorized.text
+    claimed = client.post(f"/api/uploads/{authorized.json()['upload_key']}/claim-token",
+                          headers=headers, json={})
+    assert claimed.status_code == 200, claimed.text
+
+
+def test_claim_token_accepts_single_user_bearer_header(local_app, monkeypatch):
+    client, _, _ = local_app
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "test-operator-bearer-token")
+    csrf = client.get("/api/auth/csrf-token").json()["csrf_token"]
+    headers = {"Authorization": "Bearer test-operator-bearer-token", "X-CSRF-Token": csrf}
+    authorized = client.post("/api/uploads/authorize", headers=headers, json={
+        "filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 20,
+    })
+    assert authorized.status_code == 200, authorized.text
+    claimed = client.post(f"/api/uploads/{authorized.json()['upload_key']}/claim-token",
+                          headers=headers, json={})
+    assert claimed.status_code == 200, claimed.text
+
+
+def test_upload_claim_rejects_missing_invalid_auth_and_invalid_csrf(local_app, monkeypatch):
+    client, _, _ = local_app
+    monkeypatch.setenv("SINGLE_USER_ACCESS_TOKEN", "test-operator-required-token")
+    monkeypatch.setenv("CSRF_ENABLED", "true")
+    # Public CSRF bootstrap is available, but upload authorization requires operator auth.
+    csrf = client.get("/api/auth/csrf-token").json()["csrf_token"]
+    payload = {"filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 20}
+    assert client.post("/api/uploads/authorize", headers={"X-CSRF-Token": csrf}, json=payload).status_code == 401
+    bad = {"X-Operator-Token": "wrong-token", "X-CSRF-Token": csrf}
+    assert client.post("/api/uploads/authorize", headers=bad, json=payload).status_code == 401
+    good = {"X-Operator-Token": "test-operator-required-token", "X-CSRF-Token": csrf}
+    authorized = client.post("/api/uploads/authorize", headers=good, json=payload)
+    assert authorized.status_code == 200
+    key = authorized.json()["upload_key"]
+    assert client.post(f"/api/uploads/{key}/claim-token", headers={
+        "X-Operator-Token": "test-operator-required-token", "X-CSRF-Token": "wrong-csrf",
+    }, json={}).status_code == 403
+    assert client.post(f"/api/uploads/{key}/claim-token", headers=good, json={}).status_code == 200
 
 
 def _make_job(tmp_path, with_image=False):

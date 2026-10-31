@@ -1,4 +1,5 @@
 import { handleUpload } from "@vercel/blob/client";
+import { buildClaimHeaders, safeClaimDetail } from "./blob-upload-helpers.mjs";
 
 type ClientPayload = { upload_key?: string; csrf_token?: string };
 
@@ -18,15 +19,14 @@ export default async function handler(req: any, res: any) {
         if (!host) throw new Error("VERCEL_URL is unavailable");
         const claim = await fetch(`https://${host}/api/uploads/${encodeURIComponent(clientPayload.upload_key)}/claim-token`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Cookie": req.headers.cookie || "",
-            "X-CSRF-Token": clientPayload.csrf_token,
-          },
+          headers: buildClaimHeaders(req.headers, clientPayload.csrf_token),
           body: "{}",
           cache: "no-store",
         });
-        if (!claim.ok) throw new Error("Upload intent could not be claimed");
+        if (!claim.ok) {
+          const safeDetail = safeClaimDetail(await claim.text(), req.headers, clientPayload.csrf_token);
+          throw new Error(`Upload intent claim failed (HTTP ${claim.status}): ${safeDetail}`);
+        }
         const intent = await claim.json() as { pathname: string; max_size_bytes: number; valid_until: number };
         if (pathname !== intent.pathname) throw new Error("Blob path does not match the upload intent");
         return {
