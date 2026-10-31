@@ -684,7 +684,47 @@ def create_app(
         _authorize_project_access(request, project_id)
         images = repo.list_project_images(project_id)
         return {"images": images}
+    @app.get("/api/debug/blob-check")
+    async def debug_blob_check(request: Request):
+        project_id = "9bdb8d49-86dc-4b20-9173-886d8e5fd908"
+        image_id = "77953ea2-d433-4a6a-b529-682bbe4fd36e"
 
+        _authorize_project_access(request, project_id)
+
+        asset = repo.get_image_asset(image_id)
+
+        if not asset:
+            return {"result": "database_record_missing"}
+
+        key = asset["file_storage_key"]
+
+        result = {
+            "storage_class": type(filestore).__name__,
+            "token_configured": bool(os.environ.get("BLOB_READ_WRITE_TOKEN")),
+            "store_id": os.environ.get("BLOB_STORE_ID"),
+            "database_key": key,
+        }
+
+        try:
+            metadata = filestore.head(project_id, key)
+            result["head"] = "success"
+            result["pathname"] = getattr(metadata, "pathname", None)
+            result["size"] = getattr(metadata, "size", None)
+        except Exception as exc:
+            result["head"] = "failed"
+            result["error_type"] = type(exc).__name__
+            result["error"] = str(exc)
+
+        try:
+            data = filestore.read_bytes(project_id, key)
+            result["get"] = "success"
+            result["bytes"] = len(data)
+        except Exception as exc:
+            result["get"] = "failed"
+            result["get_error_type"] = type(exc).__name__
+            result["get_error"] = str(exc)
+
+        return result
     @app.get("/api/projects/{project_id}/images/{image_id}/file")
     @app.head("/api/projects/{project_id}/images/{image_id}/file")
     async def get_image_file(request: Request, project_id: str, image_id: str):
