@@ -11,7 +11,7 @@ services:
     stop_grace_period: 90s
     read_only: true
     tmpfs:
-      - /tmp/alttext-worker:rw,noexec,nosuid,size=${WORKER_MAX_MEMORY_MB:-2048}m
+      - /tmp/alttext-worker:rw,noexec,nosuid,size=${WORKER_MAX_MEMORY_MB:-2048}m,uid=999,gid=999,mode=700
     security_opt:
       - no-new-privileges:true
     cap_drop:
