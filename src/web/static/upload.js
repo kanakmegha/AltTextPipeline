@@ -42,7 +42,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!["normal", "large", "xlarge"].includes(size)) size = "normal";
     document.documentElement.setAttribute("data-text-size", size);
     localStorage.setItem("altText_textSize", size);
-    textSizeBtns.forEach(btn => {
+    textSizeBtns.forEach((btn) => {
       if (btn.dataset.size === size) {
         btn.classList.add("active");
         btn.setAttribute("aria-current", "true");
@@ -56,7 +56,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const savedTextSize = localStorage.getItem("altText_textSize") || "normal";
   applyTextSize(savedTextSize);
 
-  textSizeBtns.forEach(btn => {
+  textSizeBtns.forEach((btn) => {
     btn.addEventListener("click", () => {
       applyTextSize(btn.dataset.size);
     });
@@ -67,7 +67,7 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const [configRes, budgetRes] = await Promise.all([
         fetch("/api/ai/config"),
-        fetch("/api/ai/budget")
+        fetch("/api/ai/budget"),
       ]);
 
       if (configRes.ok) {
@@ -75,7 +75,9 @@ document.addEventListener("DOMContentLoaded", () => {
         if (aiConfigBadge) {
           const dot = '<span class="badge-dot"></span>';
           if (config.is_configured) {
-            aiConfigBadge.innerHTML = `${dot} AI: ${escapeHtml(config.provider_name)}`;
+            aiConfigBadge.innerHTML = `${dot} AI: ${
+              escapeHtml(config.provider_name)
+            }`;
             aiConfigBadge.classList.remove("offline");
             aiConfigBadge.classList.add("online");
           } else {
@@ -89,7 +91,9 @@ document.addEventListener("DOMContentLoaded", () => {
       if (budgetRes.ok) {
         const budget = await budgetRes.json();
         if (aiSpendBadge) {
-          aiSpendBadge.textContent = `Spend: $${budget.total_spend_usd.toFixed(2)} / $${budget.max_monthly_spend_usd.toFixed(2)}`;
+          aiSpendBadge.textContent = `Spend: $${
+            budget.total_spend_usd.toFixed(2)
+          } / $${budget.max_monthly_spend_usd.toFixed(2)}`;
           if (budget.budget_exceeded) {
             aiSpendBadge.classList.add("spend-exceeded");
           } else {
@@ -168,7 +172,9 @@ document.addEventListener("DOMContentLoaded", () => {
     selectedFile = file;
     useSamplePdf = false;
     if (selectedFileText) {
-      selectedFileText.textContent = `Selected: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`;
+      selectedFileText.textContent = `Selected: ${file.name} (${
+        (file.size / (1024 * 1024)).toFixed(1)
+      } MB)`;
     }
     if (extractBtn) extractBtn.disabled = false;
   }
@@ -180,10 +186,13 @@ document.addEventListener("DOMContentLoaded", () => {
       selectedFile = null;
       useSamplePdf = true;
       if (selectedFileText) {
-        selectedFileText.textContent = "Selected: 40345.pdf (Local Sample Volume)";
+        selectedFileText.textContent =
+          "Selected: 40345.pdf (Local Sample Volume)";
       }
       if (pageRangeInput) pageRangeInput.value = "1, 4, 33, 46, 77";
-      if (projectNameInput) projectNameInput.value = "Inspection - 40345 Sample Pages";
+      if (projectNameInput) {
+        projectNameInput.value = "Inspection - 40345 Sample Pages";
+      }
       if (extractBtn) extractBtn.disabled = false;
     });
   }
@@ -194,7 +203,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (progressText) progressText.textContent = text;
     if (progressBarFill) {
       progressBarFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-      progressBarFill.setAttribute("aria-valuenow", Math.max(0, Math.min(100, percent)));
+      progressBarFill.setAttribute(
+        "aria-valuenow",
+        Math.max(0, Math.min(100, percent)),
+      );
     }
   }
 
@@ -243,18 +255,28 @@ document.addEventListener("DOMContentLoaded", () => {
       card.dataset.placement = String(image.placement_index || 0);
       const preview = document.createElement("img");
       preview.loading = "lazy";
-      preview.src = `/api/projects/${encodeURIComponent(projectId)}/images/${encodeURIComponent(image.id)}/file`;
-      preview.alt = image.original_caption || `Extracted image from page ${image.page_number}`;
+      preview.src = `/api/projects/${encodeURIComponent(projectId)}/images/${
+        encodeURIComponent(image.id)
+      }/file`;
+      preview.alt = image.original_caption ||
+        `Extracted image from page ${image.page_number}`;
       const description = document.createElement("p");
-      description.textContent = `Page ${image.page_number}${image.original_caption ? ` · ${image.original_caption}` : " · No caption found"}`;
+      description.textContent = `Page ${image.page_number}${
+        image.original_caption
+          ? ` · ${image.original_caption}`
+          : " · No caption found"
+      }`;
       card.append(preview, description);
       progressiveImageList.appendChild(card);
     }
     const ordered = [...progressiveImageList.children].sort((a, b) =>
-      Number(a.dataset.page) - Number(b.dataset.page) || Number(a.dataset.placement) - Number(b.dataset.placement)
+      Number(a.dataset.page) - Number(b.dataset.page) ||
+      Number(a.dataset.placement) - Number(b.dataset.placement)
     );
-    ordered.forEach(card => progressiveImageList.appendChild(card));
-    if (progressiveResults && ordered.length) progressiveResults.style.display = "block";
+    ordered.forEach((card) => progressiveImageList.appendChild(card));
+    if (progressiveResults && ordered.length) {
+      progressiveResults.style.display = "block";
+    }
   }
 
   async function pollProjectStatus(projectId, jobId) {
@@ -264,8 +286,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const poll = async () => {
       try {
-        const endpoint = jobId ? `/api/jobs/${encodeURIComponent(jobId)}/progress` : `/api/projects/${encodeURIComponent(projectId)}/status`;
-        const res = await fetch(endpoint, { method: "GET", credentials: "include" });
+        const endpoint = jobId
+          ? `/api/jobs/${encodeURIComponent(jobId)}/progress`
+          : `/api/projects/${encodeURIComponent(projectId)}/status`;
+        const res = await fetch(endpoint, {
+          method: "GET",
+          credentials: "include",
+        });
 
         if (!res.ok) {
           console.warn("Status poll failed:", res.status);
@@ -275,19 +302,34 @@ document.addEventListener("DOMContentLoaded", () => {
         const data = await res.json();
         let images = data.images || [];
         if (jobId) {
-          const imagesRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/images`, { credentials: "include" });
+          const imagesRes = await fetch(
+            `/api/jobs/${encodeURIComponent(jobId)}/images`,
+            { credentials: "include" },
+          );
           if (imagesRes.ok) images = (await imagesRes.json()).images || [];
         }
         appendProgressImages(projectId, images);
         const status = data.project_status || data.status;
         const jobStatus = data.job_status;
 
-        const reviewUrl = getProjectReviewUrl(status === "ready_for_review" || status === "completed" ? status : jobStatus, projectId);
+        // Open Review as soon as the first image has been persisted.
+        // Extraction continues in the background.
+        const hasExtractedImages = images.length > 0;
+
+        const reviewUrl = hasExtractedImages
+          ? getProjectReviewUrl("ready_for_review", projectId)
+          : getProjectReviewUrl(
+            status === "ready_for_review" || status === "completed"
+              ? status
+              : jobStatus,
+            projectId,
+          );
+
         if (reviewUrl) {
           clearInterval(statusPollInterval);
           statusPollInterval = null;
           hideProgress();
-          // Navigate to Review & Edit
+
           window.location.href = reviewUrl;
         } else if (status === "failed" || jobStatus === "failed") {
           clearInterval(statusPollInterval);
@@ -300,10 +342,25 @@ document.addEventListener("DOMContentLoaded", () => {
         } else {
           // Still processing: queued, extracting, etc.
           const totalImages = data.total_images || 0;
-          const batches = data.total_batches ? `Batch ${data.completed_batches || 0}/${data.total_batches}` : "Preparing page batches";
-          const pages = data.pages_to_process ? ` · ${data.completed_pages || 0}/${data.pages_to_process} pages` : "";
-          const percent = data.total_batches ? Math.min(95, 60 + Math.round(35 * (data.completed_batches || 0) / data.total_batches)) : 60;
-          setProgress(percent, `${batches}${pages} · ${totalImages} images available as extracted…`);
+          const batches = data.total_batches
+            ? `Batch ${data.completed_batches || 0}/${data.total_batches}`
+            : "Preparing page batches";
+          const pages = data.pages_to_process
+            ? ` · ${data.completed_pages || 0}/${data.pages_to_process} pages`
+            : "";
+          const percent = data.total_batches
+            ? Math.min(
+              95,
+              60 +
+                Math.round(
+                  35 * (data.completed_batches || 0) / data.total_batches,
+                ),
+            )
+            : 60;
+          setProgress(
+            percent,
+            `${batches}${pages} · ${totalImages} images available as extracted…`,
+          );
         }
       } catch (err) {
         console.warn("Status poll error:", err);
@@ -364,14 +421,17 @@ document.addEventListener("DOMContentLoaded", () => {
           }
 
           const data = await response.json();
-          const projectId = data.project_id || (data.project && data.project.id);
+          const projectId = data.project_id ||
+            (data.project && data.project.id);
           if (!projectId) {
-            throw new Error("Extraction completed but server did not return a project ID.");
+            throw new Error(
+              "Extraction completed but server did not return a project ID.",
+            );
           }
 
           currentProjectId = projectId;
           setProgress(100, "Extraction complete. Loading review…");
-          await new Promise(r => setTimeout(r, 500));
+          await new Promise((r) => setTimeout(r, 500));
           window.location.href = `/review/${projectId}`;
           return;
         }
@@ -413,18 +473,33 @@ document.addEventListener("DOMContentLoaded", () => {
         if (selectedFile.size > authData.max_size_bytes) {
           throw new Error("File exceeds the configured upload limit.");
         }
-        const csrfResponse = await fetch("/api/auth/csrf-token", { credentials: "include" });
-        if (!csrfResponse.ok) throw new Error("Could not prepare a secure upload.");
+        const csrfResponse = await fetch("/api/auth/csrf-token", {
+          credentials: "include",
+        });
+        if (!csrfResponse.ok) {
+          throw new Error("Could not prepare a secure upload.");
+        }
         const csrfData = await csrfResponse.json();
         const blobResult = await upload(authData.pathname, selectedFile, {
           access: "private",
           handleUploadUrl: authData.handle_upload_url,
-          clientPayload: JSON.stringify({ upload_key: uploadKey, csrf_token: csrfData.csrf_token }),
+          clientPayload: JSON.stringify({
+            upload_key: uploadKey,
+            csrf_token: csrfData.csrf_token,
+          }),
           contentType: "application/pdf",
           multipart: selectedFile.size > 5 * 1024 * 1024,
-          onUploadProgress: ({ percentage }) => setProgress(10 + Math.round(percentage * 0.4), `Uploading ${escapeHtml(selectedFile.name)} (${Math.round(percentage)}%)…`),
+          onUploadProgress: ({ percentage }) =>
+            setProgress(
+              10 + Math.round(percentage * 0.4),
+              `Uploading ${escapeHtml(selectedFile.name)} (${
+                Math.round(percentage)
+              }%)…`,
+            ),
         });
-        if (blobResult.pathname !== authData.pathname) throw new Error("Blob returned an unexpected object path.");
+        if (blobResult.pathname !== authData.pathname) {
+          throw new Error("Blob returned an unexpected object path.");
+        }
 
         setProgress(55, "Verifying private upload and creating project…");
 
@@ -453,7 +528,9 @@ document.addEventListener("DOMContentLoaded", () => {
         const completeData = await completeRes.json();
         const projectId = completeData.project_id;
         if (!projectId) {
-          throw new Error("Project creation succeeded but no project ID returned.");
+          throw new Error(
+            "Project creation succeeded but no project ID returned.",
+          );
         }
 
         currentProjectId = projectId;
@@ -468,7 +545,6 @@ document.addEventListener("DOMContentLoaded", () => {
         // Step 4: Poll for extraction completion
         setProgress(70, "Waiting for extraction to start…");
         pollProjectStatus(projectId, completeData.job_id);
-
       } catch (err) {
         stopPolling();
         hideProgress();
@@ -491,19 +567,26 @@ document.addEventListener("DOMContentLoaded", () => {
       const projects = data.projects || [];
 
       if (projects.length === 0) {
-        recentProjectsList.innerHTML = '<p class="text-muted" style="margin:0; font-size:13px;">No projects created yet. Upload a PDF above to begin.</p>';
+        recentProjectsList.innerHTML =
+          '<p class="text-muted" style="margin:0; font-size:13px;">No projects created yet. Upload a PDF above to begin.</p>';
         return;
       }
 
-      recentProjectsList.innerHTML = projects.slice(0, 5).map(p => {
-        const dateStr = p.created_at ? new Date(p.created_at).toLocaleDateString() : "";
+      recentProjectsList.innerHTML = projects.slice(0, 5).map((p) => {
+        const dateStr = p.created_at
+          ? new Date(p.created_at).toLocaleDateString()
+          : "";
         return `
           <div class="recent-project-row">
             <div class="recent-project-info">
               <span style="font-size: 18px;" aria-hidden="true">📁</span>
               <div>
-                <div class="recent-project-name">${escapeHtml(p.name || "Untitled Project")}</div>
-                <div class="recent-project-meta">${escapeHtml(p.source_filename || "")} · ${dateStr}</div>
+                <div class="recent-project-name">${
+          escapeHtml(p.name || "Untitled Project")
+        }</div>
+                <div class="recent-project-meta">${
+          escapeHtml(p.source_filename || "")
+        } · ${dateStr}</div>
               </div>
             </div>
             <div class="recent-project-actions">

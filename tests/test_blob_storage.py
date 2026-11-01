@@ -412,3 +412,68 @@ def test_blob_close_is_safe(mock_blob):
     storage, _, _ = mock_blob
 
     assert storage.close() is None
+
+
+
+def test_blob_read_bytes_accepts_prefixed_storage_key(mock_blob):
+    """A database key already containing project_id must not be prefixed twice."""
+    storage, objects, calls = mock_blob
+
+    project_id = "proj_1"
+    image_bytes = b"\x89PNG fake image bytes"
+
+    key, _, _ = storage.save_image(
+        project_id=project_id,
+        image_id="prefixed_read_test",
+        image_bytes=image_bytes,
+        ext="png",
+    )
+
+    # Simulate the full key stored in the database.
+    assert key == "proj_1/images/prefixed_read_test.png"
+
+    read_back = storage.read_bytes(
+        project_id,
+        key,
+    )
+
+    assert read_back == image_bytes
+
+    # Verify that the project ID appears only once.
+    assert calls["get"][-1] == (
+        "proj_1/images/prefixed_read_test.png",
+        "private",
+    )
+
+
+def test_blob_exists_accepts_prefixed_storage_key(mock_blob):
+    """Existence checks must also support database-stored full keys."""
+    storage, _, calls = mock_blob
+
+    project_id = "proj_1"
+
+    key, _, _ = storage.save_image(
+        project_id=project_id,
+        image_id="prefixed_exists_test",
+        image_bytes=b"image bytes",
+        ext="png",
+    )
+
+    assert storage.exists(project_id, key) is True
+
+    assert calls["head"][-1] == (
+        "proj_1/images/prefixed_exists_test.png"
+    )
+
+
+def test_blob_resolve_path_accepts_prefixed_storage_key(mock_blob):
+    """Resolving an already prefixed key must not duplicate project_id."""
+    storage, _, _ = mock_blob
+
+    project_id = "proj_1"
+
+    key = "proj_1/images/test_image.png"
+
+    resolved = storage.resolve_path(project_id, key)
+
+    assert resolved == "proj_1/images/test_image.png"

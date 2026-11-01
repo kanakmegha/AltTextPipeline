@@ -2,6 +2,9 @@
 import asyncio
 import io
 import json
+import re
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -70,7 +73,11 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     assert "client/`upload` requires the 'handleUploadUrl' parameter" in bundle
     assert "handleUpload(" in node_token_route
     assert "BLOB_READ_WRITE_TOKEN" not in node_token_route
-    assert 'claimUploadIntent(host, clientPayload.upload_key, clientPayload.csrf_token, req.headers)' in node_token_route
+    assert "resolveClaimOrigin(req.headers)" in node_token_route
+    assert re.search(
+        r"claimUploadIntent\s*\(\s*origin\s*,\s*clientPayload\.upload_key\s*,\s*clientPayload\.csrf_token\s*,\s*req\.headers\s*,?\s*\)",
+        node_token_route,
+    )
     assert 'incomingHeaders.authorization' in node_token_route
     assert 'incomingHeaders["x-operator-token"]' in node_token_route
     assert '...incomingHeaders' not in node_token_route
@@ -85,6 +92,125 @@ def test_browser_uses_blob_client_and_never_posts_pdf_to_fastapi(local_app):
     assert len(client.post("/api/uploads/authorize", json={"filename": "too-big.pdf",
         "content_type": "application/pdf", "size_bytes": 51 * 1024 * 1024}).content) < 1024
     assert all("/chunk" not in getattr(route, "path", "") for route in client.app.routes)
+
+
+def test_resolve_claim_origin_validates_hosts_and_forwards_credentials():
+    """Verify origin resolution security and auth header forwarding for direct Blob uploads."""
+    node_token_route = open("api/blob-upload.ts", encoding="utf-8").read()
+
+    # 1. Verify resolveClaimOrigin structure and approved hostname sources in source code
+    assert "export function resolveClaimOrigin(" in node_token_route
+    assert "env.VERCEL_URL" in node_token_route
+    assert "env.VERCEL_BRANCH_URL" in node_token_route
+    assert "env.VERCEL_PROJECT_PRODUCTION_URL" in node_token_route
+    assert "env.UPLOAD_CLAIM_ALLOWED_HOSTS" in node_token_route
+    assert "Request host is not an approved application hostname" in node_token_route
+    assert "Invalid request origin" in node_token_route
+
+    # 2. Verify resolved origin is passed to claimUploadIntent
+    assert re.search(
+        r"const\s+origin\s*=\s*resolveClaimOrigin\(req\.headers\);",
+        node_token_route,
+    )
+    assert re.search(
+        r"claimUploadIntent\s*\(\s*origin\s*,\s*clientPayload\.upload_key\s*,\s*clientPayload\.csrf_token\s*,\s*req\.headers\s*,?\s*\)",
+        node_token_route,
+    )
+
+    # 3. Verify buildClaimHeaders forwards credentials & CSRF without blind header spreading
+    assert "export function buildClaimHeaders(" in node_token_route
+    assert '"X-CSRF-Token": csrfToken' in node_token_route
+    assert 'headers.Authorization = incomingHeaders.authorization' in node_token_route
+    assert 'headers["X-Operator-Token"] = incomingHeaders["x-operator-token"]' in node_token_route
+    assert "...incomingHeaders" not in node_token_route
+
+    # 4. If Node runtime is available, execute unit tests directly on the TypeScript implementation
+    if shutil.which("node"):
+        node_script = """
+import assert from "node:assert/strict";
+import { resolveClaimOrigin, buildClaimHeaders } from "./api/blob-upload.ts";
+
+const baseEnv = {
+  VERCEL_URL: "preview-123.vercel.app",
+  VERCEL_BRANCH_URL: "branch-feature.vercel.app",
+  VERCEL_PROJECT_PRODUCTION_URL: "https://production.example.com",
+  UPLOAD_CLAIM_ALLOWED_HOSTS: "custom.domain.com, api.custom.org",
+};
+
+// Valid Vercel deployment host
+assert.equal(
+  resolveClaimOrigin({ host: "preview-123.vercel.app" }, baseEnv),
+  "https://preview-123.vercel.app"
+);
+assert.equal(
+  resolveClaimOrigin({ host: "branch-feature.vercel.app" }, baseEnv),
+  "https://branch-feature.vercel.app"
+);
+
+// Valid production domain
+assert.equal(
+  resolveClaimOrigin({ host: "production.example.com" }, baseEnv),
+  "https://production.example.com"
+);
+
+// Explicitly allowed custom hostname
+assert.equal(
+  resolveClaimOrigin({ host: "custom.domain.com" }, baseEnv),
+  "https://custom.domain.com"
+);
+assert.equal(
+  resolveClaimOrigin({ host: "api.custom.org" }, baseEnv),
+  "https://api.custom.org"
+);
+
+// Rejection of untrusted hostnames
+assert.throws(
+  () => resolveClaimOrigin({ host: "evil.com" }, baseEnv),
+  /Request host is not an approved application hostname/
+);
+assert.throws(
+  () => resolveClaimOrigin({ host: "attacker.vercel.app" }, baseEnv),
+  /Request host is not an approved application hostname/
+);
+assert.throws(
+  () => resolveClaimOrigin({ host: "production.example.com:8443" }, baseEnv),
+  /Invalid request origin/
+);
+assert.throws(
+  () => resolveClaimOrigin({ host: "production.example.com/path" }, baseEnv),
+  /Invalid request origin/
+);
+assert.throws(
+  () => resolveClaimOrigin({ host: "" }, baseEnv),
+  /Missing request host/
+);
+assert.throws(
+  () => resolveClaimOrigin({}, baseEnv),
+  /Missing request host/
+);
+
+// Authentication and CSRF headers are forwarded
+const claimHeaders = buildClaimHeaders({
+  cookie: "session_id=abc; csrf=xyz",
+  authorization: "Bearer secret-token",
+  "x-operator-token": "operator-secret-token",
+  "x-untrusted-header": "strip-this",
+  host: "production.example.com",
+}, "csrf-token-123");
+
+assert.equal(claimHeaders["Cookie"], "session_id=abc; csrf=xyz");
+assert.equal(claimHeaders["X-CSRF-Token"], "csrf-token-123");
+assert.equal(claimHeaders["Authorization"], "Bearer secret-token");
+assert.equal(claimHeaders["X-Operator-Token"], "operator-secret-token");
+assert.equal("x-untrusted-header" in claimHeaders, false);
+assert.equal("host" in claimHeaders, false);
+"""
+        proc = subprocess.run(
+            ["node", "--input-type=module", "-e", node_script],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, f"Node tests failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_upload_token_is_single_use_and_completion_verifies_blob(local_app):

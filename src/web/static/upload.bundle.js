@@ -6662,7 +6662,9 @@ ${newlined}
           selectedFileText.textContent = "Selected: 40345.pdf (Local Sample Volume)";
         }
         if (pageRangeInput) pageRangeInput.value = "1, 4, 33, 46, 77";
-        if (projectNameInput) projectNameInput.value = "Inspection - 40345 Sample Pages";
+        if (projectNameInput) {
+          projectNameInput.value = "Inspection - 40345 Sample Pages";
+        }
         if (extractBtn) extractBtn.disabled = false;
       });
     }
@@ -6671,7 +6673,10 @@ ${newlined}
       if (progressText) progressText.textContent = text;
       if (progressBarFill) {
         progressBarFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-        progressBarFill.setAttribute("aria-valuenow", Math.max(0, Math.min(100, percent)));
+        progressBarFill.setAttribute(
+          "aria-valuenow",
+          Math.max(0, Math.min(100, percent))
+        );
       }
     }
     function hideProgress() {
@@ -6720,7 +6725,9 @@ ${newlined}
         (a, b) => Number(a.dataset.page) - Number(b.dataset.page) || Number(a.dataset.placement) - Number(b.dataset.placement)
       );
       ordered.forEach((card) => progressiveImageList.appendChild(card));
-      if (progressiveResults && ordered.length) progressiveResults.style.display = "block";
+      if (progressiveResults && ordered.length) {
+        progressiveResults.style.display = "block";
+      }
     }
     async function pollProjectStatus(projectId, jobId) {
       if (statusPollInterval) {
@@ -6729,7 +6736,10 @@ ${newlined}
       const poll = async () => {
         try {
           const endpoint = jobId ? `/api/jobs/${encodeURIComponent(jobId)}/progress` : `/api/projects/${encodeURIComponent(projectId)}/status`;
-          const res = await fetch(endpoint, { method: "GET", credentials: "include" });
+          const res = await fetch(endpoint, {
+            method: "GET",
+            credentials: "include"
+          });
           if (!res.ok) {
             console.warn("Status poll failed:", res.status);
             return;
@@ -6737,13 +6747,20 @@ ${newlined}
           const data = await res.json();
           let images = data.images || [];
           if (jobId) {
-            const imagesRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/images`, { credentials: "include" });
+            const imagesRes = await fetch(
+              `/api/jobs/${encodeURIComponent(jobId)}/images`,
+              { credentials: "include" }
+            );
             if (imagesRes.ok) images = (await imagesRes.json()).images || [];
           }
           appendProgressImages(projectId, images);
           const status = data.project_status || data.status;
           const jobStatus = data.job_status;
-          const reviewUrl = (0, import_upload_status.getProjectReviewUrl)(status === "ready_for_review" || status === "completed" ? status : jobStatus, projectId);
+          const hasExtractedImages = images.length > 0;
+          const reviewUrl = hasExtractedImages ? (0, import_upload_status.getProjectReviewUrl)("ready_for_review", projectId) : (0, import_upload_status.getProjectReviewUrl)(
+            status === "ready_for_review" || status === "completed" ? status : jobStatus,
+            projectId
+          );
           if (reviewUrl) {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
@@ -6761,8 +6778,16 @@ ${newlined}
             const totalImages = data.total_images || 0;
             const batches = data.total_batches ? `Batch ${data.completed_batches || 0}/${data.total_batches}` : "Preparing page batches";
             const pages = data.pages_to_process ? ` \xB7 ${data.completed_pages || 0}/${data.pages_to_process} pages` : "";
-            const percent = data.total_batches ? Math.min(95, 60 + Math.round(35 * (data.completed_batches || 0) / data.total_batches)) : 60;
-            setProgress(percent, `${batches}${pages} \xB7 ${totalImages} images available as extracted\u2026`);
+            const percent = data.total_batches ? Math.min(
+              95,
+              60 + Math.round(
+                35 * (data.completed_batches || 0) / data.total_batches
+              )
+            ) : 60;
+            setProgress(
+              percent,
+              `${batches}${pages} \xB7 ${totalImages} images available as extracted\u2026`
+            );
           }
         } catch (err) {
           console.warn("Status poll error:", err);
@@ -6814,7 +6839,9 @@ ${newlined}
             const data = await response.json();
             const projectId2 = data.project_id || data.project && data.project.id;
             if (!projectId2) {
-              throw new Error("Extraction completed but server did not return a project ID.");
+              throw new Error(
+                "Extraction completed but server did not return a project ID."
+              );
             }
             currentProjectId = projectId2;
             setProgress(100, "Extraction complete. Loading review\u2026");
@@ -6855,18 +6882,30 @@ ${newlined}
           if (selectedFile.size > authData.max_size_bytes) {
             throw new Error("File exceeds the configured upload limit.");
           }
-          const csrfResponse = await fetch("/api/auth/csrf-token", { credentials: "include" });
-          if (!csrfResponse.ok) throw new Error("Could not prepare a secure upload.");
+          const csrfResponse = await fetch("/api/auth/csrf-token", {
+            credentials: "include"
+          });
+          if (!csrfResponse.ok) {
+            throw new Error("Could not prepare a secure upload.");
+          }
           const csrfData = await csrfResponse.json();
           const blobResult = await upload(authData.pathname, selectedFile, {
             access: "private",
             handleUploadUrl: authData.handle_upload_url,
-            clientPayload: JSON.stringify({ upload_key: uploadKey, csrf_token: csrfData.csrf_token }),
+            clientPayload: JSON.stringify({
+              upload_key: uploadKey,
+              csrf_token: csrfData.csrf_token
+            }),
             contentType: "application/pdf",
             multipart: selectedFile.size > 5 * 1024 * 1024,
-            onUploadProgress: ({ percentage }) => setProgress(10 + Math.round(percentage * 0.4), `Uploading ${escapeHtml(selectedFile.name)} (${Math.round(percentage)}%)\u2026`)
+            onUploadProgress: ({ percentage }) => setProgress(
+              10 + Math.round(percentage * 0.4),
+              `Uploading ${escapeHtml(selectedFile.name)} (${Math.round(percentage)}%)\u2026`
+            )
           });
-          if (blobResult.pathname !== authData.pathname) throw new Error("Blob returned an unexpected object path.");
+          if (blobResult.pathname !== authData.pathname) {
+            throw new Error("Blob returned an unexpected object path.");
+          }
           setProgress(55, "Verifying private upload and creating project\u2026");
           const completeRes = await fetch(`/api/uploads/${uploadKey}/complete`, {
             method: "POST",
@@ -6891,7 +6930,9 @@ ${newlined}
           const completeData = await completeRes.json();
           const projectId = completeData.project_id;
           if (!projectId) {
-            throw new Error("Project creation succeeded but no project ID returned.");
+            throw new Error(
+              "Project creation succeeded but no project ID returned."
+            );
           }
           currentProjectId = projectId;
           if (completeData.already_completed) {
