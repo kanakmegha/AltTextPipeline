@@ -705,24 +705,43 @@ def create_app(
             "database_key": key,
         }
 
+        # Test the storage abstraction.
         try:
             metadata = filestore.head(project_id, key)
-            result["head"] = "success"
-            result["pathname"] = getattr(metadata, "pathname", None)
-            result["size"] = getattr(metadata, "size", None)
+            result["storage_head"] = "success"
+            result["storage_head_size"] = getattr(metadata, "size", None)
         except Exception as exc:
-            result["head"] = "failed"
-            result["error_type"] = type(exc).__name__
-            result["error"] = str(exc)
+            result["storage_head"] = "failed"
+            result["storage_head_error"] = type(exc).__name__
+            result["storage_head_message"] = str(exc)
+
+    # Test the Vercel SDK directly.
+        try:
+            from vercel.blob import sync as blob
+
+            metadata = blob.head_blob(key)
+
+            result["direct_sdk_head"] = "success"
+            result["direct_sdk_pathname"] = getattr(metadata, "pathname", None)
+            result["direct_sdk_size"] = getattr(metadata, "size", None)
+
+        except Exception as exc:
+            result["direct_sdk_head"] = "failed"
+            result["direct_sdk_error"] = type(exc).__name__
+            result["direct_sdk_message"] = str(exc)
 
         try:
-            data = filestore.read_bytes(project_id, key)
-            result["get"] = "success"
-            result["bytes"] = len(data)
+            from vercel.blob import sync as blob
+
+            downloaded = blob.get_blob(key, access="private")
+
+            result["direct_sdk_get"] = "success"
+            result["direct_sdk_bytes"] = len(downloaded.body)
+
         except Exception as exc:
-            result["get"] = "failed"
-            result["get_error_type"] = type(exc).__name__
-            result["get_error"] = str(exc)
+            result["direct_sdk_get"] = "failed"
+            result["direct_sdk_get_error"] = type(exc).__name__
+            result["direct_sdk_get_message"] = str(exc)
 
         return result
 
