@@ -94,19 +94,29 @@ class BlobStorage(BaseStorage):
 
         return project_id
 
+    
     @classmethod
     def _safe_key(cls, project_id: str, relative_key: str) -> str:
-        """Create and validate a project-isolated Blob pathname."""
+        """
+        Create a project-isolated Vercel Blob pathname.
+
+        Supports both relative keys and keys that already
+        contain the project ID prefix.
+        """
 
         project_id = cls._validate_project_id(project_id)
 
-        if not isinstance(relative_key, str) or not relative_key:
-            raise PathTraversalError("Storage key must be a non-empty string.")
+        if not isinstance(relative_key, str) or not relative_key.strip():
+            raise PathTraversalError(
+                "Storage key must be a non-empty string."
+            )
 
         normalized = relative_key.replace("\\", "/")
 
         if normalized.startswith("/"):
-            raise PathTraversalError("Absolute storage paths are forbidden.")
+            raise PathTraversalError(
+                "Absolute storage paths are forbidden."
+            )
 
         parts = normalized.split("/")
 
@@ -115,7 +125,19 @@ class BlobStorage(BaseStorage):
                 f"Unsafe storage key: {relative_key}"
             )
 
+        # Already-prefixed database key: do not add the project ID again.
+        if parts[0] == project_id:
+            if len(parts) < 2:
+                raise PathTraversalError(
+                    "Invalid project storage key."
+                )
+
+            return PurePosixPath(*parts).as_posix()
+
+        # Relative key: add the project ID exactly once.
         return PurePosixPath(project_id, *parts).as_posix()
+
+
 
     @staticmethod
     def _safe_filename(filename: str) -> str:
