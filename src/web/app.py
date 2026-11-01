@@ -686,9 +686,12 @@ def create_app(
         return {"images": images}
     
     
+    
+    
     @app.get("/api/debug/blob-check")
     async def debug_blob_check(request: Request):
         import inspect
+        from vercel.blob import sync as blob
 
         project_id = "9bdb8d49-86dc-4b20-9173-886d8e5fd908"
         image_id = "77953ea2-d433-4a6a-b529-682bbe4fd36e"
@@ -703,92 +706,59 @@ def create_app(
         key = asset["file_storage_key"]
 
         result = {
-        "storage_class": type(filestore).__name__,
-        "token_configured": bool(
-            os.environ.get("BLOB_READ_WRITE_TOKEN")
-        ),
-        "store_id": os.environ.get("BLOB_STORE_ID"),
-        "database_key": key,
-    }
+            "storage_class": type(filestore).__name__,
+            "database_key": key,
+        }
 
-    # --------------------------------------------------
-    # 1. Inspect project ID and database key
-    # --------------------------------------------------
-        first_key_part = key.split("/")[0] if key else None
+        # 1. Inspect key values
+        first_part = key.split("/")[0]
 
         result["project_id_repr"] = repr(project_id)
-        result["first_key_part_repr"] = repr(first_key_part)
+        result["first_key_part_repr"] = repr(first_part)
         result["project_id_matches_first_part"] = (
-            first_key_part == project_id
+            first_part == project_id
         )
 
-    # --------------------------------------------------
-    # 2. Inspect the exact deployed _safe_key function
-    # --------------------------------------------------
+        # 2. Inspect deployed implementation
         try:
             result["safe_key_source"] = inspect.getsource(
                 filestore._safe_key
             )
         except Exception as exc:
-            result["safe_key_source_error"] = (
+            result["source_inspection_error"] = (
                 f"{type(exc).__name__}: {exc}"
             )
 
-    # --------------------------------------------------
-    # 3. Resolve the storage key
-    # --------------------------------------------------
+        # 3. Resolve key
         try:
             resolved_key = filestore._safe_key(project_id, key)
 
-            result["raw_key"] = repr(key)
             result["resolved_key"] = repr(resolved_key)
-            result["keys_match"] = key == resolved_key
+            result["keys_match"] = resolved_key == key
 
         except Exception as exc:
-            result["key_resolution"] = "failed"
-            result["key_resolution_error"] = type(exc).__name__
-            result["key_resolution_message"] = str(exc)
+            result["key_resolution_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
             return result
 
-    # --------------------------------------------------
-    # 4. Test storage abstraction: HEAD
-    # --------------------------------------------------
+        # 4. Storage abstraction HEAD
         try:
             metadata = filestore.head(project_id, key)
 
             result["storage_head"] = "success"
-            result["storage_head_pathname"] = getattr(
-                metadata, "pathname", None
-            )
             result["storage_head_size"] = getattr(
                 metadata, "size", None
             )
 
         except Exception as exc:
             result["storage_head"] = "failed"
-        result["storage_head_error"] = type(exc).__name__
-        result["storage_head_message"] = str(exc)
+            result["storage_head_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
-    # --------------------------------------------------
-    # 5. Test storage abstraction: GET
-    # --------------------------------------------------
+        # 5. Direct SDK HEAD with original key
         try:
-            data = filestore.read_bytes(project_id, key)
-
-            result["storage_get"] = "success"
-            result["storage_get_bytes"] = len(data)
-
-        except Exception as exc:
-            result["storage_get"] = "failed"
-            result["storage_get_error"] = type(exc).__name__
-            result["storage_get_message"] = str(exc)
-
-    # --------------------------------------------------
-    # 6. Direct SDK HEAD using original database key
-    # --------------------------------------------------
-        try:
-            from vercel.blob import sync as blob
-
             metadata = blob.head_blob(key)
 
             result["direct_sdk_head"] = "success"
@@ -801,50 +771,28 @@ def create_app(
 
         except Exception as exc:
             result["direct_sdk_head"] = "failed"
-            result["direct_sdk_error"] = type(exc).__name__
-        result["direct_sdk_message"] = str(exc)
+            result["direct_sdk_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
-    # --------------------------------------------------
-    # 7. Direct SDK HEAD using resolved key
-    # --------------------------------------------------
+        # 6. Direct SDK HEAD with resolved key
         try:
-            from vercel.blob import sync as blob
-
             metadata = blob.head_blob(resolved_key)
 
             result["resolved_sdk_head"] = "success"
             result["resolved_sdk_pathname"] = getattr(
                 metadata, "pathname", None
             )
-            result["resolved_sdk_size"] = getattr(
-                metadata, "size", None
-            )
 
         except Exception as exc:
             result["resolved_sdk_head"] = "failed"
-            result["resolved_sdk_error"] = type(exc).__name__
-            result["resolved_sdk_message"] = str(exc)
-
-    # --------------------------------------------------
-    # 8. Direct SDK GET using original database key
-    # --------------------------------------------------
-        try:
-            from vercel.blob import sync as blob
-
-            downloaded = blob.get_blob(
-                key,
-                access="private",
-        )
-
-            result["direct_sdk_get"] = "success"
-            result["direct_sdk_bytes"] = len(downloaded.body)
-
-        except Exception as exc:
-            result["direct_sdk_get"] = "failed"
-            result["direct_sdk_get_error"] = type(exc).__name__
-            result["direct_sdk_get_message"] = str(exc)
+            result["resolved_sdk_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
         return result
+
+
 
 
 
