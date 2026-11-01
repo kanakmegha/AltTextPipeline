@@ -97,6 +97,35 @@ class FileStore:
         rel_key = f"source/{safe_name}"
         return rel_key, checksum, size
 
+    def save_source_pdf_from_file(
+        self,
+        project_id: str,
+        file_path: Path | str,
+        original_filename: str = "source.pdf",
+    ) -> Tuple[str, str, int]:
+        """
+        Store a source PDF from a file path on disk.
+        The file is copied from the temp path to project storage.
+        Returns (relative_storage_key, sha256_checksum, byte_size).
+        """
+        p_dir = self.init_project_storage(project_id)
+        # Sanitize filename: only keep the basename, remove path components
+        safe_name = Path(original_filename).name
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = "source.pdf"
+        target_path = p_dir / "source" / safe_name
+
+        src = Path(file_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Source file not found: {src}")
+
+        shutil.copy2(src, target_path)
+        checksum = calculate_file_sha256(str(target_path))
+        size = target_path.stat().st_size
+
+        rel_key = f"source/{safe_name}"
+        return rel_key, checksum, size
+
     def save_image(
         self,
         project_id: str,
@@ -163,6 +192,15 @@ class FileStore:
         if not path.exists():
             raise FileNotFoundError(f"Storage asset not found: {relative_key}")
         return path.read_bytes()
+
+    def head(self, project_id: str, relative_key: str):
+        """Return local file metadata for the same verification interface as Blob."""
+        path = self.resolve_path(project_id, relative_key)
+        if not path.is_file():
+            raise FileNotFoundError(f"Storage asset not found: {relative_key}")
+        content_type = "application/pdf" if path.suffix.lower() == ".pdf" else None
+        return {"pathname": f"{project_id}/{relative_key}", "size": path.stat().st_size,
+                "content_type": content_type, "etag": None}
 
     read_file = read_bytes
 

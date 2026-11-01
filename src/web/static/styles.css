@@ -203,6 +203,13 @@ body {
   align-items: stretch;
 }
 
+.progressive-results { margin-top: 22px; }
+.progressive-results h3 { margin: 0 0 12px; color: var(--text-primary); }
+.progressive-image-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.progressive-image-card { min-width: 0; padding: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: var(--radius-md); background: rgba(18,24,38,.45); }
+.progressive-image-card img { display: block; width: 100%; height: 110px; object-fit: contain; border-radius: 6px; background: rgba(0,0,0,.2); }
+.progressive-image-card p { margin: 8px 0 0; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+
 @media (max-width: 960px) {
   .upload-grid {
     grid-template-columns: 1fr;

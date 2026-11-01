@@ -463,3 +463,96 @@ def test_postgres_auth_schema_and_project_owner_isolation(pg_db, repo):
     # Deactivating u1 prevents password verification
     repo.set_user_active(u1_id, False)
     assert repo.verify_user_password(f"pg_u1_{u1_id[:8]}@example.com", "PgPass123!") is None
+
+
+def test_postgres_upload_intent_claim_and_atomic_finalize(repo):
+    from src.db.repository import utc_now_iso
+
+    now = utc_now_iso()
+    upload_key, project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    record = repo.create_upload_key(
+        upload_key=upload_key, content_type="application/pdf", expires_at="2999-01-01T00:00:00+00:00",
+        owner_id="owner-1", filename="validated.pdf", expected_size=64,
+        blob_key=f"{project_id}/source/{upload_key}.pdf",
+    )
+    assert record["owner_id"] == "owner-1"
+    assert repo.claim_upload_token(upload_key, "owner-1", now) is True
+    assert repo.claim_upload_token(upload_key, "owner-1", now) is False
+    assert repo.claim_upload_finalization(upload_key, "owner-1", now) is True
+    first = repo.finalize_upload_project(
+        upload_key=upload_key, project_id=project_id, job_id=job_id, owner_id="owner-1",
+        name="Upload", source_filename="validated.pdf", source_storage_key="source/upload.pdf",
+        source_checksum="etag:blob", source_size=64, page_start=1, page_end=2, page_numbers=[1, 2],
+    )
+    second = repo.finalize_upload_project(
+        upload_key=upload_key, project_id=project_id, job_id=job_id, owner_id="owner-1",
+        name="Upload", source_filename="validated.pdf", source_storage_key="source/upload.pdf",
+        source_checksum="etag:blob", source_size=64, page_start=1, page_end=2, page_numbers=[1, 2],
+    )
+    assert first["project"]["id"] == second["project"]["id"] == project_id
+    assert first["job"]["id"] == second["job"]["id"] == job_id
+    assert first["job"]["page_numbers"] == [1, 2]
+    assert len(repo.list_project_jobs(project_id)) == 1
+    assert repo.get_upload_key(upload_key)["status"] == "completed"
+
+
+def test_postgres_job_claim_is_atomic_and_reclaimable(repo):
+    from src.db.repository import utc_now_iso
+
+    project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    repo.create_project(project_id, "Claim", "x.pdf", "source/x.pdf", "checksum")
+    repo.create_job(job_id, project_id, "extraction")
+    now = utc_now_iso()
+    assert repo.claim_job(job_id, "2000-01-01T00:00:00+00:00", now) is not None
+    assert repo.claim_job(job_id, "2000-01-01T00:00:00+00:00", now) is None
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE jobs SET lease_updated_at='2000-01-01T00:00:00+00:00' WHERE id=%s;", (job_id,))
+    assert repo.claim_job(job_id, "2020-01-01T00:00:00+00:00", utc_now_iso()) is not None
+    assert repo.get_job(job_id)["attempt_count"] == 2
+
+
+def test_postgres_running_status_renews_lease_without_resurrecting_terminal_job(repo):
+    from src.db.repository import utc_now_iso
+
+    project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    repo.create_project(project_id, "Lease renewal", "x.pdf", "source/x.pdf", "checksum")
+    repo.create_job(job_id, project_id, "extraction")
+    repo.update_job_status(job_id, "running")
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE jobs SET lease_updated_at='2000-01-01T00:00:00+00:00' WHERE id=%s;", (job_id,))
+
+    repo.update_job_status(job_id, "running")
+    renewed = repo.get_job(job_id)
+    assert renewed["lease_updated_at"] > "2000-01-01T00:00:00+00:00"
+
+    repo.update_job_status(job_id, "completed")
+    completed = repo.get_job(job_id)
+    repo.update_job_status(job_id, "running")
+    after_late_heartbeat = repo.get_job(job_id)
+    assert after_late_heartbeat["status"] == "completed"
+    assert after_late_heartbeat["completed_at"] == completed["completed_at"]
+    assert after_late_heartbeat["lease_updated_at"] == completed["lease_updated_at"]
+
+
+def test_postgres_worker_lease_fences_batch_and_terminal_writes(repo):
+    from src.db.repository import utc_now_iso
+
+    project_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    repo.create_project(project_id, "Fenced lease", "x.pdf", "source/x.pdf", "checksum")
+    repo.create_job(job_id, project_id, "extraction")
+    now = utc_now_iso()
+    assert repo.claim_job(job_id, "2000-01-01T00:00:00+00:00", now, worker_id="worker-a")
+    assert repo.renew_job_lease(job_id, "worker-a", utc_now_iso()) is True
+    repo.initialize_job_batches(job_id, [[1], [2]], total_document_pages=2)
+    assert repo.start_job_batch(job_id, 0, utc_now_iso(), worker_id="worker-a")
+    assert repo.set_job_batch_status(job_id, 0, "completed", worker_id="worker-a") is True
+    assert repo.get_job(job_id)["completed_pages"] == 1
+
+    assert repo.update_claimed_job_status(job_id, "worker-a", "completed") is True
+    completed = repo.get_job(job_id)
+    assert repo.renew_job_lease(job_id, "worker-a", utc_now_iso()) is False
+    assert repo.set_job_batch_status(job_id, 1, "completed", worker_id="worker-a") is False
+    assert repo.get_job(job_id)["status"] == "completed"
+    assert repo.get_job(job_id)["lease_updated_at"] == completed["lease_updated_at"]

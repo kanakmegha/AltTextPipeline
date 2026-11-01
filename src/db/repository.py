@@ -8,6 +8,7 @@ draft versions, approvals, background jobs, and exports.
 import json
 import hashlib
 import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from .connection import DatabaseConnection
@@ -116,6 +117,12 @@ class Repository:
         with self.db.session() as conn:
             conn.execute(query, tuple(values))
 
+        return self.get_project(project_id)
+
+    def update_project_source_checksum(self, project_id: str, checksum: str):
+        with self.db.session() as conn:
+            conn.execute("UPDATE projects SET source_checksum=?, updated_at=? WHERE id=?;",
+                         (checksum, utc_now_iso(), project_id))
         return self.get_project(project_id)
 
     def list_projects(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -378,6 +385,7 @@ class Repository:
         caption_position: Optional[str] = None,
         needs_review: Optional[bool] = None,
         needs_caption_review: Optional[bool] = None,
+        review_reasons: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
         fields = [
@@ -398,6 +406,9 @@ class Repository:
         if review_flag is not None:
             fields.append("needs_caption_review = ?")
             values.append(1 if review_flag else 0)
+        if review_reasons is not None:
+            fields.append("review_reasons = ?")
+            values.append(json.dumps(review_reasons))
 
         values.append(image_id)
         query = f"UPDATE image_assets SET {', '.join(fields)} WHERE id = ?;"
@@ -656,6 +667,7 @@ class Repository:
         image_id: Optional[str] = None,
         page_start: Optional[int] = None,
         page_end: Optional[int] = None,
+        page_numbers: Optional[List[int]] = None,
         max_attempts: int = 3
     ) -> Dict[str, Any]:
         now = utc_now_iso()
@@ -663,19 +675,162 @@ class Repository:
             conn.execute(
                 """
                 INSERT INTO jobs (
-                    id, project_id, image_id, job_type, page_start, page_end,
+                    id, project_id, image_id, job_type, page_start, page_end, page_numbers,
                     status, attempt_count, max_attempts, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?);
                 """,
-                (job_id, project_id, image_id, job_type, page_start, page_end, max_attempts, now)
+                (job_id, project_id, image_id, job_type, page_start, page_end,
+                 json.dumps(page_numbers) if page_numbers else None, max_attempts, now)
             )
         return self.get_job(job_id)
+
+    def claim_job(self, job_id: str, stale_before: str, now: str, worker_id: Optional[str] = None,
+                  max_attempts: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Atomically claim a queued job or reclaim an abandoned running job."""
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                """UPDATE jobs SET status='running', attempt_count=attempt_count+1,
+                   started_at=COALESCE(started_at, ?), lease_updated_at=?, error_message=NULL,
+                   worker_id=?,max_attempts=COALESCE(?,max_attempts)
+                   WHERE id=? AND attempt_count < COALESCE(?,max_attempts)
+                   AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?));""",
+                (now, now, worker_id, max_attempts, job_id, max_attempts, stale_before),
+            )
+            if not cursor.rowcount:
+                return None
+        return self.get_job(job_id)
+
+    def renew_job_lease(self, job_id: str, worker_id: str, now: str) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET lease_updated_at=? WHERE id=? AND status='running' AND worker_id=?;",
+                (now, job_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def initialize_job_batches(self, job_id: str, page_batches: List[List[int]], total_document_pages: int,
+                               max_attempts: int = 3):
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            for index, pages in enumerate(page_batches):
+                conn.execute(
+                    """INSERT INTO job_batches (job_id,batch_index,page_numbers,status,max_attempts,created_at,updated_at)
+                       VALUES (?,?,?,'queued',?,?,?) ON CONFLICT(job_id,batch_index) DO NOTHING;""",
+                    (job_id, index, json.dumps(pages), max_attempts, now, now),
+                )
+            conn.execute(
+                "UPDATE jobs SET total_pages=?,pages_to_process=?,total_batches=? WHERE id=?;",
+                (total_document_pages, sum(len(pages) for pages in page_batches), len(page_batches), job_id),
+            )
+            self._refresh_job_batch_counts(conn, job_id)
+
+    @staticmethod
+    def _refresh_job_batch_counts(conn, job_id: str):
+        rows = conn.execute(
+            "SELECT page_numbers FROM job_batches WHERE job_id=? AND status='completed';", (job_id,)
+        ).fetchall()
+        completed_pages = sum(len(json.loads(row[0])) for row in rows)
+        conn.execute(
+            "UPDATE jobs SET completed_batches=?,completed_pages=? WHERE id=?;",
+            (len(rows), completed_pages, job_id),
+        )
+
+    def list_job_batches(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_batches WHERE job_id=? ORDER BY batch_index;", (job_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["page_numbers"] = json.loads(data["page_numbers"])
+            result.append(data)
+        return result
+
+    def start_job_batch(self, job_id: str, batch_index: int, now: str, worker_id: Optional[str] = None) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE job_batches SET status='running',attempt_count=attempt_count+1,
+                   started_at=COALESCE(started_at,?),completed_at=NULL,lease_updated_at=?,
+                   error_message=NULL,updated_at=? WHERE job_id=? AND batch_index=?
+                   AND status!='completed' AND attempt_count<max_attempts
+                   AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='running'
+                               AND (? IS NULL OR worker_id=?));""",
+                (now, now, now, job_id, batch_index, job_id, worker_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def set_job_batch_status(self, job_id: str, batch_index: int, status: str,
+                             error_message: Optional[str] = None, worker_id: Optional[str] = None) -> bool:
+        now = utc_now_iso()
+        completed_at = now if status in {"completed", "failed"} else None
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE job_batches SET status=?,error_message=?,completed_at=?,lease_updated_at=?,updated_at=?
+                   WHERE job_id=? AND batch_index=?
+                   AND (? IS NULL OR EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='running' AND worker_id=?));""",
+                (status, error_message, completed_at, now if status == "running" else None,
+                 now, job_id, batch_index, worker_id, job_id, worker_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            self._refresh_job_batch_counts(conn, job_id)
+            return True
+
+    def update_claimed_job_status(self, job_id: str, worker_id: str, status: str,
+                                  error_message: Optional[str] = None) -> bool:
+        now = utc_now_iso()
+        completed_at = now if status in {"completed", "failed", "cancelled"} else None
+        with self.db.session() as conn:
+            cur = conn.execute(
+                """UPDATE jobs SET status=?,error_message=?,completed_at=?,
+                   lease_updated_at=CASE WHEN ?='running' THEN ? ELSE lease_updated_at END
+                   WHERE id=? AND status='running' AND worker_id=?;""",
+                (status, error_message, completed_at, status, now, job_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+    def list_recoverable_jobs(self, stale_before: str, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            rows = conn.execute(
+                """SELECT id FROM jobs WHERE job_type='extraction' AND attempt_count < max_attempts
+                   AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?))
+                   ORDER BY created_at LIMIT ?;""", (stale_before, limit)
+            ).fetchall()
+        return [job for row in rows if (job := self.get_job(row[0]))]
+
+    def fail_exhausted_jobs(self, stale_before: str) -> List[str]:
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            rows = conn.execute(
+                "SELECT project_id FROM jobs WHERE job_type='extraction' AND status='running' AND attempt_count >= max_attempts AND COALESCE(lease_updated_at, started_at) < ?;",
+                (stale_before,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE jobs SET status='failed', error_message='Worker stopped during final retry', completed_at=? WHERE job_type='extraction' AND status='running' AND attempt_count >= max_attempts AND COALESCE(lease_updated_at, started_at) < ?;",
+                (now, stale_before),
+            )
+        projects = sorted({row[0] for row in rows})
+        for project_id in projects:
+            self.update_project_status(project_id, status="failed")
+        return projects
+
+    def find_image_asset_by_source(self, project_id: str, page_number: int, xref: int, placement_index: int):
+        with self.db.session() as conn:
+            row = conn.execute(
+                "SELECT id FROM image_assets WHERE project_id=? AND page_number=? AND xref=? AND placement_index=? LIMIT 1;",
+                (project_id, page_number, xref, placement_index),
+            ).fetchone()
+        return self.get_image_asset(row[0]) if row else None
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self.db.session() as conn:
             cursor = conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            data = dict(row) if row else None
+            if data and data.get("page_numbers"):
+                data["page_numbers"] = json.loads(data["page_numbers"])
+            return data
 
     def update_job_status(
         self,
@@ -685,6 +840,16 @@ class Repository:
         error_message: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
+        if status == "running" and not increment_attempt:
+            with self.db.session() as conn:
+                conn.execute(
+                    """UPDATE jobs SET status='running', error_message=NULL,
+                       started_at=COALESCE(started_at, ?), lease_updated_at=?
+                       WHERE id=? AND status IN ('queued','running');""",
+                    (now, now, job_id),
+                )
+            return self.get_job(job_id)
+
         job = self.get_job(job_id)
         if not job:
             return None
@@ -696,22 +861,27 @@ class Repository:
         with self.db.session() as conn:
             conn.execute(
                 """
-                UPDATE jobs SET
+                    UPDATE jobs SET
                     status = ?,
                     attempt_count = ?,
                     error_message = ?,
                     started_at = COALESCE(started_at, ?),
-                    completed_at = ?
-                WHERE id = ?;
+                        completed_at = ?,
+                        lease_updated_at = CASE WHEN ? = 'running' THEN ? ELSE lease_updated_at END
+                WHERE id = ? AND status NOT IN ('completed','cancelled');
                 """,
-                (status, attempts, error_message, started_at, completed_at, job_id)
+                    (status, attempts, error_message, started_at, completed_at, status, now, job_id)
             )
         return self.get_job(job_id)
 
     def list_project_jobs(self, project_id: str) -> List[Dict[str, Any]]:
         with self.db.session() as conn:
             cursor = conn.execute("SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at ASC;", (project_id,))
-            return [dict(r) for r in cursor.fetchall()]
+            rows = [dict(r) for r in cursor.fetchall()]
+            for data in rows:
+                if data.get("page_numbers"):
+                    data["page_numbers"] = json.loads(data["page_numbers"])
+            return rows
 
     # ============================================================
     # Exports
@@ -1234,3 +1404,210 @@ class Repository:
             "flagged_for_review": flagged_image_ids,
             "audit_event_id": grp_audit_id,
         }
+
+    # ============================================================
+    # Upload Keys (Direct-to-Blob Upload Tracking)
+    # ============================================================
+
+    def create_upload_key(
+        self,
+        upload_key: str,
+        content_type: str,
+        expires_at: str,
+        owner_id: Optional[str] = None,
+        filename: str = "upload.pdf",
+        expected_size: int = 0,
+        blob_key: Optional[str] = None,
+        total_chunks: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a pending upload key record for direct-to-Blob upload."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO upload_keys (
+                    id, upload_key, project_id, status, content_type,
+                    owner_id, filename, expected_size, blob_key,
+                    source_storage_key, source_checksum, source_size,
+                    total_chunks, chunk_size, uploaded_chunks, temp_dir,
+                    expires_at, error_message, created_at, updated_at
+                ) VALUES (?, ?, NULL, 'uploading', ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, 0, NULL, ?, NULL, ?, ?);
+                """,
+                (
+                    str(uuid.uuid4()),
+                    upload_key,
+                    content_type,
+                    owner_id,
+                    filename,
+                    expected_size,
+                    blob_key,
+                    total_chunks,
+                    chunk_size,
+                    expires_at,
+                    now,
+                    now,
+                )
+            )
+        return self.get_upload_key(upload_key)
+
+    def claim_upload_token(self, upload_key: str, owner_id: Optional[str], now: str) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "UPDATE upload_keys SET token_issued=1, updated_at=? WHERE upload_key=? AND status='uploading' AND token_issued=0 AND expires_at>? AND owner_id IS ?;",
+                (now, upload_key, now, owner_id),
+            )
+            return cur.rowcount == 1
+
+    def claim_upload_finalization(self, upload_key: str, owner_id: Optional[str], now: str) -> bool:
+        with self.db.session() as conn:
+            cur = conn.execute(
+                "UPDATE upload_keys SET status='finalizing', updated_at=? WHERE upload_key=? AND status='uploading' AND token_issued=1 AND owner_id IS ? AND expires_at>?;",
+                (now, upload_key, owner_id, now),
+            )
+            return cur.rowcount == 1
+
+    def finalize_upload_project(self, *, upload_key, project_id, job_id, owner_id,
+                                name, source_filename, source_storage_key,
+                                source_checksum, source_size, page_start=None, page_end=None, page_numbers=None):
+        """Atomically create project/job and consume the upload intent."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            conn.execute(
+                """INSERT INTO projects (id,name,source_filename,source_storage_key,source_checksum,
+                   language_variant,status,cleanup_status,owner_id,created_at,updated_at)
+                   VALUES (?,?,?,?,?,'en-GB','queued','retained',?,?,?) ON CONFLICT(id) DO NOTHING;""",
+                (project_id, name, source_filename, source_storage_key, source_checksum, owner_id, now, now),
+            )
+            conn.execute(
+                """INSERT INTO jobs (id,project_id,job_type,page_start,page_end,page_numbers,status,attempt_count,max_attempts,created_at)
+                   VALUES (?,?, 'extraction', ?, ?, ?, 'queued',0,3,?) ON CONFLICT(id) DO NOTHING;""",
+                (job_id, project_id, page_start, page_end, json.dumps(page_numbers) if page_numbers else None, now),
+            )
+            conn.execute(
+                """UPDATE upload_keys SET status='completed',project_id=?,source_storage_key=?,
+                   source_checksum=?,source_size=?,updated_at=? WHERE upload_key=? AND owner_id IS ?
+                   AND status IN ('finalizing','completed');""",
+                (project_id, source_storage_key, source_checksum, source_size, now, upload_key, owner_id),
+            )
+        return {"project": self.get_project(project_id), "job": self.get_job(job_id)}
+
+    def get_upload_key(self, upload_key: str) -> Optional[Dict[str, Any]]:
+        """Get upload key record by upload_key."""
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM upload_keys WHERE upload_key = ?;",
+                (upload_key,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_upload_key(
+        self,
+        upload_key: str,
+        status: Optional[str] = None,
+        source_storage_key: Optional[str] = None,
+        source_checksum: Optional[str] = None,
+        source_size: Optional[int] = None,
+        total_chunks: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        uploaded_chunks: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+        error_message: Optional[str] = None,
+        project_id: Optional[str] = None,
+        token_issued: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update an upload key record."""
+        now = utc_now_iso()
+        fields = []
+        values = []
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if source_storage_key is not None:
+            fields.append("source_storage_key = ?")
+            values.append(source_storage_key)
+        if source_checksum is not None:
+            fields.append("source_checksum = ?")
+            values.append(source_checksum)
+        if source_size is not None:
+            fields.append("source_size = ?")
+            values.append(source_size)
+        if total_chunks is not None:
+            fields.append("total_chunks = ?")
+            values.append(total_chunks)
+        if chunk_size is not None:
+            fields.append("chunk_size = ?")
+            values.append(chunk_size)
+        if uploaded_chunks is not None:
+            fields.append("uploaded_chunks = ?")
+            values.append(uploaded_chunks)
+        if temp_dir is not None:
+            fields.append("temp_dir = ?")
+            values.append(temp_dir)
+        if error_message is not None:
+            fields.append("error_message = ?")
+            values.append(error_message)
+        if project_id is not None:
+            fields.append("project_id = ?")
+            values.append(project_id)
+        if token_issued is not None:
+            fields.append("token_issued = ?")
+            values.append(1 if token_issued else 0)
+        if not fields:
+            return self.get_upload_key(upload_key)
+
+        fields.append("updated_at = ?")
+        values.append(now)
+        values.append(upload_key)
+
+        query = f"UPDATE upload_keys SET {', '.join(fields)} WHERE upload_key = ?;"
+        with self.db.session() as conn:
+            conn.execute(query, tuple(values))
+        return self.get_upload_key(upload_key)
+
+    def complete_upload(
+        self,
+        upload_key: str,
+        project_id: str,
+        source_storage_key: str,
+        source_checksum: str,
+        source_size: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark an upload as completed and link it to a project."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                UPDATE upload_keys
+                SET status = 'completed',
+                    project_id = ?,
+                    source_storage_key = ?,
+                    source_checksum = ?,
+                    source_size = ?,
+                    updated_at = ?
+                WHERE upload_key = ?;
+                """,
+                (project_id, source_storage_key, source_checksum, source_size, now, upload_key)
+            )
+        return self.get_upload_key(upload_key)
+
+    def expire_upload_keys(self) -> int:
+        """Mark expired upload keys as 'expired'. Returns count of expired keys."""
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "UPDATE upload_keys SET status = 'expired', updated_at = ? WHERE status = 'uploading' AND expires_at < ?;",
+                (now, now)
+            )
+            return cursor.rowcount or 0
+
+    def list_upload_keys_by_project(self, project_id: str) -> List[Dict[str, Any]]:
+        """List upload keys associated with a project."""
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM upload_keys WHERE project_id = ? ORDER BY created_at DESC;",
+                (project_id,)
+            )
+            return [dict(r) for r in cursor.fetchall()]

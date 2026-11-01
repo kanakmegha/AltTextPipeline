@@ -13,9 +13,11 @@ Key layout:
     {project_id}/exports/{export_id}_{filename}
 """
 
+import hashlib
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple
 
@@ -33,6 +35,8 @@ from .base_storage import (
 logger = logging.getLogger("alttext.storage.blob")
 
 MAX_OBJECT_BYTES = 50 * 1024 * 1024
+# Chunk size for streaming uploads (64 KB)
+UPLOAD_CHUNK_SIZE = 65536
 
 DOCX_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
@@ -170,6 +174,64 @@ class BlobStorage(BaseStorage):
         except Exception as exc:
             self._sdk_error("upload", key, exc)
 
+    def _upload_from_file(
+        self,
+        key: str,
+        file_path: str | Path,
+        content_type: str,
+    ) -> Tuple[str, int]:
+        """
+        Upload a file from disk to Vercel Blob without loading the entire
+        file into memory. Streams the file in chunks and computes the SHA-256
+        checksum incrementally.
+
+        Returns (checksum, byte_size).
+        """
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Source file not found: {file_path}")
+
+        hasher = hashlib.sha256()
+        total_size = 0
+
+        try:
+            # Read the file in chunks to compute checksum and size
+            # without loading the entire file into memory.
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    total_size += len(chunk)
+
+            if total_size == 0:
+                raise StorageError(f"Empty file provided for upload: {key}")
+
+            if total_size > MAX_OBJECT_BYTES:
+                raise StorageError(
+                    f"File exceeds the maximum object size "
+                    f"({total_size} bytes > {MAX_OBJECT_BYTES} bytes)."
+                )
+
+            # Now upload the file from disk. The SDK's put_blob accepts
+            # a file-like object or bytes; we pass the open file handle
+            # so it streams from disk.
+            with open(file_path, "rb") as f:
+                blob.put_blob(
+                    key,
+                    f,
+                    access="private",
+                    content_length=total_size,
+                    content_type=content_type,
+                    allow_overwrite=True,
+                )
+
+            return hasher.hexdigest(), total_size
+
+        except Exception as exc:
+            self._sdk_error("upload", key, exc)
+
     def init_project_storage(self, project_id: str) -> str:
         project_id = self._validate_project_id(project_id)
         return f"{project_id}/"
@@ -205,6 +267,24 @@ class BlobStorage(BaseStorage):
         size = len(data)
 
         self._upload_bytes(key, data, "application/pdf")
+
+        return key, checksum, size
+
+    def save_source_pdf_from_file(
+        self,
+        project_id: str,
+        file_path: str | Path,
+        original_filename: str = "source.pdf",
+    ) -> Tuple[str, str, int]:
+        """
+        Store a source PDF from a file path on disk using streaming upload.
+        The file is read in chunks to avoid loading the entire PDF into memory.
+        Returns (relative_storage_key, sha256_checksum, byte_size).
+        """
+        safe_name = self._safe_filename(original_filename)
+        key = self._safe_key(project_id, f"source/{safe_name}")
+
+        checksum, size = self._upload_from_file(key, file_path, "application/pdf")
 
         return key, checksum, size
 
@@ -323,6 +403,16 @@ class BlobStorage(BaseStorage):
 
         except Exception as exc:
             self._sdk_error("existence check", key, exc)
+
+    def head(self, project_id: str, relative_key: str):
+        """Return private Blob metadata without downloading object bytes."""
+        key = self._safe_key(project_id, relative_key)
+        try:
+            return blob.head_blob(key)
+        except BlobNotFoundError as exc:
+            raise FileNotFoundError(f"Storage asset not found: {relative_key}") from exc
+        except Exception as exc:
+            self._sdk_error("metadata check", key, exc)
 
     def cleanup_project(
         self,
