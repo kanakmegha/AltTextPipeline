@@ -685,8 +685,11 @@ def create_app(
         images = repo.list_project_images(project_id)
         return {"images": images}
     
+    
     @app.get("/api/debug/blob-check")
     async def debug_blob_check(request: Request):
+        import inspect
+
         project_id = "9bdb8d49-86dc-4b20-9173-886d8e5fd908"
         image_id = "77953ea2-d433-4a6a-b529-682bbe4fd36e"
 
@@ -700,16 +703,39 @@ def create_app(
         key = asset["file_storage_key"]
 
         result = {
-            "storage_class": type(filestore).__name__,
-            "token_configured": bool(
-                os.environ.get("BLOB_READ_WRITE_TOKEN")
-            ),
-            "store_id": os.environ.get("BLOB_STORE_ID"),
-            "database_key": key,
-            }
+        "storage_class": type(filestore).__name__,
+        "token_configured": bool(
+            os.environ.get("BLOB_READ_WRITE_TOKEN")
+        ),
+        "store_id": os.environ.get("BLOB_STORE_ID"),
+        "database_key": key,
+    }
 
     # --------------------------------------------------
-    # 1. Inspect key normalization
+    # 1. Inspect project ID and database key
+    # --------------------------------------------------
+        first_key_part = key.split("/")[0] if key else None
+
+        result["project_id_repr"] = repr(project_id)
+        result["first_key_part_repr"] = repr(first_key_part)
+        result["project_id_matches_first_part"] = (
+            first_key_part == project_id
+        )
+
+    # --------------------------------------------------
+    # 2. Inspect the exact deployed _safe_key function
+    # --------------------------------------------------
+        try:
+            result["safe_key_source"] = inspect.getsource(
+                filestore._safe_key
+            )
+        except Exception as exc:
+            result["safe_key_source_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # --------------------------------------------------
+    # 3. Resolve the storage key
     # --------------------------------------------------
         try:
             resolved_key = filestore._safe_key(project_id, key)
@@ -722,10 +748,10 @@ def create_app(
             result["key_resolution"] = "failed"
             result["key_resolution_error"] = type(exc).__name__
             result["key_resolution_message"] = str(exc)
-        return result
+            return result
 
     # --------------------------------------------------
-    # 2. Test storage abstraction: HEAD
+    # 4. Test storage abstraction: HEAD
     # --------------------------------------------------
         try:
             metadata = filestore.head(project_id, key)
@@ -735,16 +761,16 @@ def create_app(
                 metadata, "pathname", None
             )
             result["storage_head_size"] = getattr(
-            metadata, "size", None
+                metadata, "size", None
             )
 
         except Exception as exc:
             result["storage_head"] = "failed"
-            result["storage_head_error"] = type(exc).__name__
-            result["storage_head_message"] = str(exc)
+        result["storage_head_error"] = type(exc).__name__
+        result["storage_head_message"] = str(exc)
 
     # --------------------------------------------------
-    # 3. Test storage abstraction: GET
+    # 5. Test storage abstraction: GET
     # --------------------------------------------------
         try:
             data = filestore.read_bytes(project_id, key)
@@ -758,7 +784,7 @@ def create_app(
             result["storage_get_message"] = str(exc)
 
     # --------------------------------------------------
-    # 4. Test direct SDK using original database key
+    # 6. Direct SDK HEAD using original database key
     # --------------------------------------------------
         try:
             from vercel.blob import sync as blob
@@ -776,10 +802,10 @@ def create_app(
         except Exception as exc:
             result["direct_sdk_head"] = "failed"
             result["direct_sdk_error"] = type(exc).__name__
-            result["direct_sdk_message"] = str(exc)
+        result["direct_sdk_message"] = str(exc)
 
     # --------------------------------------------------
-    # 5. Test direct SDK using resolved key
+    # 7. Direct SDK HEAD using resolved key
     # --------------------------------------------------
         try:
             from vercel.blob import sync as blob
@@ -800,7 +826,7 @@ def create_app(
             result["resolved_sdk_message"] = str(exc)
 
     # --------------------------------------------------
-    # 6. Test direct SDK GET using original database key
+    # 8. Direct SDK GET using original database key
     # --------------------------------------------------
         try:
             from vercel.blob import sync as blob
@@ -808,7 +834,7 @@ def create_app(
             downloaded = blob.get_blob(
                 key,
                 access="private",
-            )
+        )
 
             result["direct_sdk_get"] = "success"
             result["direct_sdk_bytes"] = len(downloaded.body)
@@ -819,6 +845,7 @@ def create_app(
             result["direct_sdk_get_message"] = str(exc)
 
         return result
+
 
 
     @app.get("/api/projects/{project_id}/images/{image_id}/file")
