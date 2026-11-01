@@ -725,18 +725,20 @@ def create_app(
             result["get_error"] = str(exc)
 
         return result
-        @app.get("/api/debug/routes")
-        async def debug_routes():
-            return {
-                "routes": [
-                    {
-                        "path": route.path,
-                        "methods": sorted(route.methods or [])
-                    }
-                    for route in app.routes
-                    if hasattr(route, "path")
-                ]
-            }
+
+    @app.get("/api/debug/routes")
+    async def debug_routes():
+        return {
+            "routes": [
+                {
+                    "path": route.path,
+                    "methods": sorted(route.methods or [])
+                }
+                for route in app.routes
+                if hasattr(route, "path")
+            ]
+        }
+
     @app.get("/api/projects/{project_id}/images/{image_id}/file")
     @app.head("/api/projects/{project_id}/images/{image_id}/file")
     async def get_image_file(request: Request, project_id: str, image_id: str):
