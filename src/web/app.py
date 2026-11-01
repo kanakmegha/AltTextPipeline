@@ -789,6 +789,18 @@ def create_app(
             result["resolved_sdk_error"] = (
                 f"{type(exc).__name__}: {exc}"
             )
+         # 7. Test complete image download through storage abstraction
+        try:
+            image_bytes = filestore.read_bytes(project_id, key)
+
+            result["storage_get"] = "success"
+            result["storage_get_bytes"] = len(image_bytes)
+
+        except Exception as exc:
+            result["storage_get"] = "failed"
+            result["storage_get_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
         return result
 
