@@ -118,3 +118,11 @@ def test_error_handling_invalid_project(web_client):
 
     res_export = client.get("/export/non-existent-uuid")
     assert res_export.status_code == 404
+
+
+def test_diagnostic_endpoints_are_not_exposed(web_client):
+    client, _ = web_client
+    res = client.get("/api/debug/blob-check")
+    assert res.status_code == 404
+    assert all("/api/debug" not in getattr(route, "path", "") for route in client.app.routes)
+
