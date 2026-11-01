@@ -684,6 +684,7 @@ def create_app(
         _authorize_project_access(request, project_id)
         images = repo.list_project_images(project_id)
         return {"images": images}
+    
     @app.get("/api/debug/blob-check")
     async def debug_blob_check(request: Request):
         project_id = "9bdb8d49-86dc-4b20-9173-886d8e5fd908"
@@ -700,40 +701,114 @@ def create_app(
 
         result = {
             "storage_class": type(filestore).__name__,
-            "token_configured": bool(os.environ.get("BLOB_READ_WRITE_TOKEN")),
+            "token_configured": bool(
+                os.environ.get("BLOB_READ_WRITE_TOKEN")
+            ),
             "store_id": os.environ.get("BLOB_STORE_ID"),
             "database_key": key,
-        }
+            }
 
-        # Test the storage abstraction.
+    # --------------------------------------------------
+    # 1. Inspect key normalization
+    # --------------------------------------------------
+        try:
+            resolved_key = filestore._safe_key(project_id, key)
+
+            result["raw_key"] = repr(key)
+            result["resolved_key"] = repr(resolved_key)
+            result["keys_match"] = key == resolved_key
+
+        except Exception as exc:
+            result["key_resolution"] = "failed"
+            result["key_resolution_error"] = type(exc).__name__
+            result["key_resolution_message"] = str(exc)
+        return result
+
+    # --------------------------------------------------
+    # 2. Test storage abstraction: HEAD
+    # --------------------------------------------------
         try:
             metadata = filestore.head(project_id, key)
+
             result["storage_head"] = "success"
-            result["storage_head_size"] = getattr(metadata, "size", None)
+            result["storage_head_pathname"] = getattr(
+                metadata, "pathname", None
+            )
+            result["storage_head_size"] = getattr(
+            metadata, "size", None
+            )
+
         except Exception as exc:
             result["storage_head"] = "failed"
             result["storage_head_error"] = type(exc).__name__
             result["storage_head_message"] = str(exc)
 
-    # Test the Vercel SDK directly.
+    # --------------------------------------------------
+    # 3. Test storage abstraction: GET
+    # --------------------------------------------------
+        try:
+            data = filestore.read_bytes(project_id, key)
+
+            result["storage_get"] = "success"
+            result["storage_get_bytes"] = len(data)
+
+        except Exception as exc:
+            result["storage_get"] = "failed"
+            result["storage_get_error"] = type(exc).__name__
+            result["storage_get_message"] = str(exc)
+
+    # --------------------------------------------------
+    # 4. Test direct SDK using original database key
+    # --------------------------------------------------
         try:
             from vercel.blob import sync as blob
 
             metadata = blob.head_blob(key)
 
             result["direct_sdk_head"] = "success"
-            result["direct_sdk_pathname"] = getattr(metadata, "pathname", None)
-            result["direct_sdk_size"] = getattr(metadata, "size", None)
+            result["direct_sdk_pathname"] = getattr(
+                metadata, "pathname", None
+            )
+            result["direct_sdk_size"] = getattr(
+                metadata, "size", None
+            )
 
         except Exception as exc:
             result["direct_sdk_head"] = "failed"
             result["direct_sdk_error"] = type(exc).__name__
             result["direct_sdk_message"] = str(exc)
 
+    # --------------------------------------------------
+    # 5. Test direct SDK using resolved key
+    # --------------------------------------------------
         try:
             from vercel.blob import sync as blob
 
-            downloaded = blob.get_blob(key, access="private")
+            metadata = blob.head_blob(resolved_key)
+
+            result["resolved_sdk_head"] = "success"
+            result["resolved_sdk_pathname"] = getattr(
+                metadata, "pathname", None
+            )
+            result["resolved_sdk_size"] = getattr(
+                metadata, "size", None
+            )
+
+        except Exception as exc:
+            result["resolved_sdk_head"] = "failed"
+            result["resolved_sdk_error"] = type(exc).__name__
+            result["resolved_sdk_message"] = str(exc)
+
+    # --------------------------------------------------
+    # 6. Test direct SDK GET using original database key
+    # --------------------------------------------------
+        try:
+            from vercel.blob import sync as blob
+
+            downloaded = blob.get_blob(
+                key,
+                access="private",
+            )
 
             result["direct_sdk_get"] = "success"
             result["direct_sdk_bytes"] = len(downloaded.body)
@@ -745,18 +820,6 @@ def create_app(
 
         return result
 
-    @app.get("/api/debug/routes")
-    async def debug_routes():
-        return {
-            "routes": [
-                {
-                    "path": route.path,
-                    "methods": sorted(route.methods or [])
-                }
-                for route in app.routes
-                if hasattr(route, "path")
-            ]
-        }
 
     @app.get("/api/projects/{project_id}/images/{image_id}/file")
     @app.head("/api/projects/{project_id}/images/{image_id}/file")
