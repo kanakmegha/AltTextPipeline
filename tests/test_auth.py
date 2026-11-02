@@ -328,6 +328,32 @@ def _login_client(app, email: str, password: str) -> tuple[TestClient, str]:
     return client, csrf_token
 
 
+def test_blob_upload_authorize_and_claim_use_multi_user_session_and_csrf(auth_app_env):
+    from fastapi.testclient import TestClient
+
+    app = auth_app_env["app"]
+    repo = auth_app_env["repo"]
+    user = auth_app_env["user_a"]
+    client = TestClient(app)
+    csrf = client.get("/api/auth/csrf-token").json()["csrf_token"]
+    login = client.post("/api/auth/login", json={
+        "email": user["email"], "password": "AliceStrongPass!123",
+    }, headers={"X-CSRF-Token": csrf})
+    assert login.status_code == 200, login.text
+    csrf = login.json()["csrf_token"]
+    headers = {"X-CSRF-Token": csrf}
+    authorized = client.post("/api/uploads/authorize", headers=headers, json={
+        "filename": "sample.pdf", "content_type": "application/pdf", "size_bytes": 20,
+    })
+    assert authorized.status_code == 200, authorized.text
+    key = authorized.json()["upload_key"]
+    assert client.cookies.get(auth.SESSION_COOKIE_NAME)
+    assert repo.get_upload_key(key)["owner_id"] == user["id"]
+    assert client.post(f"/api/uploads/{key}/claim-token", json={}).status_code == 403
+    claimed = client.post(f"/api/uploads/{key}/claim-token", headers=headers, json={})
+    assert claimed.status_code == 200, claimed.text
+
+
 # ------------------------------------------------------------------
 # 1. Startup Configuration & Secret Strength Tests
 # ------------------------------------------------------------------

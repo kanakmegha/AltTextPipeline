@@ -121,7 +121,29 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_message TEXT,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    completed_pages INTEGER NOT NULL DEFAULT 0,
+    pages_to_process INTEGER NOT NULL DEFAULT 0,
+    total_batches INTEGER NOT NULL DEFAULT 0,
+    completed_batches INTEGER NOT NULL DEFAULT 0,
+    worker_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS job_batches (
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    batch_index INTEGER NOT NULL,
+    page_numbers TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    lease_updated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, batch_index)
 );
 
 -- Exports Table

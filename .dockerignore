@@ -1,0 +1,17 @@
+.git
+.venv
+venv
+node_modules
+__pycache__
+.pytest_cache
+.env
+.env.*
+.vercel
+data
+*.db
+*.sqlite
+*.sqlite3
+*.pdf
+diagnostic_output
+tests
+docs
