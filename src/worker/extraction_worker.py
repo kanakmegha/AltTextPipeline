@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 
 import pymupdf as fitz
@@ -45,26 +45,47 @@ def _process_batch(pdf_path, pages, engine):
 def _persist_batch_images(repo, filestore, project_id, result):
     context = result.grouping_context or {}
     images_by_page = context.get("images_by_page", {})
+    images_to_upload = []
+
     for page in sorted(images_by_page):
         for image in images_by_page[page]:
             if not repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index):
-                image_key, image_checksum, _ = filestore.save_image(
-                    project_id=project_id, image_id=image.image_id,
-                    image_bytes=image.image_bytes, ext=image.image_format,
-                )
-                repo.create_image_asset(
-                    image_id=image.image_id, project_id=project_id, page_number=image.page_number,
-                    xref=image.xref, placement_index=image.placement_index, bbox=image.bbox.to_dict(),
-                    original_caption=image.caption, caption_position=image.caption_position,
-                    needs_caption_review=image.needs_caption_review, review_reasons=image.review_reasons,
-                    suggested_filename=image.suggested_filename, file_storage_key=image_key,
-                    file_checksum=image_checksum, image_format=image.image_format,
-                    processing_status="ready_for_review", group_id=None,
-                    association_type=image.association_type,
-                    association_confidence=image.association_confidence, panel_label=image.panel_label,
-                )
-            # Keep grouping metadata in memory but release image payloads as soon as they are persisted.
-            image.image_bytes = b""
+                images_to_upload.append(image)
+
+    if not images_to_upload:
+        return context
+
+    def _save_one(img):
+        key, checksum, size = filestore.save_image(
+            project_id=project_id,
+            image_id=img.image_id,
+            image_bytes=img.image_bytes,
+            ext=img.image_format,
+        )
+        return img, key, checksum, size
+
+    max_upload_workers = min(4, len(images_to_upload))
+    if max_upload_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_upload_workers) as uploader:
+            uploaded = list(uploader.map(_save_one, images_to_upload))
+    else:
+        uploaded = [_save_one(img) for img in images_to_upload]
+
+    for img, image_key, image_checksum, _ in uploaded:
+        repo.create_image_asset(
+            image_id=img.image_id, project_id=project_id, page_number=img.page_number,
+            xref=img.xref, placement_index=img.placement_index, bbox=img.bbox.to_dict(),
+            original_caption=img.caption, caption_position=img.caption_position,
+            needs_caption_review=img.needs_caption_review, review_reasons=img.review_reasons,
+            suggested_filename=img.suggested_filename, file_storage_key=image_key,
+            file_checksum=image_checksum, image_format=img.image_format,
+            processing_status="ready_for_review", group_id=None,
+            association_type=img.association_type,
+            association_confidence=img.association_confidence, panel_label=img.panel_label,
+        )
+        # Keep grouping metadata in memory but release image payloads as soon as they are persisted.
+        img.image_bytes = b""
+
     return context
 
 
@@ -89,16 +110,20 @@ def _finalize_document_grouping(repo, project_id, engine, contexts):
                 review_reasons=group.review_reasons,
             )
     for image in final_images:
-        existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
-        if not existing:
+        existing_id = getattr(image, "image_id", None)
+        if not existing_id:
+            existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
+            existing_id = existing["id"] if existing else None
+        if not existing_id:
             continue
         image.group_id = group_ids.get(image.group_id, image.group_id)
         repo.update_image_group_association(
-            existing["id"], image.group_id, association_type=image.association_type,
+            existing_id, image.group_id, association_type=image.association_type,
             association_confidence=image.association_confidence, panel_label=image.panel_label,
             caption=image.caption, caption_position=image.caption_position,
             needs_caption_review=image.needs_caption_review, review_reasons=image.review_reasons,
         )
+    return len(final_images), len(groups)
 
 
 def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_seconds=30, worker_id=None):
@@ -134,8 +159,10 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
     tmp_path = None
+    t0_job = time.perf_counter()
     try:
         repo.update_project_status(project_id, status="extracting")
+        t0_download = time.perf_counter()
         source = filestore.read_bytes(project_id, project["source_storage_key"])
         if not source.startswith(b"%PDF-"):
             raise ValueError("Stored source is not a PDF")
@@ -144,9 +171,14 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
             tmp.write(source)
             tmp_path = tmp.name
         del source
+        dur_download = time.perf_counter() - t0_download
+
+        t0_open = time.perf_counter()
         doc = fitz.open(tmp_path)
         total_document_pages = len(doc)
         doc.close()
+        dur_open = time.perf_counter() - t0_open
+
         page_numbers = claimed.get("page_numbers")
         if not page_numbers and claimed.get("page_start") and claimed.get("page_end"):
             page_numbers = list(range(int(claimed["page_start"]), int(claimed["page_end"]) + 1))
@@ -164,6 +196,12 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
         contexts = []
         active_engine = engine or ExtractionEngine()
         use_processes = engine is None and max_parallel > 1 and len(page_batches) > 1
+
+        logger.info(
+            "Job started: job_id=%s project_id=%s worker_id=%s total_pages=%d total_batches=%d batch_size=%d max_parallel=%d duration_download=%.3fs duration_open=%.3fs",
+            job_id, project_id, worker_id, total_document_pages, len(page_batches), batch_size, max_parallel, dur_download, dur_open,
+        )
+
         if use_processes:
             _process_batches_parallel(
                 job_id, project_id, tmp_path, repo, filestore, page_batches,
@@ -171,6 +209,7 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
             )
         else:
             for index, pages in enumerate(page_batches):
+                t0_batch = time.perf_counter()
                 if lease_lost.is_set() or not repo.renew_job_lease(
                     job_id, worker_id, _iso(datetime.now(timezone.utc))
                 ):
@@ -180,12 +219,16 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
                     job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
                 ):
                     raise RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
+                t0_extract = time.perf_counter()
                 result = _process_batch(tmp_path, pages, engine)
+                dur_extract = time.perf_counter() - t0_extract
                 if lease_lost.is_set() or not repo.renew_job_lease(
                     job_id, worker_id, _iso(datetime.now(timezone.utc))
                 ):
                     raise RuntimeError("Worker lost the extraction job lease")
+                t0_persist = time.perf_counter()
                 contexts.append(_persist_batch_images(repo, filestore, project_id, result))
+                dur_persist = time.perf_counter() - t0_persist
                 if batch["status"] != "completed":
                     if result.errors:
                         repo.set_job_batch_status(
@@ -194,13 +237,25 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
                         raise RuntimeError(f"Page batch {index + 1} reported extraction errors")
                     if not repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id):
                         raise RuntimeError("Worker lost ownership before recording batch completion")
+                dur_batch = time.perf_counter() - t0_batch
+                logger.info(
+                    "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d duration_extract=%.3fs duration_persist=%.3fs duration_total=%.3fs status=completed",
+                    job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images), dur_extract, dur_persist, dur_batch,
+                )
 
         if lease_lost.is_set() or not repo.renew_job_lease(job_id, worker_id, _iso(datetime.now(timezone.utc))):
             raise RuntimeError("Worker lost the extraction job lease")
-        _finalize_document_grouping(repo, project_id, active_engine, contexts)
+        t0_group = time.perf_counter()
+        img_count, group_count = _finalize_document_grouping(repo, project_id, active_engine, contexts)
+        dur_group = time.perf_counter() - t0_group
         if not repo.update_claimed_job_status(job_id, worker_id, "completed"):
             raise RuntimeError("Worker lost ownership before completing the extraction job")
         repo.update_project_status(project_id, status="ready_for_review")
+        dur_job = time.perf_counter() - t0_job
+        logger.info(
+            "Job completed: job_id=%s project_id=%s total_pages=%d total_batches=%d total_images=%d total_groups=%d duration_download=%.3fs duration_grouping=%.3fs duration_total=%.3fs status=completed",
+            job_id, project_id, total_document_pages, len(page_batches), img_count, group_count, dur_download, dur_group, dur_job,
+        )
         return True
     except Exception as exc:
         logger.exception("Extraction job %s failed", job_id)
@@ -232,6 +287,7 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
                               batch_rows, contexts, engine, max_parallel, worker_id, lease_lost):
     pending = iter(enumerate(page_batches))
     active = {}
+    batch_start_times = {}
     first_error = None
     with ProcessPoolExecutor(max_workers=max_parallel) as executor:
         while True:
@@ -252,6 +308,7 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
                 ):
                     first_error = RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
                     break
+                batch_start_times[index] = time.perf_counter()
                 active[executor.submit(_extract_pdf_batch, pdf_path, pages)] = (index, batch)
             if not active:
                 break
@@ -265,12 +322,20 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
                     ):
                         lease_lost.set()
                         raise RuntimeError("Worker lost the extraction job lease")
+                    t0_persist = time.perf_counter()
                     contexts.append(_persist_batch_images(repo, filestore, project_id, result))
+                    dur_persist = time.perf_counter() - t0_persist
                     if result.errors:
                         raise RuntimeError(f"Page batch {index + 1} reported extraction errors: {result.errors[:3]}")
                     if batch["status"] != "completed":
                         if not repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id):
                             raise RuntimeError("Worker lost ownership before recording batch completion")
+                    dur_batch = time.perf_counter() - batch_start_times.get(index, t0_persist)
+                    pages = page_batches[index]
+                    logger.info(
+                        "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d duration_persist=%.3fs duration_total=%.3fs status=completed",
+                        job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images), dur_persist, dur_batch,
+                    )
                 except Exception as exc:
                     retry_batch = int(batch["attempt_count"]) + (0 if batch["status"] == "completed" else 1) < int(batch["max_attempts"])
                     if batch["status"] != "completed":

@@ -52,8 +52,13 @@ def check_export_eligibility(repo: Repository, project_id: str) -> Dict[str, Any
     for img in images:
         is_approved = img.get("processing_status") == "approved"
         approval = repo.get_approval_for_image(img["id"]) if is_approved else None
+        approved_version = (
+            repo.get_alt_text_version(approval["alt_text_version_id"])
+            if (approval and approval.get("alt_text_version_id"))
+            else None
+        )
 
-        if not is_approved or not approval:
+        if not is_approved or not approval or not approved_version:
             unapproved.append({
                 "id": img["id"],
                 "filename": img["suggested_filename"],

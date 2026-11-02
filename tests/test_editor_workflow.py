@@ -1924,3 +1924,157 @@ def test_review_js_defines_update_header_counts_and_executes_without_error():
 
     res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, check=True)
     assert "SUCCESS" in res.stdout
+
+
+def test_approve_with_edited_text_creates_new_version_and_approves_atomically(api_env):
+    """
+    Verifies that when an editor approves with modified text:
+    1. A new version (v2) is atomically created with the modified text and human_editor attribution.
+    2. The original AI version (v1) text is preserved completely intact.
+    3. The approval record references the new version (v2).
+    4. Image asset processing_status becomes 'approved'.
+    """
+    client = api_env["client"]
+    repo = api_env["repo"]
+    project_id = api_env["project_id"]
+
+    img_id = create_api_test_image(api_env, page_number=1, caption="Figure 1: Test Diagram")
+
+    # Create original AI version
+    v1_id = str(uuid.uuid4())
+    repo.create_alt_text_version(
+        version_id=v1_id,
+        image_id=img_id,
+        version_number=1,
+        text="Original AI generated alt text description.",
+        provider="gemini",
+        model="gemini-2.5-flash",
+        language="en-GB",
+        status="success",
+    )
+
+    # Approve with modified text
+    approve_res = client.post(
+        f"/api/projects/{project_id}/images/{img_id}/approve",
+        json={
+            "version_id": v1_id,
+            "alt_text": "Editor refined alt text with crucial corrections.",
+        },
+    )
+    assert approve_res.status_code == 200
+    res_data = approve_res.json()
+    assert res_data["status"] == "approved"
+
+    # Verify versions
+    versions = repo.list_image_versions(img_id)
+    assert len(versions) == 2
+
+    # Original AI version is completely unmodified
+    v1 = next(v for v in versions if v["id"] == v1_id)
+    assert v1["text"] == "Original AI generated alt text description."
+    assert v1["version_number"] == 1
+    assert v1["provider"] == "gemini"
+
+    # New approved version has the modified text
+    v2 = next(v for v in versions if v["id"] != v1_id)
+    assert v2["text"] == "Editor refined alt text with crucial corrections."
+    assert v2["version_number"] == 2
+    assert v2["provider"] == "manual"
+    assert v2["model"] == "human_editor"
+
+    # Approval points directly to v2
+    approval = repo.get_approval_for_image(img_id)
+    assert approval is not None
+    assert approval["alt_text_version_id"] == v2["id"]
+
+    # Image asset status is approved
+    asset = repo.get_image_asset(img_id)
+    assert asset["processing_status"] == "approved"
+
+
+def test_approve_without_modifications_approves_selected_version(api_env):
+    """Verifies that approving unchanged text directly references that version without creating duplicates."""
+    client = api_env["client"]
+    repo = api_env["repo"]
+    project_id = api_env["project_id"]
+
+    img_id = create_api_test_image(api_env, page_number=1, caption="Figure 2: Chart")
+    v1_id = str(uuid.uuid4())
+    repo.create_alt_text_version(
+        version_id=v1_id,
+        image_id=img_id,
+        version_number=1,
+        text="Accurate AI alt text that needs no editing.",
+        provider="gemini",
+        model="gemini-2.5-flash",
+        status="success",
+    )
+
+    approve_res = client.post(
+        f"/api/projects/{project_id}/images/{img_id}/approve",
+        json={"version_id": v1_id, "modified_text": "Accurate AI alt text that needs no editing."},
+    )
+    assert approve_res.status_code == 200
+
+    versions = repo.list_image_versions(img_id)
+    assert len(versions) == 1
+
+    approval = repo.get_approval_for_image(img_id)
+    assert approval["alt_text_version_id"] == v1_id
+
+
+def test_save_draft_after_approval_transitions_status_to_drafted(api_env):
+    """
+    Verifies that saving a new draft on an approved image:
+    1. Sets image processing_status to 'drafted'.
+    2. Marks is_approved as False in get_image_versions.
+    3. Blocks DOCX export until re-approved.
+    """
+    client = api_env["client"]
+    repo = api_env["repo"]
+    project_id = api_env["project_id"]
+
+    img_id = create_api_test_image(api_env, page_number=1, caption="Figure 3: Photo")
+    v1_id = str(uuid.uuid4())
+    repo.create_alt_text_version(
+        version_id=v1_id,
+        image_id=img_id,
+        version_number=1,
+        text="Initial alt text.",
+        status="success",
+    )
+    repo.approve_alt_text(
+        approval_id=str(uuid.uuid4()),
+        image_id=img_id,
+        version_id=v1_id,
+        reviewer_id="editor",
+    )
+
+    # Verify initially approved
+    asset = repo.get_image_asset(img_id)
+    assert asset["processing_status"] == "approved"
+
+    # Save a new draft
+    draft_res = client.post(
+        f"/api/projects/{project_id}/images/{img_id}/draft",
+        json={"text": "Unapproved draft work in progress"},
+    )
+    assert draft_res.status_code == 200
+
+    # Image asset status is now drafted
+    asset = repo.get_image_asset(img_id)
+    assert asset["processing_status"] == "drafted"
+
+    # API returns is_approved=False
+    versions_res = client.get(f"/api/projects/{project_id}/images/{img_id}/versions")
+    assert versions_res.status_code == 200
+    versions_data = versions_res.json()
+    assert versions_data["is_approved"] is False
+
+    # Check export status is blocked
+    status_res = client.get(f"/api/projects/{project_id}/exports/status")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["eligible"] is False
+    assert status_data["checklist"]["approved_count"] == 0
+    assert status_data["checklist"]["unapproved_count"] == 1

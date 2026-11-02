@@ -16,8 +16,24 @@ document.addEventListener("DOMContentLoaded", () => {
   // Setup Stepper & Nav links
   const stepperExportLink = document.getElementById("stepperExportLink");
   const continueExportBtn = document.getElementById("continueExportBtn");
-  if (stepperExportLink) stepperExportLink.href = `/export/${projectId}`;
-  if (continueExportBtn) continueExportBtn.href = `/export/${projectId}`;
+  if (stepperExportLink) {
+    stepperExportLink.href = `/export/${projectId}`;
+    stepperExportLink.addEventListener("click", (e) => {
+      if (typeof isEditorDirty === "function" && isEditorDirty()) {
+        const proceed = window.confirm("You have unsaved edits on this image. Continue to Export and discard unsaved edits?");
+        if (!proceed) e.preventDefault();
+      }
+    });
+  }
+  if (continueExportBtn) {
+    continueExportBtn.href = `/export/${projectId}`;
+    continueExportBtn.addEventListener("click", (e) => {
+      if (typeof isEditorDirty === "function" && isEditorDirty()) {
+        const proceed = window.confirm("You have unsaved edits on this image. Continue to Export and discard unsaved edits?");
+        if (!proceed) e.preventDefault();
+      }
+    });
+  }
 
   // Top Level / Summary Elements
   const projectTitle = document.getElementById("projectTitle");
@@ -34,6 +50,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Direct Review Workspace Container
   const reviewWorkspaceSection = document.getElementById("reviewWorkspaceSection");
+
+  // Progressive Extraction Banner Elements
+  const extractionProgressBanner = document.getElementById("extractionProgressBanner");
+  const extractionSpinner = document.getElementById("extractionSpinner");
+  const extractionProgressTitle = document.getElementById("extractionProgressTitle");
+  const extractionProgressSubtitle = document.getElementById("extractionProgressSubtitle");
+  const extractionProgressPercent = document.getElementById("extractionProgressPercent");
+  const extractionProgressBar = document.getElementById("extractionProgressBar");
+  const extractionProgressBarFill = document.getElementById("extractionProgressBarFill");
+  const extractionPagesText = document.getElementById("extractionPagesText");
+  const extractionBatchesText = document.getElementById("extractionBatchesText");
+  const extractionImagesText = document.getElementById("extractionImagesText");
+  const extractionNoticeText = document.getElementById("extractionNoticeText");
+  const extractionDismissBtn = document.getElementById("extractionDismissBtn");
+  const extractionErrorRow = document.getElementById("extractionErrorRow");
+  const extractionErrorText = document.getElementById("extractionErrorText");
 
   // Figure Groups Management Modal Elements
   const manageGroupsBtn = document.getElementById("manageGroupsBtn");
@@ -122,6 +154,18 @@ document.addEventListener("DOMContentLoaded", () => {
   let skipEmptyPages = true;
   let activeView = "reader"; // 'reader' or 'review'
   let currentReviewIndex = 0;
+
+  // Editorial dirty state tracking
+  let isAltTextDirty = false;
+  let isCaptionDirty = false;
+  let isRevisionDirty = false;
+  let lastLoadedAltText = "";
+  let lastLoadedCaption = "";
+  let currentActiveVersionId = null;
+
+  function isEditorDirty() {
+    return isAltTextDirty || isCaptionDirty || isRevisionDirty;
+  }
   let currentReviewImageVersions = [];
   let currentReviewImageApproval = null;
   let selectedModalImage = null;
@@ -211,13 +255,268 @@ document.addEventListener("DOMContentLoaded", () => {
     return words.length;
   }
 
+  // --- Progressive Extraction Progress Tracking ---
+  let extractionPollTimer = null;
+  let extractionPollDelay = 3000;
+  let isBannerDismissed = false;
+
+  if (extractionDismissBtn) {
+    extractionDismissBtn.addEventListener("click", () => {
+      isBannerDismissed = true;
+      if (extractionProgressBanner) {
+        extractionProgressBanner.style.display = "none";
+      }
+    });
+  }
+
+  function stopExtractionProgressPolling() {
+    if (extractionPollTimer) {
+      clearTimeout(extractionPollTimer);
+      extractionPollTimer = null;
+    }
+  }
+
+  function updateExtractionBanner(data) {
+    if (!extractionProgressBanner || isBannerDismissed) return;
+
+    const projectStatus = data.project_status || data.status;
+    const jobStatus = data.job_status || (data.job && data.job.status);
+    const totalPages = Number(data.total_pages || (data.job && data.job.total_pages) || 0);
+    const completedPages = Number(data.completed_pages || (data.job && data.job.completed_pages) || 0);
+    const totalBatches = Number(data.total_batches || (data.job && data.job.total_batches) || 0);
+    const completedBatches = Number(data.completed_batches || (data.job && data.job.completed_batches) || 0);
+    const failedBatches = Number(data.failed_batches || 0);
+    const totalImages = Number(data.total_images ?? (data.images ? data.images.length : 0));
+    const errorMsg = data.error || (data.job && data.job.error_message);
+
+    // Compute backend-authoritative percentage
+    let percent = 0;
+    if (totalPages > 0) {
+      percent = Math.min(100, Math.round((completedPages / totalPages) * 100));
+    }
+
+    // Reset banner classes
+    extractionProgressBanner.classList.remove("state-completed", "state-failed", "state-partial");
+    if (extractionErrorRow) extractionErrorRow.style.display = "none";
+
+    const isFullyComplete = projectStatus === "ready_for_review" && (jobStatus === "completed" || !jobStatus);
+    const isJobFailed = jobStatus === "failed" || projectStatus === "failed";
+    const isPartiallyComplete = failedBatches > 0 && completedBatches > 0;
+
+    if (isFullyComplete) {
+      // --- State B: Extraction Completed ---
+      extractionProgressBanner.classList.add("state-completed");
+      if (extractionSpinner) extractionSpinner.textContent = "✓";
+      if (extractionProgressTitle) extractionProgressTitle.textContent = "Image extraction completed";
+      if (extractionProgressSubtitle) extractionProgressSubtitle.textContent = "All document pages processed and figures grouped successfully.";
+      if (extractionProgressPercent) extractionProgressPercent.textContent = "100%";
+      if (extractionProgressBar) extractionProgressBar.setAttribute("aria-valuenow", "100");
+      if (extractionProgressBarFill) extractionProgressBarFill.style.width = "100%";
+      if (extractionPagesText) extractionPagesText.textContent = `${totalPages} / ${totalPages}`;
+      if (extractionBatchesText) extractionBatchesText.textContent = `${totalBatches} / ${totalBatches}`;
+      if (extractionImagesText) extractionImagesText.textContent = `${totalImages}`;
+      if (extractionNoticeText) extractionNoticeText.textContent = "All images are ready for review.";
+      if (extractionDismissBtn) extractionDismissBtn.style.display = "inline-flex";
+      extractionProgressBanner.style.display = "block";
+      stopExtractionProgressPolling();
+      return;
+    }
+
+    if (isJobFailed) {
+      if (totalImages > 0) {
+        // --- State D: Partial Completion on Failure ---
+        extractionProgressBanner.classList.add("state-partial");
+        if (extractionSpinner) extractionSpinner.textContent = "⚠️";
+        if (extractionProgressTitle) extractionProgressTitle.textContent = "Extraction partially completed";
+        if (extractionProgressSubtitle) extractionProgressSubtitle.textContent = `Extraction stopped with an error. ${totalImages} image(s) recovered and available for review.`;
+        if (extractionProgressPercent) extractionProgressPercent.textContent = `${percent}%`;
+        if (extractionProgressBar) extractionProgressBar.setAttribute("aria-valuenow", String(percent));
+        if (extractionProgressBarFill) extractionProgressBarFill.style.width = `${percent}%`;
+        if (extractionPagesText) extractionPagesText.textContent = `${completedPages} / ${totalPages}`;
+        if (extractionBatchesText) extractionBatchesText.textContent = `${completedBatches} completed${failedBatches > 0 ? `, ${failedBatches} failed` : ""}`;
+        if (extractionImagesText) extractionImagesText.textContent = `${totalImages}`;
+        if (extractionNoticeText) extractionNoticeText.textContent = "Some pages could not be extracted.";
+        if (extractionErrorRow && errorMsg) {
+          extractionErrorRow.style.display = "block";
+          if (extractionErrorText) extractionErrorText.textContent = `Error: ${errorMsg}`;
+        }
+        if (extractionDismissBtn) extractionDismissBtn.style.display = "inline-flex";
+        extractionProgressBanner.style.display = "block";
+      } else {
+        // --- State C: Full Failure ---
+        extractionProgressBanner.classList.add("state-failed");
+        if (extractionSpinner) extractionSpinner.textContent = "❌";
+        if (extractionProgressTitle) extractionProgressTitle.textContent = "Extraction failed";
+        if (extractionProgressSubtitle) extractionProgressSubtitle.textContent = "The background worker encountered an error during extraction.";
+        if (extractionProgressPercent) extractionProgressPercent.textContent = "Failed";
+        if (extractionProgressBar) extractionProgressBar.setAttribute("aria-valuenow", "0");
+        if (extractionProgressBarFill) extractionProgressBarFill.style.width = "0%";
+        if (extractionPagesText) extractionPagesText.textContent = `${completedPages} / ${totalPages}`;
+        if (extractionBatchesText) extractionBatchesText.textContent = `${completedBatches} / ${totalBatches}`;
+        if (extractionImagesText) extractionImagesText.textContent = `${totalImages}`;
+        if (extractionNoticeText) extractionNoticeText.textContent = "No images could be extracted.";
+        if (extractionErrorRow && errorMsg) {
+          extractionErrorRow.style.display = "block";
+          if (extractionErrorText) extractionErrorText.textContent = `Error: ${errorMsg}`;
+        }
+        if (extractionDismissBtn) extractionDismissBtn.style.display = "inline-flex";
+        extractionProgressBanner.style.display = "block";
+      }
+      stopExtractionProgressPolling();
+      return;
+    }
+
+    if (isPartiallyComplete) {
+      // --- State D: Partial Completion with non-terminal failures ---
+      extractionProgressBanner.classList.add("state-partial");
+      if (extractionSpinner) extractionSpinner.textContent = "⚠️";
+      if (extractionProgressTitle) extractionProgressTitle.textContent = "Extraction partially completed";
+      if (extractionProgressSubtitle) extractionProgressSubtitle.textContent = `${failedBatches} batch(es) encountered an error during processing.`;
+      if (extractionProgressPercent) extractionProgressPercent.textContent = `${percent}%`;
+      if (extractionProgressBar) extractionProgressBar.setAttribute("aria-valuenow", String(percent));
+      if (extractionProgressBarFill) extractionProgressBarFill.style.width = `${percent}%`;
+      if (extractionPagesText) extractionPagesText.textContent = `${completedPages} / ${totalPages}`;
+      if (extractionBatchesText) extractionBatchesText.textContent = `${completedBatches} of ${totalBatches} (${failedBatches} failed)`;
+      if (extractionImagesText) extractionImagesText.textContent = `${totalImages}`;
+      if (extractionNoticeText) extractionNoticeText.textContent = "Incomplete extraction. Additional images may be missing.";
+      if (extractionDismissBtn) extractionDismissBtn.style.display = "inline-flex";
+      extractionProgressBanner.style.display = "block";
+      return;
+    }
+
+    // --- State A: Extraction in Progress ---
+    const isFinalizing = totalBatches > 0 && completedBatches >= totalBatches;
+    if (extractionSpinner) extractionSpinner.textContent = "⏳";
+    if (extractionProgressTitle) {
+      extractionProgressTitle.textContent = isFinalizing
+        ? "Finalizing extracted figures…"
+        : "Extracting images from your document…";
+    }
+    if (extractionProgressSubtitle) {
+      extractionProgressSubtitle.textContent = isFinalizing
+        ? "Correlating multi-panel figure groups and associating captions across pages…"
+        : "Extraction is progressing in the background. You can begin reviewing images as they arrive.";
+    }
+    const displayPercent = isFinalizing ? 99 : Math.min(99, percent);
+    if (extractionProgressPercent) extractionProgressPercent.textContent = `${displayPercent}%`;
+    if (extractionProgressBar) extractionProgressBar.setAttribute("aria-valuenow", String(displayPercent));
+    if (extractionProgressBarFill) extractionProgressBarFill.style.width = `${displayPercent}%`;
+    if (extractionPagesText) extractionPagesText.textContent = `${completedPages} / ${totalPages}`;
+    if (extractionBatchesText) extractionBatchesText.textContent = `${completedBatches} / ${totalBatches}`;
+    if (extractionImagesText) extractionImagesText.textContent = `${totalImages}`;
+    if (extractionNoticeText) {
+      extractionNoticeText.textContent = isFinalizing
+        ? "Finalizing document figure grouping and metadata…"
+        : "Additional images will appear here automatically as extraction continues.";
+    }
+    if (extractionDismissBtn) extractionDismissBtn.style.display = "none";
+    extractionProgressBanner.style.display = "block";
+  }
+
+  function mergeNewlyExtractedImages(incomingImages, incomingGroups) {
+    const sorted = getSortedReviewImages();
+    const activeImage = sorted[currentReviewIndex];
+    const activeImageId = activeImage ? activeImage.id : null;
+
+    // Check if user is typing in an editorial input field or holds unsaved edits
+    const isActivelyFocused = (
+      document.activeElement === rwDraftTextarea ||
+      document.activeElement === rwCaptionEditInput ||
+      document.activeElement === rwRevisionInput
+    );
+    const hasUnsavedEdits = isEditorDirty();
+
+    const scrollY = window.scrollY;
+
+    currentImages = incomingImages;
+    if (incomingGroups && incomingGroups.length > 0) {
+      currentGroups = incomingGroups;
+    }
+
+    updateHeaderCounts();
+    updateOverallProgress();
+
+    const newSorted = getSortedReviewImages();
+
+    if (!activeImageId && newSorted.length > 0) {
+      // First images just arrived into previously empty workspace
+      currentReviewIndex = 0;
+      renderReviewWorkspace();
+    } else if (activeImageId) {
+      const newIdx = newSorted.findIndex(img => img.id === activeImageId);
+      if (newIdx !== -1) {
+        currentReviewIndex = newIdx;
+      }
+      // Update counter e.g. "1 of 5"
+      if (rwImageCounter) {
+        rwImageCounter.textContent = `${currentReviewIndex + 1} of ${newSorted.length}`;
+      }
+      if (rwPrevBtn) rwPrevBtn.disabled = currentReviewIndex === 0;
+      if (rwNextBtn) rwNextBtn.disabled = currentReviewIndex === newSorted.length - 1;
+
+      // Only re-render workspace DOM if the user is NOT actively typing into an input and has no unsaved edits
+      if (!isActivelyFocused && !hasUnsavedEdits) {
+        renderReviewWorkspace();
+      }
+    }
+
+    // Preserve scroll position
+    window.scrollTo(0, scrollY);
+  }
+
+  async function pollExtractionProgress() {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/status`, {
+        credentials: "include",
+      });
+      if (!res.ok) {
+        throw new Error(`Status poll returned HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      extractionPollDelay = 3000; // Reset backoff on success
+
+      updateExtractionBanner(data);
+
+      // Merge newly arrived images
+      const incomingImages = data.images || [];
+      const incomingGroups = data.groups || [];
+
+      if (incomingImages.length > currentImages.length) {
+        mergeNewlyExtractedImages(incomingImages, incomingGroups);
+      }
+
+      // Check if polling should continue
+      const projectStatus = data.project_status || data.status;
+      const jobStatus = data.job_status || (data.job && data.job.status);
+      const isTerminal = (projectStatus === "ready_for_review" && (jobStatus === "completed" || !jobStatus)) ||
+                         (jobStatus === "failed" || projectStatus === "failed");
+
+      if (!isTerminal) {
+        extractionPollTimer = setTimeout(pollExtractionProgress, extractionPollDelay);
+      } else {
+        stopExtractionProgressPolling();
+      }
+    } catch (err) {
+      console.warn("Extraction progress polling error:", err);
+      // Exponential backoff up to 20s
+      extractionPollDelay = Math.min(20000, Math.round(extractionPollDelay * 1.5));
+      extractionPollTimer = setTimeout(pollExtractionProgress, extractionPollDelay);
+    }
+  }
+
+  function startExtractionProgressPolling() {
+    stopExtractionProgressPolling();
+    extractionPollTimer = setTimeout(pollExtractionProgress, 1500);
+  }
+
   // --- Load Full Project State ---
   async function loadProject() {
     try {
-      const [projRes, imgRes, grpRes] = await Promise.all([
+      const [projRes, imgRes, grpRes, statusRes] = await Promise.all([
         fetch(`/api/projects/${projectId}`),
         fetch(`/api/projects/${projectId}/images`),
         fetch(`/api/projects/${projectId}/groups`),
+        fetch(`/api/projects/${projectId}/status`),
       ]);
 
       if (!projRes.ok) {
@@ -232,11 +531,12 @@ document.addEventListener("DOMContentLoaded", () => {
       const projData = await projRes.json();
       const imgData = imgRes.ok ? await imgRes.json() : { images: [] };
       const grpData = grpRes.ok ? await grpRes.json() : { groups: [] };
+      const statusData = statusRes.ok ? await statusRes.json() : null;
 
       currentProject = {
         project_id: projectId,
         project_name: projData.project_name || projData.project?.name || "Project Review",
-        total_pages: projData.total_pages || 1,
+        total_pages: projData.total_pages || (statusData && statusData.total_pages) || 1,
         stats: projData.stats || {}
       };
 
@@ -247,6 +547,18 @@ document.addEventListener("DOMContentLoaded", () => {
       updateHeaderCounts();
       updateOverallProgress();
       await renderReviewWorkspace();
+
+      // Initialize extraction progress banner and live polling if still extracting
+      if (statusData) {
+        updateExtractionBanner(statusData);
+        const projectStatus = statusData.project_status || statusData.status;
+        const jobStatus = statusData.job_status || (statusData.job && statusData.job.status);
+        const isTerminal = (projectStatus === "ready_for_review" && (jobStatus === "completed" || !jobStatus)) ||
+                           (jobStatus === "failed" || projectStatus === "failed");
+        if (!isTerminal) {
+          startExtractionProgressPolling();
+        }
+      }
     } catch (err) {
       console.error("Error loading project state:", err);
     }
@@ -1001,7 +1313,10 @@ document.addEventListener("DOMContentLoaded", () => {
         rwCaptionBlock.classList.add("has-caption");
       }
     }
-    if (rwCaptionEditInput) rwCaptionEditInput.value = captionText;
+    if (rwCaptionEditInput && !isCaptionDirty) {
+      lastLoadedCaption = captionText;
+      rwCaptionEditInput.value = captionText;
+    }
     if (rwCaptionExpandBtn) rwCaptionExpandBtn.style.display = captionText.length > 140 ? "inline-block" : "none";
 
     // Load alt-text versions
@@ -1018,6 +1333,46 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  function updateApprovalButtonAndBadge() {
+    if (!rwVersionSelect || !currentReviewImageVersions) return;
+    const sorted = getSortedReviewImages();
+    const img = sorted[currentReviewIndex];
+    const isImageApproved = img && img.processing_status === "approved";
+    const approvedVersionId = currentReviewImageApproval ? currentReviewImageApproval.alt_text_version_id : null;
+    const selectedVid = rwVersionSelect.value;
+    const isSelectedApproved = isImageApproved && approvedVersionId === selectedVid;
+    const selectedVer = currentReviewImageVersions.find(v => v.id === selectedVid);
+    const verNum = selectedVer ? selectedVer.version_number : 1;
+
+    if (rwVersionBadge) {
+      if (isAltTextDirty) {
+        rwVersionBadge.textContent = `v${verNum} (Unsaved Edits)`;
+        rwVersionBadge.className = "status-pill review";
+      } else if (isSelectedApproved) {
+        rwVersionBadge.textContent = `v${verNum} (Approved)`;
+        rwVersionBadge.className = "status-pill matched";
+      } else {
+        rwVersionBadge.textContent = `v${verNum} (Unapproved Draft)`;
+        rwVersionBadge.className = "status-pill review";
+      }
+    }
+
+    if (rwApproveBtn) {
+      if (isAltTextDirty) {
+        rwApproveBtn.innerHTML = "<span>✓ Approve Edited Text</span>";
+        rwApproveBtn.className = "btn-approve-primary";
+        rwApproveBtn.disabled = false;
+      } else if (isSelectedApproved) {
+        rwApproveBtn.innerHTML = "<span>✓ Approved</span>";
+        rwApproveBtn.className = "btn-secondary";
+      } else {
+        rwApproveBtn.innerHTML = "<span>✓ Approve Alt Text</span>";
+        rwApproveBtn.className = "btn-approve-primary";
+        rwApproveBtn.disabled = false;
+      }
+    }
+  }
+
   function populateReviewVersionsDropdown(versions, latestVersion, approval, img) {
     if (!rwVersionSelect) return;
     rwVersionSelect.innerHTML = "";
@@ -1027,7 +1382,10 @@ document.addEventListener("DOMContentLoaded", () => {
       opt.value = "";
       opt.textContent = "No versions generated yet";
       rwVersionSelect.appendChild(opt);
-      if (rwDraftTextarea) rwDraftTextarea.value = "";
+      if (rwDraftTextarea && !isAltTextDirty) {
+        lastLoadedAltText = "";
+        rwDraftTextarea.value = "";
+      }
       if (rwVersionBadge) rwVersionBadge.textContent = "No Draft";
       if (rwGenBtnText) rwGenBtnText.textContent = "✨ Generate Alt Text";
       if (rwApproveBtn) {
@@ -1038,35 +1396,40 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    let activeVersion = latestVersion || versions[versions.length - 1];
+    const isImageApproved = img && img.processing_status === "approved";
+    const approvedVersionId = approval ? approval.alt_text_version_id : null;
+    const approvedVersion = (isImageApproved && approvedVersionId)
+      ? versions.find(v => v.id === approvedVersionId)
+      : null;
+
+    // Prefer approved version if image is currently approved; otherwise latest version
+    let activeVersion = approvedVersion || latestVersion || versions[versions.length - 1];
+    currentActiveVersionId = activeVersion ? activeVersion.id : null;
 
     versions.forEach(v => {
       const opt = document.createElement("option");
       opt.value = v.id;
-      const isApprovedVer = approval && approval.alt_text_version_id === v.id && img && img.processing_status === "approved";
-      const flag = isApprovedVer ? " ★ Approved" : "";
+      const isApprovedVer = isImageApproved && approvedVersionId === v.id;
+      const isLatestUnapproved = latestVersion && latestVersion.id === v.id && !isApprovedVer;
+      let tag = "";
+      if (isApprovedVer) {
+        tag = " ★ Approved";
+      } else if (isLatestUnapproved) {
+        tag = " [Unapproved Draft]";
+      }
       const source = v.provider === "manual" ? "Client Edit" : (v.model ? v.model.split("/").pop() : "AI");
-      opt.textContent = `v${v.version_number} (${source})${flag}`;
+      opt.textContent = `v${v.version_number} (${source})${tag}`;
       if (activeVersion && v.id === activeVersion.id) opt.selected = true;
       rwVersionSelect.appendChild(opt);
     });
 
     if (activeVersion && rwDraftTextarea) {
-      rwDraftTextarea.value = activeVersion.text || "";
+      if (!isAltTextDirty) {
+        lastLoadedAltText = activeVersion.text || "";
+        rwDraftTextarea.value = lastLoadedAltText;
+      }
       if (rwGenBtnText) rwGenBtnText.textContent = "✨ Regenerate Alt Text";
-      const isAppr = approval && approval.alt_text_version_id === activeVersion.id && img && img.processing_status === "approved";
-      if (rwVersionBadge) {
-        rwVersionBadge.textContent = isAppr ? `v${activeVersion.version_number} (Approved)` : `v${activeVersion.version_number} (Draft)`;
-      }
-      if (rwApproveBtn) {
-        if (isAppr) {
-          rwApproveBtn.innerHTML = "<span>✓ Approved</span>";
-          rwApproveBtn.className = "btn-secondary";
-        } else {
-          rwApproveBtn.innerHTML = "<span>✓ Approve Alt Text</span>";
-          rwApproveBtn.className = "btn-approve-primary";
-        }
-      }
+      updateApprovalButtonAndBadge();
     }
     updateRwWordCount();
   }
@@ -1118,37 +1481,62 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  if (rwDraftTextarea) rwDraftTextarea.addEventListener("input", updateRwWordCount);
+  if (rwDraftTextarea) {
+    rwDraftTextarea.addEventListener("input", () => {
+      isAltTextDirty = (rwDraftTextarea.value !== lastLoadedAltText);
+      updateRwWordCount();
+      updateApprovalButtonAndBadge();
+    });
+  }
+
+  if (rwCaptionEditInput) {
+    rwCaptionEditInput.addEventListener("input", () => {
+      isCaptionDirty = (rwCaptionEditInput.value !== lastLoadedCaption);
+    });
+  }
+
+  if (rwRevisionInput) {
+    rwRevisionInput.addEventListener("input", () => {
+      isRevisionDirty = Boolean(rwRevisionInput.value.trim().length > 0);
+    });
+  }
 
   if (rwVersionSelect) {
     rwVersionSelect.addEventListener("change", () => {
+      if (isAltTextDirty) {
+        const proceed = window.confirm("You have unsaved edits in the editor. Discard edits and switch version?");
+        if (!proceed) {
+          if (currentActiveVersionId) rwVersionSelect.value = currentActiveVersionId;
+          return;
+        }
+      }
+      isAltTextDirty = false;
       const vid = rwVersionSelect.value;
+      currentActiveVersionId = vid;
       const ver = currentReviewImageVersions.find(v => v.id === vid);
       if (ver && rwDraftTextarea) {
-        rwDraftTextarea.value = ver.text || "";
-        const sorted = getSortedReviewImages();
-        const img = sorted[currentReviewIndex];
-        const isAppr = currentReviewImageApproval && currentReviewImageApproval.alt_text_version_id === ver.id && img && img.processing_status === "approved";
-        if (rwVersionBadge) {
-          rwVersionBadge.textContent = isAppr ? `v${ver.version_number} (Approved)` : `v${ver.version_number} (Draft)`;
-        }
-        if (rwApproveBtn) {
-          if (isAppr) {
-            rwApproveBtn.innerHTML = "<span>✓ Approved</span>";
-            rwApproveBtn.className = "btn-secondary";
-          } else {
-            rwApproveBtn.innerHTML = "<span>✓ Approve Alt Text</span>";
-            rwApproveBtn.className = "btn-approve-primary";
-          }
-        }
+        lastLoadedAltText = ver.text || "";
+        rwDraftTextarea.value = lastLoadedAltText;
+        updateApprovalButtonAndBadge();
         updateRwWordCount();
       }
     });
   }
 
+  function confirmNavigationIfDirty() {
+    if (!isEditorDirty()) return true;
+    return window.confirm(
+      "You have unsaved edits on this image. Discard unsaved changes and navigate to another image?"
+    );
+  }
+
   if (rwPrevBtn) {
     rwPrevBtn.addEventListener("click", () => {
       if (currentReviewIndex > 0) {
+        if (!confirmNavigationIfDirty()) return;
+        isAltTextDirty = false;
+        isCaptionDirty = false;
+        isRevisionDirty = false;
         currentReviewIndex--;
         renderReviewWorkspace();
       }
@@ -1159,6 +1547,10 @@ document.addEventListener("DOMContentLoaded", () => {
     rwNextBtn.addEventListener("click", () => {
       const sorted = getSortedReviewImages();
       if (currentReviewIndex < sorted.length - 1) {
+        if (!confirmNavigationIfDirty()) return;
+        isAltTextDirty = false;
+        isCaptionDirty = false;
+        isRevisionDirty = false;
         currentReviewIndex++;
         renderReviewWorkspace();
       }
@@ -1230,6 +1622,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         const data = await res.json();
+        isCaptionDirty = false;
+        lastLoadedCaption = (data.image && data.image.original_caption) || img.original_caption || "";
         Object.assign(img, data.image);
         const idx = currentImages.findIndex(i => i.id === img.id);
         if (idx >= 0) Object.assign(currentImages[idx], data.image);
@@ -1281,6 +1675,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         const data = await res.json();
+        isCaptionDirty = false;
+        lastLoadedCaption = (data.image && data.image.original_caption) || img.original_caption || "";
         Object.assign(img, data.image);
         const idx = currentImages.findIndex(i => i.id === img.id);
         if (idx >= 0) Object.assign(currentImages[idx], data.image);
@@ -1474,6 +1870,8 @@ document.addEventListener("DOMContentLoaded", () => {
           const errData = await res.json();
           throw new Error(errData.detail || "Could not save draft edit");
         }
+        isAltTextDirty = false;
+        lastLoadedAltText = text;
         img.processing_status = "drafted";
         const idx = currentImages.findIndex(i => i.id === img.id);
         if (idx >= 0) currentImages[idx].processing_status = "drafted";
@@ -1515,6 +1913,9 @@ document.addEventListener("DOMContentLoaded", () => {
           const errData = await res.json();
           throw new Error(errData.detail || "Approval failed");
         }
+
+        isAltTextDirty = false;
+        lastLoadedAltText = text;
 
         img.processing_status = "approved";
         img.needs_caption_review = 0;
@@ -1805,6 +2206,15 @@ document.addEventListener("DOMContentLoaded", () => {
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
   }
+
+  // Cleanup polling and warn on unsaved edits on page unload
+  window.addEventListener("beforeunload", (e) => {
+    if (typeof isEditorDirty === "function" && isEditorDirty()) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    stopExtractionProgressPolling();
+  });
 
   // Initialize
   loadProject();

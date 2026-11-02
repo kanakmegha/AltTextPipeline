@@ -678,6 +678,104 @@ class PostgresRepository:
     # Approvals
     # ============================================================
 
+    def approve_alt_text(
+        self,
+        approval_id: str,
+        image_id: str,
+        reviewer_id: Optional[str] = None,
+        alt_text: Optional[str] = None,
+        version_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Atomically approves alt-text for an image in PostgreSQL.
+        If submitted text differs from the selected/latest version, a new manual
+        alt_text_version is created and approved within the same transaction.
+        """
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, project_id FROM image_assets WHERE id = %s;", (image_id,))
+                asset = cur.fetchone()
+                if not asset:
+                    raise ValueError(f"Image asset '{image_id}' not found.")
+
+                target_version_id = None
+                submitted_text = alt_text.strip() if (alt_text is not None and alt_text.strip() != "") else None
+
+                selected_version = None
+                if version_id:
+                    cur.execute(
+                        "SELECT * FROM alt_text_versions WHERE id = %s AND image_id = %s;",
+                        (version_id, image_id)
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"Version '{version_id}' not found for image '{image_id}'.")
+                    selected_version = dict(row)
+
+                if submitted_text:
+                    base_version = selected_version
+                    if not base_version:
+                        cur.execute(
+                            "SELECT * FROM alt_text_versions WHERE image_id = %s ORDER BY version_number DESC LIMIT 1;",
+                            (image_id,)
+                        )
+                        row = cur.fetchone()
+                        base_version = dict(row) if row else None
+
+                    if base_version and (base_version.get("text") or "").strip() == submitted_text:
+                        target_version_id = base_version["id"]
+                    else:
+                        cur.execute(
+                            "SELECT COALESCE(MAX(version_number), 0) FROM alt_text_versions WHERE image_id = %s;",
+                            (image_id,)
+                        )
+                        max_ver = cur.fetchone()[0]
+                        next_ver = max_ver + 1
+                        new_vid = str(uuid.uuid4())
+                        lang = (base_version.get("language") if base_version else "en-GB") or "en-GB"
+                        cur.execute(
+                            """
+                            INSERT INTO alt_text_versions (
+                                id, image_id, version_number, text, revision_instruction,
+                                provider, model, language, status, created_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                            """,
+                            (
+                                new_vid, image_id, next_ver, submitted_text,
+                                "Approved client edit", "manual", "human_editor",
+                                lang, "success", now
+                            )
+                        )
+                        target_version_id = new_vid
+                else:
+                    if selected_version:
+                        target_version_id = selected_version["id"]
+                    else:
+                        cur.execute(
+                            "SELECT id FROM alt_text_versions WHERE image_id = %s ORDER BY version_number DESC LIMIT 1;",
+                            (image_id,)
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            raise ValueError(f"Cannot approve: No draft version exists for image '{image_id}'.")
+                        target_version_id = row[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO approvals (id, image_id, alt_text_version_id, reviewer_id, approved_at)
+                    VALUES (%s, %s, %s, %s, %s);
+                    """,
+                    (approval_id, image_id, target_version_id, reviewer_id or "editor", now)
+                )
+
+                cur.execute(
+                    "UPDATE image_assets SET processing_status = 'approved', updated_at = %s WHERE id = %s;",
+                    (now, image_id)
+                )
+
+        return self.get_approval(approval_id)
+
     def create_approval(
         self,
         approval_id: str,

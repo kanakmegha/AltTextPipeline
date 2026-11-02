@@ -86,6 +86,50 @@
       </div>
     </div>
 
+    <!-- Progressive Extraction Status Banner (Visible while background extraction is active) -->
+    <section id="extractionProgressBanner" class="extraction-progress-banner" aria-label="Document Extraction Progress" role="region" aria-live="polite" style="display: none;">
+      <div class="extraction-banner-header">
+        <div class="extraction-banner-title-group">
+          <span id="extractionSpinner" class="extraction-spinner" aria-hidden="true">⏳</span>
+          <div>
+            <h3 id="extractionProgressTitle" class="extraction-progress-title">Extracting images from your document…</h3>
+            <p id="extractionProgressSubtitle" class="extraction-progress-subtitle">Extraction is progressing in the background. You can begin reviewing images as they arrive.</p>
+          </div>
+        </div>
+        <div class="extraction-banner-actions">
+          <span id="extractionProgressPercent" class="extraction-progress-percent">0%</span>
+          <button id="extractionDismissBtn" class="btn-dismiss-banner" type="button" aria-label="Dismiss extraction status" title="Dismiss" style="display: none;">✕</button>
+        </div>
+      </div>
+
+      <div class="extraction-progress-bar-bg" role="progressbar" id="extractionProgressBar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+        <div id="extractionProgressBarFill" class="extraction-progress-bar-fill" style="width: 0%;"></div>
+      </div>
+
+      <div class="extraction-progress-meta-row">
+        <div class="extraction-meta-item">
+          <span class="extraction-meta-label">Pages processed:</span>
+          <span id="extractionPagesText" class="extraction-meta-value">0 / 0</span>
+        </div>
+        <div class="extraction-meta-item">
+          <span class="extraction-meta-label">Batches:</span>
+          <span id="extractionBatchesText" class="extraction-meta-value">0 / 0</span>
+        </div>
+        <div class="extraction-meta-item">
+          <span class="extraction-meta-label">Images extracted:</span>
+          <span id="extractionImagesText" class="extraction-meta-value">0</span>
+        </div>
+        <div id="extractionNoticeItem" class="extraction-notice-wrap">
+          <span id="extractionNoticeText" class="extraction-notice-text">Additional images will appear here automatically as extraction continues.</span>
+        </div>
+      </div>
+
+      <!-- Failure / Retry Box (Conditional) -->
+      <div id="extractionErrorRow" class="extraction-error-row" style="display: none;">
+        <span id="extractionErrorText" class="extraction-error-text">Extraction encountered an issue.</span>
+      </div>
+    </section>
+
     <!-- Review & Edit Main Workspace (Direct individual-image workflow) -->
     <main id="reviewWorkspaceSection" class="review-workspace" aria-label="Client-Friendly Review Workspace">
       <!-- Top Review Header Card with Progress and Nav Actions -->
@@ -493,7 +537,7 @@
   </div>
 
   <script src="/static/api-client.js"></script>
-
+  <script src="/static/extraction-progress.js"></script>
   <script src="/static/review.js"></script>
 </body>
 </html>

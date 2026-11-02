@@ -1081,20 +1081,38 @@ def create_app(
 
         # Get latest job for this project
         jobs = repo.list_project_jobs(project_id)
-        latest_job = jobs[0] if jobs else None
+        latest_job = jobs[-1] if jobs else None
 
+        batches = repo.list_job_batches(latest_job["id"]) if latest_job else []
         images = repo.list_project_images(project_id)
         groups = repo.list_project_groups(project_id)
+
+        failed_batches = sum(1 for batch in batches if batch["status"] == "failed")
+        completed_batches = latest_job.get("completed_batches", 0) if latest_job else 0
+        total_batches = latest_job.get("total_batches", 0) if latest_job else 0
+        completed_pages = latest_job.get("completed_pages", 0) if latest_job else 0
+        total_pages = latest_job.get("total_pages", 0) if latest_job else 0
+        pages_to_process = latest_job.get("pages_to_process", 0) if latest_job else total_pages
+        job_status = latest_job.get("status") if latest_job else None
 
         return {
             "project_id": project_id,
             "status": project.get("status"),
+            "project_status": project.get("status"),
             "cleanup_status": project.get("cleanup_status"),
+            "job_id": latest_job.get("id") if latest_job else None,
+            "job_status": job_status,
+            "total_pages": total_pages,
+            "pages_to_process": pages_to_process,
+            "completed_pages": completed_pages,
+            "total_batches": total_batches,
+            "completed_batches": completed_batches,
+            "failed_batches": failed_batches,
             "total_images": len(images),
-            "groups": len(groups),
-            "job": latest_job,
-            "images": images,
             "groups": groups,
+            "job": latest_job,
+            "batches": batches,
+            "images": images,
             "error": latest_job.get("error_message") if latest_job and latest_job.get("status") == "failed" else None,
         }
 
@@ -1521,46 +1539,22 @@ def create_app(
         if not asset or asset["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="Image asset not found")
 
-        version_id = payload.version_id if payload and payload.version_id else None
-
-        if payload and payload.alt_text:
-            latest = repo.get_latest_version(image_id)
-            if not latest or latest["text"].strip() != payload.alt_text.strip():
-                versions = repo.list_image_versions(image_id)
-                next_ver = len(versions) + 1
-                v_id = str(uuid.uuid4())
-                repo.create_alt_text_version(
-                    version_id=v_id,
-                    image_id=image_id,
-                    version_number=next_ver,
-                    text=payload.alt_text.strip(),
-                    revision_instruction="Approved client edit",
-                    provider="manual",
-                    model="human_editor",
-                    language="en-GB",
-                    status="success",
-                )
-                version_id = v_id
-
-        if not version_id:
-            latest = repo.get_latest_version(image_id)
-            if not latest:
-                raise HTTPException(status_code=400, detail="Cannot approve: No draft version exists for this image.")
-            version_id = latest["id"]
-
         approval_id = str(uuid.uuid4())
         if auth.is_auth_enabled():
             reviewer_id = _resolve_actor_id(request, "editor")
         else:
             reviewer_id = (payload.reviewer_id if payload and payload.reviewer_id else None) or "editor"
 
-        approval = repo.create_approval(
-            approval_id=approval_id,
-            image_id=image_id,
-            alt_text_version_id=version_id,
-            reviewer_id=reviewer_id
-        )
-        repo.update_image_status(image_id, "approved")
+        try:
+            approval = repo.approve_alt_text(
+                approval_id=approval_id,
+                image_id=image_id,
+                reviewer_id=reviewer_id,
+                alt_text=payload.alt_text if payload else None,
+                version_id=payload.version_id if payload else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
         raw_reasons = asset.get("review_reasons")
         if isinstance(raw_reasons, list):
