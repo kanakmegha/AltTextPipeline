@@ -8,10 +8,10 @@
     "test:frontend": "node --test tests/*.test.mjs"
   },
   "dependencies": {
+    "@types/node": "^22.20.5",
     "@vercel/blob": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22.20.5",
     "esbuild": "^0.25.0",
     "typescript": "^7.0.2"
   },
