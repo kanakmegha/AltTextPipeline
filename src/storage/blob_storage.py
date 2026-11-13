@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence
 
 from vercel.blob import sync as blob
 from vercel.blob.errors import BlobError, BlobNotFoundError
@@ -29,6 +29,8 @@ from .base_storage import (
     StorageError,
     PathTraversalError,
     CleanupBlockedError,
+    DeletionResult,
+    validate_storage_key,
     calculate_sha256,
 )
 
@@ -100,42 +102,12 @@ class BlobStorage(BaseStorage):
         """
         Create a project-isolated Vercel Blob pathname.
 
-        Supports both relative keys and keys that already
-        contain the project ID prefix.
+        Validates project_id, path traversal, and cross-project boundaries.
+        Supports both relative keys and keys that already contain the project ID prefix.
         """
-
         project_id = cls._validate_project_id(project_id)
-
-        if not isinstance(relative_key, str) or not relative_key.strip():
-            raise PathTraversalError(
-                "Storage key must be a non-empty string."
-            )
-
-        normalized = relative_key.replace("\\", "/")
-
-        if normalized.startswith("/"):
-            raise PathTraversalError(
-                "Absolute storage paths are forbidden."
-            )
-
-        parts = normalized.split("/")
-
-        if any(part in ("", ".", "..") for part in parts):
-            raise PathTraversalError(
-                f"Unsafe storage key: {relative_key}"
-            )
-
-        # Already-prefixed database key: do not add the project ID again.
-        if parts[0] == project_id:
-            if len(parts) < 2:
-                raise PathTraversalError(
-                    "Invalid project storage key."
-                )
-
-            return PurePosixPath(*parts).as_posix()
-
-        # Relative key: add the project ID exactly once.
-        return PurePosixPath(project_id, *parts).as_posix()
+        norm_key = validate_storage_key(project_id, relative_key)
+        return PurePosixPath(project_id, *norm_key.split("/")).as_posix()
 
 
 
@@ -435,6 +407,107 @@ class BlobStorage(BaseStorage):
             raise FileNotFoundError(f"Storage asset not found: {relative_key}") from exc
         except Exception as exc:
             self._sdk_error("metadata check", key, exc)
+
+    def delete_object(self, project_id: str, relative_key: str) -> DeletionResult:
+        """
+        Delete a single object identified by relative_key within project_id in Vercel Blob.
+        Idempotent: if the object does not exist, it is recorded in result.missing.
+        """
+        result = DeletionResult()
+        safe_key = self._safe_key(project_id, relative_key)
+
+        try:
+            if not self.exists(project_id, relative_key):
+                result.missing.append(relative_key)
+                return result
+
+            blob.delete_blob(safe_key)
+            result.deleted.append(relative_key)
+        except BlobNotFoundError:
+            result.missing.append(relative_key)
+        except Exception as exc:
+            logger.warning("Failed to delete blob %s: %s", safe_key, exc)
+            result.failed[relative_key] = str(exc)
+
+        return result
+
+    def delete_objects(
+        self, project_id: str, relative_keys: Sequence[str]
+    ) -> DeletionResult:
+        """
+        Delete multiple objects within project_id in Vercel Blob.
+        Idempotent: missing objects are listed in result.missing.
+        Failed deletions are recorded in result.failed with error details.
+        """
+        result = DeletionResult()
+        if not relative_keys:
+            return result
+
+        # Step 1: Pre-validate all keys (raises PathTraversalError on invalid/cross-project keys)
+        key_map = {}
+        for rk in relative_keys:
+            safe_key = self._safe_key(project_id, rk)
+            key_map[rk] = safe_key
+
+        # Step 2: Query existing blobs under this project to distinguish existing vs missing
+        prefix = f"{self._validate_project_id(project_id)}/"
+        existing_blobs = None
+        try:
+            existing_blobs = {
+                item.pathname: item
+                for item in blob.query_blobs(prefix=prefix, page_size=1000)
+            }
+        except Exception as exc:
+            logger.warning(
+                "query_blobs failed for prefix %s: %s; falling back to per-item existence check",
+                prefix,
+                exc,
+            )
+
+        to_delete = []
+        for rk, sk in key_map.items():
+            if existing_blobs is not None:
+                if sk in existing_blobs:
+                    to_delete.append((rk, sk))
+                else:
+                    result.missing.append(rk)
+            else:
+                try:
+                    if self.exists(project_id, rk):
+                        to_delete.append((rk, sk))
+                    else:
+                        result.missing.append(rk)
+                except Exception as exc:
+                    result.failed[rk] = f"Existence check failed: {exc}"
+
+        if not to_delete:
+            return result
+
+        # Step 3: Batch delete objects in chunks of up to 500 (SDK supports up to 1000)
+        chunk_size = 500
+        for i in range(0, len(to_delete), chunk_size):
+            chunk = to_delete[i:i + chunk_size]
+            targets = [sk for _, sk in chunk]
+            try:
+                blob.delete_blob(targets)
+                for rk, _ in chunk:
+                    result.deleted.append(rk)
+            except Exception as batch_exc:
+                logger.warning(
+                    "Batch deletion failed for %d objects: %s; falling back to individual deletion",
+                    len(chunk),
+                    batch_exc,
+                )
+                for rk, sk in chunk:
+                    try:
+                        blob.delete_blob(sk)
+                        result.deleted.append(rk)
+                    except BlobNotFoundError:
+                        result.missing.append(rk)
+                    except Exception as indiv_exc:
+                        result.failed[rk] = str(indiv_exc)
+
+        return result
 
     def cleanup_project(
         self,

@@ -96,16 +96,24 @@ def mock_blob(monkeypatch):
                     etag=item["etag"],
                 )
 
-    def mock_delete(pathname, *, if_match=None):
-        calls["delete"].append((pathname, if_match))
+    def mock_delete(url_or_pathname, *, if_match=None):
+        calls["delete"].append((url_or_pathname, if_match))
 
-        if pathname not in objects:
-            raise BlobNotFoundError()
+        if isinstance(url_or_pathname, str):
+            targets = [url_or_pathname]
+        else:
+            targets = list(url_or_pathname)
 
-        if if_match and objects[pathname]["etag"] != if_match:
-            raise RuntimeError("ETag mismatch")
+        for target in targets:
+            if target not in objects:
+                if len(targets) == 1:
+                    raise BlobNotFoundError()
+                continue
 
-        del objects[pathname]
+            if if_match and objects[target]["etag"] != if_match:
+                raise RuntimeError("ETag mismatch")
+
+            del objects[target]
 
     monkeypatch.setattr(
         "src.storage.blob_storage.blob.put_blob", mock_put

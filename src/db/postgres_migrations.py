@@ -361,4 +361,36 @@ def apply_migrations(db: PostgresConnection) -> int:
         _record_version(db, 10)
         current_version = 10
 
+    # Migration 11: Durable Cleanup Operations Manifest Table
+    if current_version < 11:
+        with db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cleanup_operations (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                        cleanup_mode TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        target_blob_keys TEXT NOT NULL,
+                        deleted_blob_keys TEXT NOT NULL DEFAULT '[]',
+                        missing_blob_keys TEXT NOT NULL DEFAULT '[]',
+                        failed_blob_keys TEXT NOT NULL DEFAULT '{}',
+                        db_records_summary TEXT NOT NULL DEFAULT '{}',
+                        audit_summary TEXT NOT NULL DEFAULT '[]',
+                        error_message TEXT,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        started_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cleanup_ops_project ON cleanup_operations(project_id, status);"
+                )
+        _record_version(db, 11)
+        current_version = 11
+
     return current_version

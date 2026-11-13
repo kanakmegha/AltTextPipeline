@@ -12,8 +12,10 @@ be readable by project B.
 
 import hashlib
 import os
-from pathlib import Path
-from typing import Tuple, Optional, Any
+import re
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Tuple, Optional, Any, List, Dict, Sequence
 
 
 class StorageError(Exception):
@@ -29,6 +31,87 @@ class PathTraversalError(StorageError):
 class CleanupBlockedError(StorageError):
     """Raised when a cleanup is attempted on active or unverified project assets."""
     pass
+
+
+STANDARD_STORAGE_DIRS = frozenset({"source", "images", "artifacts", "exports"})
+
+
+def validate_storage_key(project_id: str, relative_key: str) -> str:
+    """
+    Validates that relative_key is safe and belongs strictly to project_id.
+
+    Returns the normalized relative key within the project (e.g. 'images/img.png').
+    Raises PathTraversalError if unsafe, cross-project, or attempting directory traversal.
+    """
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise PathTraversalError("Project ID must be a non-empty string.")
+
+    project_id = project_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", project_id):
+        raise PathTraversalError(f"Invalid project ID: {project_id}")
+
+    if not isinstance(relative_key, str) or not relative_key.strip():
+        raise PathTraversalError("Storage key must be a non-empty string.")
+
+    normalized = relative_key.replace("\\", "/").strip()
+    if normalized.startswith("/"):
+        raise PathTraversalError(f"Absolute storage paths are forbidden: {relative_key}")
+
+    parts = normalized.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise PathTraversalError(f"Unsafe storage key: {relative_key}")
+
+    # If key starts with this project's ID:
+    if parts[0] == project_id:
+        if len(parts) < 2:
+            raise PathTraversalError(
+                f"Storage key cannot target the project root directory: {relative_key}"
+            )
+        parts = parts[1:]
+
+    # Key must now target one of the standard project subdirectories
+    if not parts or parts[0] not in STANDARD_STORAGE_DIRS:
+        raise PathTraversalError(
+            f"Cross-project access forbidden or invalid root directory: key '{relative_key}' does not belong to project '{project_id}'"
+        )
+
+    return "/".join(parts)
+
+
+@dataclass
+class DeletionResult:
+    """
+    Structured outcome of an object deletion operation.
+    - deleted: list of relative keys that existed and were successfully removed.
+    - missing: list of relative keys not found (already deleted or never created); treated idempotently as success.
+    - failed: mapping of relative key -> error message for keys that encountered an error during deletion.
+    """
+    deleted: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+    failed: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_success(self) -> bool:
+        """True if no objects failed deletion."""
+        return len(self.failed) == 0
+
+    @property
+    def has_failures(self) -> bool:
+        """True if any objects failed deletion."""
+        return len(self.failed) > 0
+
+    @property
+    def total_processed(self) -> int:
+        return len(self.deleted) + len(self.missing) + len(self.failed)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "deleted": list(self.deleted),
+            "missing": list(self.missing),
+            "failed": dict(self.failed),
+            "is_success": self.is_success,
+            "total_processed": self.total_processed,
+        }
 
 
 def calculate_sha256(data_bytes: bytes) -> str:
@@ -110,4 +193,20 @@ class BaseStorage:
 
     def exists(self, project_id: str, relative_key: str) -> bool:
         """Check whether a stored object exists."""
+        raise NotImplementedError
+
+    def delete_object(self, project_id: str, relative_key: str) -> DeletionResult:
+        """
+        Delete a single object identified by relative_key within project_id.
+        Idempotent: if the object does not exist, it is recorded in result.missing.
+        Validates project_id and key to prevent cross-project or path traversal access.
+        """
+        raise NotImplementedError
+
+    def delete_objects(self, project_id: str, relative_keys: Sequence[str]) -> DeletionResult:
+        """
+        Delete multiple objects identified by relative_keys within project_id.
+        Idempotent: missing objects are listed in result.missing.
+        Failed deletions are recorded in result.failed with error details.
+        """
         raise NotImplementedError
