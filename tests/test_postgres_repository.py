@@ -556,3 +556,382 @@ def test_postgres_worker_lease_fences_batch_and_terminal_writes(repo):
     assert repo.set_job_batch_status(job_id, 1, "completed", worker_id="worker-a") is False
     assert repo.get_job(job_id)["status"] == "completed"
     assert repo.get_job(job_id)["lease_updated_at"] == completed["lease_updated_at"]
+
+
+def test_postgres_cleanup_preview_and_prepare_both_modes(repo):
+    from src.storage.base_storage import CleanupBlockedError
+
+    # Mode A: extracted
+    pid_a = f"pg_clean_a_{uuid.uuid4().hex[:8]}"
+    repo.create_project(pid_a, "PG Cleanup Mode A", "doc_a.pdf", "source/doc_a.pdf", "chk_a")
+    repo.create_image_asset(
+        image_id="img_a_1",
+        project_id=pid_a,
+        page_number=1,
+        xref=1,
+        placement_index=1,
+        bbox={"x0": 0.0, "y0": 0.0, "x1": 100.0, "y1": 100.0},
+        original_caption="Fig 1",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="p1_1.png",
+        file_storage_key="images/p1_1.png",
+        file_checksum="chk_img_a",
+        image_format="png",
+    )
+    exp_a = f"exp_a_{uuid.uuid4().hex[:8]}"
+    repo.create_export(exp_a, pid_a, "docx", "exports/doc_a.docx", "chk_exp_a")
+    repo.update_export_status(exp_a, "verified")
+
+    preview_a = repo.preview_project_cleanup(pid_a, "extracted")
+    assert preview_a["project_id"] == pid_a
+    assert preview_a["cleanup_mode"] == "extracted"
+    assert preview_a["can_cleanup"] is True
+    assert preview_a["target_blob_keys"] == ["images/p1_1.png"]
+    assert "exports/doc_a.docx" in preview_a["preserved_assets"]["export_storage_keys"]
+    assert preview_a["preserved_assets"]["source_storage_key"] == "source/doc_a.pdf"
+
+    op_a = repo.prepare_cleanup_operation(pid_a, "extracted")
+    assert op_a["status"] == "pending"
+    assert op_a["cleanup_mode"] == "extracted"
+    assert op_a["target_blob_keys"] == ["images/p1_1.png"]
+    assert repo.get_project(pid_a)["cleanup_status"] == "cleaning"
+
+    # Concurrent prepare & job/export creation must be blocked while cleaning
+    with pytest.raises(CleanupBlockedError):
+        repo.prepare_cleanup_operation(pid_a, "extracted")
+    with pytest.raises(CleanupBlockedError):
+        repo.create_job(str(uuid.uuid4()), pid_a, "extraction")
+    with pytest.raises(CleanupBlockedError):
+        repo.create_export(str(uuid.uuid4()), pid_a, "docx", "exports/blocked.docx", "chk_blocked")
+
+    # Mode B: all_source
+    pid_b = f"pg_clean_b_{uuid.uuid4().hex[:8]}"
+    repo.create_project(pid_b, "PG Cleanup Mode B", "doc_b.pdf", "source/doc_b.pdf", "chk_b")
+    repo.create_image_asset(
+        image_id="img_b_1",
+        project_id=pid_b,
+        page_number=1,
+        xref=1,
+        placement_index=1,
+        bbox={"x0": 0.0, "y0": 0.0, "x1": 100.0, "y1": 100.0},
+        original_caption="Fig 1",
+        caption_position="below",
+        needs_caption_review=False,
+        review_reasons=[],
+        suggested_filename="p1_1.png",
+        file_storage_key="images/p1_1.png",
+        file_checksum="chk_img_a",
+        image_format="png",
+    )
+    exp_b = f"exp_b_{uuid.uuid4().hex[:8]}"
+    repo.create_export(exp_b, pid_b, "docx", "exports/doc_b.docx", "chk_exp_b")
+    repo.update_export_status(exp_b, "verified")
+
+    preview_b = repo.preview_project_cleanup(pid_b, "all_source")
+    assert preview_b["project_id"] == pid_b
+    assert preview_b["cleanup_mode"] == "all_source"
+    assert preview_b["can_cleanup"] is True
+    assert preview_b["target_blob_keys"] == ["images/p1_1.png", "source/doc_b.pdf"]
+    assert "exports/doc_b.docx" in preview_b["preserved_assets"]["export_storage_keys"]
+
+    op_b = repo.prepare_cleanup_operation(pid_b, "all_source")
+    assert op_b["status"] == "pending"
+    assert op_b["cleanup_mode"] == "all_source"
+    assert op_b["target_blob_keys"] == ["images/p1_1.png", "source/doc_b.pdf"]
+    assert repo.get_project(pid_b)["cleanup_status"] == "cleaning"
+
+
+def test_postgres_orphan_upload_recovery_and_stale_claims(repo):
+    from datetime import datetime, timedelta, timezone
+    from concurrent.futures import ThreadPoolExecutor
+    from src.storage.base_storage import DeletionResult
+
+    past_exp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    future_exp = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+
+    k_expired = f"uk_exp_{uuid.uuid4().hex[:8]}"
+    k_fresh_claim = f"uk_fresh_{uuid.uuid4().hex[:8]}"
+    k_stale_claim = f"uk_stale_{uuid.uuid4().hex[:8]}"
+    k_active = f"uk_act_{uuid.uuid4().hex[:8]}"
+    k_finalizing = f"uk_fin_{uuid.uuid4().hex[:8]}"
+
+    repo.create_upload_key(
+        upload_key=k_expired,
+        content_type="application/pdf",
+        expires_at=past_exp,
+        filename="expired.pdf",
+        expected_size=1024,
+        blob_key="proj_exp/source/expired.pdf",
+    )
+    repo.create_upload_key(
+        upload_key=k_fresh_claim,
+        content_type="application/pdf",
+        expires_at=past_exp,
+        filename="fresh.pdf",
+        expected_size=1024,
+        blob_key="proj_fresh/source/fresh.pdf",
+    )
+    repo.create_upload_key(
+        upload_key=k_stale_claim,
+        content_type="application/pdf",
+        expires_at=past_exp,
+        filename="stale.pdf",
+        expected_size=1024,
+        blob_key="proj_stale/source/stale.pdf",
+    )
+    repo.create_upload_key(
+        upload_key=k_active,
+        content_type="application/pdf",
+        expires_at=future_exp,
+        filename="active.pdf",
+        expected_size=1024,
+        blob_key="proj_act/source/active.pdf",
+    )
+    repo.create_upload_key(
+        upload_key=k_finalizing,
+        content_type="application/pdf",
+        expires_at=past_exp,
+        filename="fin.pdf",
+        expected_size=1024,
+        blob_key="proj_fin/source/fin.pdf",
+    )
+    repo.update_upload_key(k_finalizing, status="finalizing")
+
+    # Claim k_fresh_claim now (fresh claim must not be stolen)
+    claimed_fresh = repo.claim_orphan_upload_cleanup(k_fresh_claim, claim_ttl_seconds=300)
+    assert claimed_fresh is not None
+    assert claimed_fresh["status"] == "cleaning_orphan"
+    assert isinstance(claimed_fresh["expires_at"], str)
+    assert isinstance(claimed_fresh["created_at"], str)
+    assert isinstance(claimed_fresh["updated_at"], str)
+    # Second claim on fresh row must fail
+    assert repo.claim_orphan_upload_cleanup(k_fresh_claim, claim_ttl_seconds=300) is None
+
+    # Simulate crashed worker holding k_stale_claim for 10 minutes
+    assert repo.claim_orphan_upload_cleanup(k_stale_claim, claim_ttl_seconds=300) is not None
+    stale_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE upload_keys SET updated_at = %s WHERE upload_key = %s;", (stale_ts, k_stale_claim))
+
+    eligible = {r["upload_key"]: r for r in repo.list_expired_incomplete_uploads(limit=50, claim_ttl_seconds=300)}
+    assert k_expired in eligible
+    assert k_stale_claim in eligible
+    assert k_fresh_claim not in eligible
+    assert k_active not in eligible
+    assert k_finalizing not in eligible
+    assert isinstance(eligible[k_expired]["expires_at"], str)
+
+    # Ineligible rows cannot be claimed
+    assert repo.claim_orphan_upload_cleanup(k_active, claim_ttl_seconds=300) is None
+    assert repo.claim_orphan_upload_cleanup(k_finalizing, claim_ttl_seconds=300) is None
+
+    # Concurrent workers racing to reclaim k_stale_claim: exactly one wins
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: repo.claim_orphan_upload_cleanup(k_stale_claim, claim_ttl_seconds=300), range(4)))
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1
+    assert winners[0]["status"] == "cleaning_orphan"
+
+    # Reset k_stale_claim to stale again and verify full recover_orphan_uploads idempotency
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE upload_keys SET updated_at = %s WHERE upload_key = %s;", (stale_ts, k_stale_claim))
+
+    deleted_calls = []
+
+    class DummyStorage:
+        def delete_object(self, project_id, relative_key):
+            deleted_calls.append((project_id, relative_key))
+            return DeletionResult(deleted=[f"{project_id}/{relative_key}"])
+
+    rec = repo.recover_orphan_uploads(DummyStorage(), limit=50, claim_ttl_seconds=300)
+    assert k_expired in rec["cleaned"]
+    assert k_stale_claim in rec["cleaned"]
+    assert k_fresh_claim not in rec["cleaned"]
+    assert ("proj_exp", "source/expired.pdf") in deleted_calls
+    assert ("proj_stale", "source/stale.pdf") in deleted_calls
+    assert repo.get_upload_key(k_expired)["status"] == "cleaned_orphan"
+    assert repo.get_upload_key(k_stale_claim)["status"] == "cleaned_orphan"
+    assert repo.get_upload_key(k_fresh_claim)["status"] == "cleaning_orphan"
+
+
+def test_postgres_permanent_project_deletion_and_retry(repo):
+    from datetime import datetime, timedelta, timezone
+    from src.storage.base_storage import CleanupBlockedError, DeletionResult, StorageError
+
+    pid_del = f"pg_del_{uuid.uuid4().hex[:8]}"
+    pid_keep = f"pg_keep_{uuid.uuid4().hex[:8]}"
+    for pid, name in [(pid_del, "PG Delete Me"), (pid_keep, "PG Keep Me")]:
+        repo.create_project(pid, name, f"{pid}.pdf", f"source/{pid}.pdf", "chk")
+        repo.create_image_asset(
+            image_id=f"img_{pid}", project_id=pid, page_number=1, xref=1, placement_index=1,
+            bbox={"x0": 0.0, "y0": 0.0, "x1": 10.0, "y1": 10.0}, original_caption="Cap",
+            caption_position="below", needs_caption_review=False, review_reasons=[],
+            suggested_filename="f1.png", file_storage_key="images/f1.png",
+            file_checksum="chk_img", image_format="png",
+        )
+        repo.create_alt_text_version(
+            version_id=f"ver_{pid}",
+            image_id=f"img_{pid}",
+            version_number=1,
+            text="Alt",
+            provider="openai",
+            model="gpt-4o",
+        )
+        repo.create_approval(f"app_{pid}", f"img_{pid}", f"ver_{pid}", "approved")
+        repo.create_export(f"exp_{pid}", pid, "docx", "exports/out.docx", "chk_exp")
+        repo.update_export_status(f"exp_{pid}", "verified")
+        repo.record_audit_event(f"aud_{pid}", pid, "approved", "image", f"img_{pid}", "user", "{}")
+        repo.record_ai_usage(f"ai_{pid}", pid, f"img_{pid}", "openai", "gpt-4o", 5, 5, 0.01)
+        exp_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        repo.create_upload_key(f"uk_{pid}", "application/pdf", exp_at, blob_key=f"{pid}/source/{pid}.pdf")
+        repo.update_upload_key(f"uk_{pid}", status="completed", project_id=pid)
+
+    class FlakyStorage:
+        def __init__(self):
+            self.calls = 0
+
+        def list_project_keys(self, project_id):
+            return ["artifacts/extra.pdf"] if project_id == pid_del else []
+
+        def delete_objects(self, project_id, keys):
+            self.calls += 1
+            if self.calls == 1:
+                return DeletionResult(deleted=list(keys[:-1]), failed={keys[-1]: "Simulated Blob 503"})
+            return DeletionResult(deleted=list(keys))
+
+    storage = FlakyStorage()
+    preview = repo.preview_project_deletion(pid_del, storage=storage)
+    assert preview["can_delete"] is True
+    assert "exports/out.docx" in preview["target_blob_keys"]
+    assert "artifacts/extra.pdf" in preview["target_blob_keys"]
+
+    with pytest.raises(StorageError):
+        repo.execute_project_deletion(pid_del, storage=storage)
+
+    # Project & records remain while failed; job/cleanup fenced
+    assert repo.get_project(pid_del) is not None
+    with pytest.raises(CleanupBlockedError):
+        repo.create_job(str(uuid.uuid4()), pid_del, "extraction")
+    op = repo.get_latest_cleanup_operation(pid_del)
+    assert op is not None and op["status"] == "failed"
+
+    # Retry succeeds and purges all records for pid_del while keeping pid_keep intact
+    done = repo.retry_project_deletion(op["id"], storage=storage)
+    assert done["status"] == "completed"
+    assert repo.get_project(pid_del) is None
+    assert repo.get_upload_key(f"uk_{pid_del}") is None
+    assert repo.get_project(pid_keep) is not None
+    assert repo.get_export(f"exp_{pid_keep}") is not None
+
+
+def test_postgres_deletion_crash_recovery_lease_fencing_and_partial_db(repo, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import threading
+    from src.storage.base_storage import CleanupBlockedError, DeletionResult, StorageError
+
+    monkeypatch.setenv("DELETION_LEASE_SECONDS", "300")
+    pid_del = f"pg_crash_{uuid.uuid4().hex[:8]}"
+    pid_keep = f"pg_safe_{uuid.uuid4().hex[:8]}"
+    for pid, name in [(pid_del, "PG Crash"), (pid_keep, "PG Safe")]:
+        repo.create_project(pid, name, f"{pid}.pdf", f"source/{pid}.pdf", "chk")
+        repo.create_image_asset(
+            image_id=f"img_{pid}", project_id=pid, page_number=1, xref=1, placement_index=1,
+            bbox={"x0": 0.0, "y0": 0.0, "x1": 10.0, "y1": 10.0}, original_caption="Cap",
+            caption_position="below", needs_caption_review=False, review_reasons=[],
+            suggested_filename="f1.png", file_storage_key="images/f1.png",
+            file_checksum="chk_img", image_format="png",
+        )
+        repo.create_alt_text_version(
+            version_id=f"ver_{pid}", image_id=f"img_{pid}", version_number=1, text="Alt",
+        )
+        repo.create_approval(f"app_{pid}", f"img_{pid}", f"ver_{pid}", "approved")
+        repo.create_export(f"exp_{pid}", pid, "docx", "exports/out.docx", "chk_exp")
+        repo.update_export_status(f"exp_{pid}", "verified")
+
+    class CrashThenRecoverStorage:
+        def __init__(self):
+            self.mode = "boom"
+
+        def list_project_keys(self, project_id):
+            return []
+
+        def delete_objects(self, project_id, keys):
+            if self.mode == "boom":
+                raise RuntimeError("Unexpected Postgres Blob SDK error")
+            return DeletionResult(deleted=list(keys))
+
+    storage = CrashThenRecoverStorage()
+    op = repo.prepare_project_deletion(pid_del, storage=storage)
+    op_id = op["id"]
+
+    # 1. Unexpected Blob exception leaves operation recoverable in failed state
+    with pytest.raises(StorageError):
+        repo._run_project_deletion_operation(op, storage)
+    failed_op = repo.get_cleanup_operation(op_id)
+    assert failed_op["status"] == "failed"
+    assert "Unexpected Postgres Blob SDK error" in (failed_op["error_message"] or "")
+
+    # 2. Fresh lease blocks reclaim; stale lease allows atomic reclaim
+    fresh_exp = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE cleanup_operations SET status = 'deleting_blobs', lease_token = 'live-pg', lease_expires_at = %s WHERE id = %s;",
+                (fresh_exp, op_id),
+            )
+    with pytest.raises(CleanupBlockedError):
+        repo.retry_project_deletion(op_id, storage=storage)
+
+    stale_exp = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE cleanup_operations SET lease_expires_at = %s WHERE id = %s;", (stale_exp, op_id))
+    prev = repo.preview_project_deletion(pid_del, storage=storage)
+    assert prev["existing_operation"]["id"] == op_id
+    assert prev["can_resume"] is True
+
+    # 3. Concurrent reclaimers: only one wins
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _compete():
+        barrier.wait()
+        try:
+            _, tok = repo._claim_project_deletion_operation(op_id)
+            results.append(("ok", tok))
+        except CleanupBlockedError:
+            results.append(("blocked", None))
+
+    t1 = threading.Thread(target=_compete)
+    t2 = threading.Thread(target=_compete)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert sorted(r[0] for r in results) == ["blocked", "ok"]
+    winning_tok = next(tok for status, tok in results if status == "ok")
+
+    # Old worker fenced out
+    with pytest.raises(CleanupBlockedError):
+        repo._renew_deletion_lease(op_id, "live-pg")
+    assert repo._record_deletion_failure(op_id, "live-pg", [], [], {}, "stale") is False
+    assert winning_tok != "live-pg"
+
+    # 4. Crash during deleting_records with partial DB deletion -> retry completes cleanly
+    storage.mode = "ok"
+    with repo.db.session() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM approvals WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);", (pid_del,))
+            cur.execute(
+                "UPDATE cleanup_operations SET status = 'deleting_records', deleted_blob_keys = target_blob_keys, lease_expires_at = %s WHERE id = %s;",
+                (stale_exp, op_id),
+            )
+    done = repo.retry_project_deletion(op_id, storage=storage)
+    assert done["status"] == "completed"
+    assert repo.get_project(pid_del) is None
+    assert repo.get_project(pid_keep) is not None
+    assert repo.get_export(f"exp_{pid_keep}") is not None

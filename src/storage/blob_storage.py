@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Optional, Tuple, Sequence
+from typing import List, Optional, Tuple, Sequence
 
 from vercel.blob import sync as blob
 from vercel.blob.errors import BlobError, BlobNotFoundError
@@ -30,13 +30,16 @@ from .base_storage import (
     PathTraversalError,
     CleanupBlockedError,
     DeletionResult,
+    DEFAULT_MAX_UPLOAD_MB,
+    get_max_upload_bytes,
     validate_storage_key,
     calculate_sha256,
 )
 
 logger = logging.getLogger("alttext.storage.blob")
 
-MAX_OBJECT_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_OBJECT_BYTES = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
+MAX_OBJECT_BYTES = get_max_upload_bytes()
 # Chunk size for streaming uploads (64 KB)
 UPLOAD_CHUNK_SIZE = 65536
 
@@ -132,10 +135,11 @@ class BlobStorage(BaseStorage):
         if not data:
             raise StorageError(f"Empty bytes provided for {label}.")
 
-        if len(data) > MAX_OBJECT_BYTES:
+        max_bytes = get_max_upload_bytes()
+        if len(data) > max_bytes:
             raise StorageError(
                 f"{label} exceeds the maximum object size "
-                f"of {MAX_OBJECT_BYTES} bytes."
+                f"of {max_bytes} bytes."
             )
 
     @staticmethod
@@ -202,10 +206,11 @@ class BlobStorage(BaseStorage):
             if total_size == 0:
                 raise StorageError(f"Empty file provided for upload: {key}")
 
-            if total_size > MAX_OBJECT_BYTES:
+            max_bytes = get_max_upload_bytes()
+            if total_size > max_bytes:
                 raise StorageError(
                     f"File exceeds the maximum object size "
-                    f"({total_size} bytes > {MAX_OBJECT_BYTES} bytes)."
+                    f"({total_size} bytes > {max_bytes} bytes)."
                 )
 
             # Now upload the file from disk. The SDK's put_blob accepts
@@ -380,6 +385,47 @@ class BlobStorage(BaseStorage):
 
     read_file = read_bytes
 
+    def download_to_file(
+        self,
+        project_id: str,
+        relative_key: str,
+        destination_path: str,
+    ) -> Tuple[int, str]:
+        """
+        Stream a private Vercel Blob object directly to destination_path without
+        materializing the complete payload in memory. Cleans up incomplete files on error.
+        Returns: (byte_size, sha256_checksum)
+        """
+        key = self._safe_key(project_id, relative_key)
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        try:
+            with blob.stream_blob(key, access="private") as download:
+                with open(destination_path, "wb") as dst:
+                    for chunk in download:
+                        if not chunk:
+                            continue
+                        dst.write(chunk)
+                        hasher.update(chunk)
+                        total_bytes += len(chunk)
+            return total_bytes, hasher.hexdigest()
+        except BlobNotFoundError as exc:
+            if os.path.exists(destination_path):
+                try:
+                    os.unlink(destination_path)
+                except OSError:
+                    pass
+            raise FileNotFoundError(
+                f"Storage asset not found: {relative_key}"
+            ) from exc
+        except Exception as exc:
+            if os.path.exists(destination_path):
+                try:
+                    os.unlink(destination_path)
+                except OSError:
+                    pass
+            self._sdk_error("download", key, exc)
+
     def exists(
         self,
         project_id: str,
@@ -508,6 +554,25 @@ class BlobStorage(BaseStorage):
                         result.failed[rk] = str(indiv_exc)
 
         return result
+
+    def list_project_keys(self, project_id: str) -> List[str]:
+        """List all relative Blob keys under {project_id}/."""
+        project_id = self._validate_project_id(project_id)
+        prefix = f"{project_id}/"
+        keys: List[str] = []
+        try:
+            for item in blob.query_blobs(prefix=prefix, page_size=1000):
+                pathname = item.pathname
+                if not pathname.startswith(prefix):
+                    raise StorageError(
+                        f"Blob listing returned an object outside project {project_id}: {pathname}"
+                    )
+                rel = pathname[len(prefix):]
+                if rel:
+                    keys.append(rel)
+        except Exception as exc:
+            self._sdk_error("list", prefix, exc)
+        return sorted(set(keys))
 
     def cleanup_project(
         self,

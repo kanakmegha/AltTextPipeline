@@ -393,4 +393,17 @@ def apply_migrations(db: PostgresConnection) -> int:
         _record_version(db, 11)
         current_version = 11
 
+    # Migration 12: Lease token and expiration columns on cleanup_operations for crash recovery
+    if current_version < 12:
+        with db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE cleanup_operations ADD COLUMN IF NOT EXISTS lease_token TEXT;"
+                )
+                cur.execute(
+                    "ALTER TABLE cleanup_operations ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;"
+                )
+        _record_version(db, 12)
+        current_version = 12
+
     return current_version

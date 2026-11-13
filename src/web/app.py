@@ -44,6 +44,8 @@ from src.storage.filestore import (
 )
 from src.storage.base_storage import (
     BaseStorage,
+    StorageError,
+    get_max_upload_bytes,
     PathTraversalError as BasePathTraversalError,
     CleanupBlockedError as BaseCleanupBlockedError,
 )
@@ -142,6 +144,14 @@ class UploadAuthorizeResponse(BaseModel):
 class UploadCompleteRequest(BaseModel):
     project_name: Optional[str] = None
     pages: Optional[str] = None
+
+
+class ProjectCleanupRequest(BaseModel):
+    mode: Optional[str] = "extracted"
+
+
+class ProjectDeleteRequest(BaseModel):
+    confirm_project_name: str
 
 
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # retained for older client compatibility only
@@ -614,7 +624,11 @@ def create_app(
         }
 
     @app.get("/api/projects")
-    async def list_projects(request: Request):
+    async def list_projects(
+        request: Request,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ):
         user = getattr(request.state, "user", None)
         if auth.is_auth_enabled():
             owner_id = user["id"] if user else ""
@@ -622,7 +636,18 @@ def create_app(
         else:
             all_projects = repo.list_projects()
             projects = auth.filter_authorized_projects(all_projects, user)
-        return {"projects": projects}
+        total_count = len(projects)
+        safe_offset = max(0, offset)
+        if limit is not None and limit > 0:
+            page_projects = projects[safe_offset:safe_offset + limit]
+        else:
+            page_projects = projects[safe_offset:] if safe_offset else projects
+        return {
+            "projects": page_projects,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": safe_offset,
+        }
 
     @app.get("/api/projects/{project_id}")
     async def get_project(request: Request, project_id: str):
@@ -678,6 +703,149 @@ def create_app(
 
         repo.delete_project(project_id)
         return {"status": "deleted", "project_id": project_id}
+
+    @app.get("/api/projects/{project_id}/cleanup/preview")
+    async def preview_project_cleanup_endpoint(request: Request, project_id: str, mode: str = "extracted"):
+        _authorize_project_access(request, project_id)
+        try:
+            preview = repo.preview_project_cleanup(project_id, cleanup_mode=mode)
+            return {"project_id": project_id, "mode": mode, "preview": preview}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("Cleanup preview failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail=f"Failed to generate cleanup preview: {str(e)}")
+
+    @app.get("/api/projects/{project_id}/cleanup/summary")
+    async def get_project_storage_summary_endpoint(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
+        try:
+            summary = repo.get_project_storage_summary(project_id)
+            return {"project_id": project_id, "summary": summary}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("Storage summary failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail=f"Failed to retrieve storage summary: {str(e)}")
+
+    @app.post("/api/projects/{project_id}/cleanup/execute")
+    async def execute_project_cleanup_endpoint(request: Request, project_id: str, payload: Optional[ProjectCleanupRequest] = None):
+        _authorize_project_access(request, project_id)
+        mode = payload.mode if payload and payload.mode else "extracted"
+        try:
+            preview = repo.preview_project_cleanup(project_id, cleanup_mode=mode)
+            if not preview.get("can_cleanup"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Cleanup cannot proceed because one or more conditions are not met.",
+                        "blocking_reasons": preview.get("blocking_reasons", []),
+                    }
+                )
+            operation = repo.execute_project_cleanup(project_id, cleanup_mode=mode, storage=filestore)
+            return {"status": "ok", "operation": operation}
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (FileStoreCleanupBlockedError, BaseCleanupBlockedError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except StorageError as e:
+            latest_op = repo.get_latest_cleanup_operation(project_id)
+            if latest_op and latest_op.get("status") == "failed":
+                return {"status": "partial_failure", "operation": latest_op}
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:
+            logger.exception("Cleanup execution failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail=f"Failed to execute cleanup: {str(e)}")
+
+    @app.post("/api/cleanup/{operation_id}/retry")
+    async def retry_cleanup_operation_endpoint(request: Request, operation_id: str):
+        op = repo.get_cleanup_operation(operation_id)
+        if not op:
+            raise HTTPException(status_code=404, detail="Cleanup operation not found.")
+        _authorize_project_access(request, op["project_id"])
+        try:
+            operation = repo.retry_cleanup_operation(operation_id, storage=filestore)
+            return {"status": "ok", "operation": operation}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except StorageError as e:
+            latest_op = repo.get_cleanup_operation(operation_id)
+            if latest_op and latest_op.get("status") == "failed":
+                return {"status": "partial_failure", "operation": latest_op}
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:
+            logger.exception("Cleanup retry failed for operation %s", operation_id)
+            raise HTTPException(status_code=500, detail=f"Failed to retry cleanup: {str(e)}")
+
+    @app.get("/api/cleanup/{operation_id}")
+    async def get_cleanup_operation_endpoint(request: Request, operation_id: str):
+        op = repo.get_cleanup_operation(operation_id)
+        if not op:
+            raise HTTPException(status_code=404, detail="Cleanup operation not found.")
+        _authorize_project_access(request, op["project_id"])
+        return {"operation": op}
+
+    @app.get("/api/projects/{project_id}/delete/preview")
+    async def preview_project_deletion_endpoint(request: Request, project_id: str):
+        _authorize_project_access(request, project_id)
+        try:
+            preview = repo.preview_project_deletion(project_id, storage=filestore)
+            return {"project_id": project_id, "preview": preview}
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            logger.exception("Deletion preview failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail=f"Failed to generate deletion preview: {str(e)}")
+
+    @app.post("/api/projects/{project_id}/delete")
+    async def execute_project_deletion_endpoint(request: Request, project_id: str, payload: ProjectDeleteRequest):
+        project = _authorize_project_access(request, project_id)
+        expected_name = (project.get("name") or "").strip()
+        provided_name = (payload.confirm_project_name or "").strip()
+        if not expected_name or provided_name != expected_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmation project name does not match.",
+            )
+        try:
+            operation = repo.execute_project_deletion(project_id, storage=filestore)
+            return {"status": "deleted", "project_id": project_id, "operation": operation}
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except (FileStoreCleanupBlockedError, BaseCleanupBlockedError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except StorageError as e:
+            latest_op = repo.get_latest_cleanup_operation(project_id)
+            if latest_op and latest_op.get("cleanup_mode") == "delete_project" and latest_op.get("status") == "failed":
+                return {"status": "partial_failure", "operation": latest_op}
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:
+            logger.exception("Permanent deletion failed for project %s", project_id)
+            raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
+
+    @app.post("/api/deletions/{operation_id}/retry")
+    async def retry_project_deletion_endpoint(request: Request, operation_id: str):
+        op = repo.get_cleanup_operation(operation_id)
+        if not op or op.get("cleanup_mode") != "delete_project":
+            raise HTTPException(status_code=404, detail="Project deletion operation not found.")
+        _authorize_project_access(request, op["project_id"])
+        try:
+            operation = repo.retry_project_deletion(operation_id, storage=filestore)
+            return {"status": "deleted", "project_id": op["project_id"], "operation": operation}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (FileStoreCleanupBlockedError, BaseCleanupBlockedError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except StorageError as e:
+            latest_op = repo.get_cleanup_operation(operation_id)
+            if latest_op and latest_op.get("status") == "failed":
+                return {"status": "partial_failure", "operation": latest_op}
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:
+            logger.exception("Project deletion retry failed for operation %s", operation_id)
+            raise HTTPException(status_code=500, detail=f"Failed to retry project deletion: {str(e)}")
 
     @app.get("/api/projects/{project_id}/images")
     async def list_project_images(request: Request, project_id: str):
@@ -742,11 +910,11 @@ def create_app(
         if len(source_bytes) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "50"))
-        if len(source_bytes) > max_upload_mb * 1024 * 1024:
+        max_upload_bytes = get_max_upload_bytes()
+        if len(source_bytes) > max_upload_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"File too large. Maximum size is {max_upload_mb} MB."
+                detail=f"File exceeds the configured upload limit of {max_upload_bytes // (1024 * 1024)} MB."
             )
 
         if not source_bytes.lstrip().startswith(b"%PDF-"):
@@ -880,6 +1048,27 @@ def create_app(
     # Direct browser-to-Blob upload intents
     # ============================================================
 
+    @app.post("/api/uploads/cleanup-orphans")
+    async def cleanup_orphan_uploads_endpoint(request: Request, limit: int = 50):
+        """Safely delete expired incomplete upload Blobs that never became projects."""
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        safe_limit = max(1, min(int(limit), 200))
+        result = repo.recover_orphan_uploads(filestore, limit=safe_limit)
+        return {"status": "ok", "recovery": result}
+
+    @app.get("/api/uploads/config")
+    async def upload_config(request: Request):
+        user = getattr(request.state, "user", None) or auth.get_single_user_operator()
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        max_bytes = get_max_upload_bytes()
+        return {
+            "max_upload_bytes": max_bytes,
+            "max_upload_mb": max_bytes // (1024 * 1024),
+        }
+
     @app.post("/api/uploads/authorize")
     async def upload_authorize(request: Request, payload: UploadAuthorizeRequest):
         user = getattr(request.state, "user", None) or auth.get_single_user_operator()
@@ -888,12 +1077,17 @@ def create_app(
         if (not filename or len(filename) > 255 or any(ord(ch) < 32 for ch in filename)
                 or filename != Path(filename).name or "/" in filename or "\\" in filename
                 or not filename.lower().endswith(".pdf")):
-            raise HTTPException(status_code=400, detail="Only a plain PDF filename is allowed.")
+            raise HTTPException(status_code=400, detail="Unsupported or invalid PDF: only a plain .pdf filename is allowed.")
         if payload.content_type != "application/pdf":
-            raise HTTPException(status_code=400, detail="Invalid content type. Expected application/pdf.")
-        max_bytes = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
-        if payload.size_bytes <= 0 or payload.size_bytes > max_bytes:
-            raise HTTPException(status_code=413, detail="Invalid PDF size or file exceeds the upload limit.")
+            raise HTTPException(status_code=400, detail="Unsupported or invalid PDF: content type must be application/pdf.")
+        max_bytes = get_max_upload_bytes()
+        if payload.size_bytes <= 0:
+            raise HTTPException(status_code=400, detail="Unsupported or invalid PDF: file is empty.")
+        if payload.size_bytes > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds the configured upload limit of {max_bytes // (1024 * 1024)} MB.",
+            )
         upload_key = str(uuid.uuid4())
         project_id = str(uuid.uuid4())
         pathname = f"{project_id}/source/{upload_key}.pdf"

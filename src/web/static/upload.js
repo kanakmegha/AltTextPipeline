@@ -1,5 +1,7 @@
 import { upload } from "@vercel/blob/client";
 import { getProjectReviewUrl } from "./upload-status.js";
+import { openCleanupModal } from "./cleanup-modal.js";
+import { openDeleteProjectModal } from "./delete-project-modal.js";
 
 /**
  * AltTextPipeline — Stage 1: Upload & Extract Frontend Controller
@@ -163,9 +165,31 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  let maxUploadBytes = null;
+  let maxUploadMb = null;
+  fetch("/api/uploads/config", { credentials: "include" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((cfg) => {
+      if (cfg && typeof cfg.max_upload_bytes === "number") {
+        maxUploadBytes = cfg.max_upload_bytes;
+        maxUploadMb = cfg.max_upload_mb || Math.floor(maxUploadBytes / (1024 * 1024));
+      }
+    })
+    .catch(() => {});
+
   function handleFileSelected(file) {
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      showError("Please select a valid PDF file (.pdf).");
+    const isPdfName = file.name.toLowerCase().endsWith(".pdf");
+    const isPdfType = !file.type || file.type === "application/pdf";
+    if (!isPdfName || !isPdfType) {
+      showError("Unsupported or invalid PDF: please select a valid .pdf file.");
+      return;
+    }
+    if (file.size <= 0) {
+      showError("Unsupported or invalid PDF: file is empty.");
+      return;
+    }
+    if (maxUploadBytes && file.size > maxUploadBytes) {
+      showError(`File exceeds the configured upload limit (${maxUploadMb} MB).`);
       return;
     }
     clearError();
@@ -338,7 +362,7 @@ document.addEventListener("DOMContentLoaded", () => {
           isProcessing = false;
           if (extractBtn) extractBtn.disabled = false;
           const errMsg = data.error || "Extraction failed.";
-          showError(`Extraction Error: ${errMsg}`);
+          showError(`Worker processing failure: ${errMsg}`);
         } else {
           // Still processing: queued, extracting, etc.
           const totalImages = data.total_images || 0;
@@ -465,40 +489,53 @@ document.addEventListener("DOMContentLoaded", () => {
             const errData = await authRes.json();
             errorMsg = errData.detail || errorMsg;
           } catch (_) {}
-          throw new Error(errorMsg);
+          if (authRes.status === 413) {
+            throw new Error(`File exceeds configured upload limit: ${errorMsg}`);
+          }
+          if (authRes.status === 400) {
+            throw new Error(errorMsg);
+          }
+          throw new Error(`Upload authorization failure: ${errorMsg}`);
         }
 
         const authData = await authRes.json();
         const uploadKey = authData.upload_key;
         if (selectedFile.size > authData.max_size_bytes) {
-          throw new Error("File exceeds the configured upload limit.");
+          throw new Error(
+            `File exceeds configured upload limit (${Math.floor(authData.max_size_bytes / (1024 * 1024))} MB).`,
+          );
         }
         const csrfResponse = await fetch("/api/auth/csrf-token", {
           credentials: "include",
         });
         if (!csrfResponse.ok) {
-          throw new Error("Could not prepare a secure upload.");
+          throw new Error("Upload authorization failure: could not prepare a secure upload.");
         }
         const csrfData = await csrfResponse.json();
-        const blobResult = await upload(authData.pathname, selectedFile, {
-          access: "private",
-          handleUploadUrl: authData.handle_upload_url,
-          clientPayload: JSON.stringify({
-            upload_key: uploadKey,
-            csrf_token: csrfData.csrf_token,
-          }),
-          contentType: "application/pdf",
-          multipart: selectedFile.size > 5 * 1024 * 1024,
-          onUploadProgress: ({ percentage }) =>
-            setProgress(
-              10 + Math.round(percentage * 0.4),
-              `Uploading ${escapeHtml(selectedFile.name)} (${
-                Math.round(percentage)
-              }%)…`,
-            ),
-        });
+        let blobResult;
+        try {
+          blobResult = await upload(authData.pathname, selectedFile, {
+            access: "private",
+            handleUploadUrl: authData.handle_upload_url,
+            clientPayload: JSON.stringify({
+              upload_key: uploadKey,
+              csrf_token: csrfData.csrf_token,
+            }),
+            contentType: "application/pdf",
+            multipart: selectedFile.size > 5 * 1024 * 1024,
+            onUploadProgress: ({ percentage }) =>
+              setProgress(
+                10 + Math.round(percentage * 0.4),
+                `Uploading ${escapeHtml(selectedFile.name)} (${
+                  Math.round(percentage)
+                }%)…`,
+              ),
+          });
+        } catch (blobErr) {
+          throw new Error(`Blob upload failure: ${blobErr?.message || "direct upload failed"}`);
+        }
         if (blobResult.pathname !== authData.pathname) {
-          throw new Error("Blob returned an unexpected object path.");
+          throw new Error("Blob upload failure: returned an unexpected object path.");
         }
 
         setProgress(55, "Verifying private upload and creating project…");
@@ -555,24 +592,37 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  // --- Recent Projects List ---
-  async function loadRecentProjects() {
+  // --- Existing Projects List (Paginated) ---
+  const PROJECTS_PAGE_SIZE = 10;
+  let currentProjectsPage = 0;
+
+  async function loadRecentProjects(page = currentProjectsPage) {
     if (!recentProjectsList) return;
+    currentProjectsPage = Math.max(0, page);
+    const offset = currentProjectsPage * PROJECTS_PAGE_SIZE;
     try {
-      const res = await fetch("/api/projects", {
-        credentials: "include",
-      });
+      const res = await fetch(
+        `/api/projects?limit=${PROJECTS_PAGE_SIZE}&offset=${offset}`,
+        { credentials: "include" },
+      );
       if (!res.ok) return;
       const data = await res.json();
       const projects = data.projects || [];
+      const totalCount = typeof data.total_count === "number"
+        ? data.total_count
+        : projects.length;
 
-      if (projects.length === 0) {
+      if (totalCount === 0) {
         recentProjectsList.innerHTML =
           '<p class="text-muted" style="margin:0; font-size:13px;">No projects created yet. Upload a PDF above to begin.</p>';
         return;
       }
 
-      recentProjectsList.innerHTML = projects.slice(0, 5).map((p) => {
+      if (projects.length === 0 && currentProjectsPage > 0) {
+        return loadRecentProjects(currentProjectsPage - 1);
+      }
+
+      const rowsHtml = projects.map((p) => {
         const dateStr = p.created_at
           ? new Date(p.created_at).toLocaleDateString()
           : "";
@@ -592,16 +642,67 @@ document.addEventListener("DOMContentLoaded", () => {
             <div class="recent-project-actions">
               <a href="/review/${p.id}" class="btn-secondary btn-sm" style="text-decoration:none;">Review &amp; Edit</a>
               <a href="/export/${p.id}" class="btn-secondary btn-sm" style="text-decoration:none;">Export</a>
+              <button type="button" class="btn-secondary btn-sm btn-cleanup-trigger" data-project-id="${p.id}" data-project-name="${escapeHtml(p.name || "Untitled Project")}">Clean up</button>
+              <button type="button" class="btn-secondary btn-sm btn-delete-project-trigger" data-project-id="${p.id}" data-project-name="${escapeHtml(p.name || "Untitled Project")}" style="color:#f87171; border-color:rgba(248,113,113,0.4);">Delete Project</button>
             </div>
           </div>
         `;
       }).join("");
+
+      const totalPages = Math.max(1, Math.ceil(totalCount / PROJECTS_PAGE_SIZE));
+      const paginationHtml = totalPages > 1
+        ? `
+          <div class="projects-pagination" style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding-top:10px; border-top:1px solid var(--border-color, #333); font-size:12px;">
+            <span class="text-muted">Showing ${offset + 1}–${offset + projects.length} of ${totalCount} projects</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="btn-secondary btn-sm btn-projects-prev" ${currentProjectsPage === 0 ? "disabled" : ""}>← Previous</button>
+              <span class="text-muted">Page ${currentProjectsPage + 1} of ${totalPages}</span>
+              <button type="button" class="btn-secondary btn-sm btn-projects-next" ${currentProjectsPage + 1 >= totalPages ? "disabled" : ""}>Next →</button>
+            </div>
+          </div>
+        `
+        : "";
+
+      recentProjectsList.innerHTML = rowsHtml + paginationHtml;
     } catch (err) {
       console.warn("Could not load recent projects:", err);
     }
   }
 
-  loadRecentProjects();
+  loadRecentProjects(0);
+
+  if (recentProjectsList) {
+    recentProjectsList.addEventListener("click", (e) => {
+      const prevBtn = e.target.closest(".btn-projects-prev");
+      if (prevBtn && !prevBtn.disabled) {
+        loadRecentProjects(currentProjectsPage - 1);
+        return;
+      }
+      const nextBtn = e.target.closest(".btn-projects-next");
+      if (nextBtn && !nextBtn.disabled) {
+        loadRecentProjects(currentProjectsPage + 1);
+        return;
+      }
+      const deleteBtn = e.target.closest(".btn-delete-project-trigger");
+      if (deleteBtn) {
+        openDeleteProjectModal({
+          projectId: deleteBtn.dataset.projectId,
+          projectName: deleteBtn.dataset.projectName,
+          onComplete: () => loadRecentProjects(currentProjectsPage),
+        });
+        return;
+      }
+      const btn = e.target.closest(".btn-cleanup-trigger");
+      if (!btn) return;
+      const projectId = btn.dataset.projectId;
+      const projectName = btn.dataset.projectName;
+      openCleanupModal({
+        projectId,
+        projectName,
+        onComplete: () => loadRecentProjects(currentProjectsPage),
+      });
+    });
+  }
 
   // Cleanup polling on page unload
   window.addEventListener("beforeunload", () => {

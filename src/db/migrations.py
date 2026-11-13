@@ -350,4 +350,18 @@ def apply_migrations(db: DatabaseConnection) -> int:
             conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (11, now_iso))
             current_version = 11
 
+        # Migration 12: Lease token and expiration columns on cleanup_operations for crash recovery
+        if current_version < 12:
+            cols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(cleanup_operations);").fetchall()
+            ]
+            if "lease_token" not in cols:
+                conn.execute("ALTER TABLE cleanup_operations ADD COLUMN lease_token TEXT;")
+            if "lease_expires_at" not in cols:
+                conn.execute("ALTER TABLE cleanup_operations ADD COLUMN lease_expires_at TEXT;")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (12, now_iso))
+            current_version = 12
+
     return current_version

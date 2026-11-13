@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS cleanup_operations (
     audit_summary TEXT NOT NULL DEFAULT '[]',
     error_message TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    lease_expires_at TEXT,
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL,

@@ -34,6 +34,29 @@ class CleanupBlockedError(StorageError):
 
 
 STANDARD_STORAGE_DIRS = frozenset({"source", "images", "artifacts", "exports"})
+DEFAULT_MAX_UPLOAD_MB = 500
+
+
+def get_max_upload_bytes() -> int:
+    """
+    Authoritative maximum PDF upload/object size in bytes (default: 500 MB).
+    Reads MAX_UPLOAD_MB (preferred) or MAX_OBJECT_BYTES (legacy fallback).
+    """
+    raw_mb = os.environ.get("MAX_UPLOAD_MB")
+    if raw_mb is not None and str(raw_mb).strip():
+        mb = int(str(raw_mb).strip())
+        if mb <= 0:
+            raise ValueError("MAX_UPLOAD_MB must be positive.")
+        return mb * 1024 * 1024
+
+    raw_bytes = os.environ.get("MAX_OBJECT_BYTES")
+    if raw_bytes is not None and str(raw_bytes).strip():
+        size = int(str(raw_bytes).strip())
+        if size <= 0:
+            raise ValueError("MAX_OBJECT_BYTES must be positive.")
+        return size
+
+    return DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
 
 
 def validate_storage_key(project_id: str, relative_key: str) -> str:
@@ -177,6 +200,19 @@ class BaseStorage:
         """Read file bytes for a verified project storage key."""
         raise NotImplementedError
 
+    def download_to_file(
+        self,
+        project_id: str,
+        relative_key: str,
+        destination_path: str,
+    ) -> Tuple[int, str]:
+        """
+        Stream a stored object into destination_path without materializing the full
+        payload in memory. Cleans up incomplete destination_path on error.
+        Returns: (byte_size, sha256_checksum)
+        """
+        raise NotImplementedError
+
     def cleanup_project(
         self,
         project_id: str,
@@ -210,3 +246,7 @@ class BaseStorage:
         Failed deletions are recorded in result.failed with error details.
         """
         raise NotImplementedError
+
+    def list_project_keys(self, project_id: str) -> List[str]:
+        """List all relative storage keys owned by project_id."""
+        return []

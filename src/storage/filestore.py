@@ -247,6 +247,48 @@ class FileStore(BaseStorage):
 
     read_file = read_bytes
 
+    def download_to_file(
+        self,
+        project_id: str,
+        relative_key: str,
+        destination_path: str,
+    ) -> Tuple[int, str]:
+        """Stream local file into destination_path in chunks, computing SHA-256."""
+        path = self.resolve_path(project_id, relative_key)
+        if not path.is_file():
+            raise FileNotFoundError(f"Storage asset not found: {relative_key}")
+
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        try:
+            with open(path, "rb") as src, open(destination_path, "wb") as dst:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    hasher.update(chunk)
+                    total_bytes += len(chunk)
+            return total_bytes, hasher.hexdigest()
+        except Exception:
+            if os.path.exists(destination_path):
+                try:
+                    os.unlink(destination_path)
+                except OSError:
+                    pass
+            raise
+
+    def list_project_keys(self, project_id: str) -> List[str]:
+        """List all relative file keys inside project_id's directory."""
+        p_dir = self.get_project_dir(project_id)
+        if not p_dir.exists():
+            return []
+        keys: List[str] = []
+        for item in sorted(p_dir.rglob("*")):
+            if item.is_file():
+                keys.append(item.relative_to(p_dir).as_posix())
+        return keys
+
     def cleanup_project(
         self,
         project_id: str,
