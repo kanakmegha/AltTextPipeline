@@ -14,11 +14,39 @@ behavior, adapted for PostgreSQL:
 
 import json
 import hashlib
+import os
 import secrets
 import uuid
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict, Any, Set
 from .postgres_connection import PostgresConnection
+from src.storage.base_storage import CleanupBlockedError, StorageError
+
+
+def get_deletion_lease_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("DELETION_LEASE_SECONDS", "300")))
+    except (TypeError, ValueError):
+        return 300
+
+
+def _parse_utc_dt(val: Any) -> Optional[datetime]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 
 def utc_now_iso() -> str:
@@ -97,17 +125,20 @@ class PostgresRepository:
                 )
         return self.get_project(project_id)
 
+    @staticmethod
+    def _format_project_row(row: Any) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        data = dict(row)
+        data["created_at"] = _to_iso(data.get("created_at"))
+        data["updated_at"] = _to_iso(data.get("updated_at"))
+        return data
+
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
         with self.db.session() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM projects WHERE id = %s;", (project_id,))
-                row = cur.fetchone()
-                if not row:
-                    return None
-                data = dict(row)
-                data["created_at"] = _to_iso(data.get("created_at"))
-                data["updated_at"] = _to_iso(data.get("updated_at"))
-                return data
+                return self._format_project_row(cur.fetchone())
 
     def update_project_status(
         self,
@@ -830,6 +861,44 @@ class PostgresRepository:
     # Jobs
     # ============================================================
 
+    def _assert_not_cleaning_in_tx(
+        self,
+        cur: Any,
+        project_id: str,
+        operation_label: str,
+        disallow_cleaned_extracted: bool = False,
+    ) -> None:
+        """Lock project row with FOR UPDATE and verify cleanup does not block job/export creation."""
+        cur.execute("SELECT cleanup_status FROM projects WHERE id = %s FOR UPDATE;", (project_id,))
+        row = cur.fetchone()
+        if row:
+            cstatus = row.get("cleanup_status") or "retained"
+            if cstatus in ("cleaning", "deleting"):
+                raise CleanupBlockedError(
+                    f"Cannot {operation_label} while project '{project_id}' {'deletion' if cstatus == 'deleting' else 'cleanup'} is in progress."
+                )
+            if cstatus == "cleaned_all_source":
+                raise CleanupBlockedError(
+                    f"Cannot {operation_label}: project '{project_id}' source and extracted assets have been cleaned."
+                )
+            if disallow_cleaned_extracted and cstatus == "cleaned_extracted":
+                raise CleanupBlockedError(
+                    f"Cannot {operation_label}: project '{project_id}' extracted assets have been cleaned."
+                )
+        cur.execute(
+            """
+            SELECT id FROM cleanup_operations
+            WHERE project_id = %s AND status IN ('pending', 'deleting_blobs', 'deleting_records')
+            LIMIT 1;
+            """,
+            (project_id,),
+        )
+        active = cur.fetchone()
+        if active:
+            raise CleanupBlockedError(
+                f"Cannot {operation_label}: cleanup operation ({active['id']}) is in progress."
+            )
+
     def create_job(
         self,
         job_id: str,
@@ -844,6 +913,12 @@ class PostgresRepository:
         now = utc_now_iso()
         with self.db.session() as conn:
             with conn.cursor() as cur:
+                self._assert_not_cleaning_in_tx(
+                    cur,
+                    project_id,
+                    operation_label=f"create {job_type} job",
+                    disallow_cleaned_extracted=(job_type != "extraction"),
+                )
                 cur.execute(
                     """
                     INSERT INTO jobs (
@@ -1115,6 +1190,12 @@ class PostgresRepository:
         now = utc_now_iso()
         with self.db.session() as conn:
             with conn.cursor() as cur:
+                self._assert_not_cleaning_in_tx(
+                    cur,
+                    project_id,
+                    operation_label="create export",
+                    disallow_cleaned_extracted=True,
+                )
                 cur.execute(
                     """
                     INSERT INTO exports (
@@ -1734,6 +1815,16 @@ class PostgresRepository:
                 )
         return {"project": self.get_project(project_id), "job": self.get_job(job_id)}
 
+    @staticmethod
+    def _format_upload_key_row(row: Any) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        data = dict(row)
+        data["expires_at"] = _to_iso(data.get("expires_at"))
+        data["created_at"] = _to_iso(data.get("created_at"))
+        data["updated_at"] = _to_iso(data.get("updated_at"))
+        return data
+
     def get_upload_key(self, upload_key: str) -> Optional[Dict[str, Any]]:
         """Get upload key record by upload_key."""
         with self.db.session() as conn:
@@ -1742,14 +1833,7 @@ class PostgresRepository:
                     "SELECT * FROM upload_keys WHERE upload_key = %s;",
                     (upload_key,)
                 )
-                row = cur.fetchone()
-                if not row:
-                    return None
-                data = dict(row)
-                data["expires_at"] = _to_iso(data.get("expires_at"))
-                data["created_at"] = _to_iso(data.get("created_at"))
-                data["updated_at"] = _to_iso(data.get("updated_at"))
-                return data
+                return self._format_upload_key_row(cur.fetchone())
 
     def update_upload_key(
         self,
@@ -1871,3 +1955,1272 @@ class PostgresRepository:
                     data["updated_at"] = _to_iso(data.get("updated_at"))
                     result.append(data)
                 return result
+
+    # ============================================================
+    # Storage Lifecycle Management & Post-Export Project Cleanup
+    # ============================================================
+
+    @staticmethod
+    def _normalize_cleanup_mode(cleanup_mode: str) -> str:
+        m = (cleanup_mode or "").strip().lower()
+        if m in ("extracted", "mode_a", "extracted_only"):
+            return "extracted"
+        if m in ("all_source", "mode_b", "all", "source_and_extracted"):
+            return "all_source"
+        raise ValueError(f"Invalid cleanup mode '{cleanup_mode}'. Allowed modes: 'extracted', 'all_source'.")
+
+    def _format_cleanup_operation_row(self, row: Any) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        data = dict(row)
+        for ts_col in ("started_at", "completed_at", "created_at", "updated_at", "lease_expires_at"):
+            data[ts_col] = _to_iso(data.get(ts_col))
+
+        for json_col in ("target_blob_keys", "deleted_blob_keys", "missing_blob_keys"):
+            val = data.get(json_col)
+            if isinstance(val, str):
+                try:
+                    data[json_col] = json.loads(val)
+                except Exception:
+                    data[json_col] = []
+            elif val is None:
+                data[json_col] = []
+
+        for dict_col in ("failed_blob_keys", "db_records_summary"):
+            val = data.get(dict_col)
+            if isinstance(val, str):
+                try:
+                    data[dict_col] = json.loads(val)
+                except Exception:
+                    data[dict_col] = {}
+            elif val is None:
+                data[dict_col] = {}
+
+        val = data.get("audit_summary")
+        if isinstance(val, str):
+            try:
+                data["audit_summary"] = json.loads(val)
+            except Exception:
+                data["audit_summary"] = []
+        elif val is None:
+            data["audit_summary"] = []
+
+        return data
+
+    def get_cleanup_operation(self, operation_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM cleanup_operations WHERE id = %s;", (operation_id,))
+                return self._format_cleanup_operation_row(cur.fetchone())
+
+    def get_active_cleanup_operation(self, project_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM cleanup_operations
+                    WHERE project_id = %s AND status IN ('pending', 'deleting_blobs', 'deleting_records')
+                    ORDER BY created_at DESC LIMIT 1;
+                    """,
+                    (project_id,)
+                )
+                return self._format_cleanup_operation_row(cur.fetchone())
+
+    def get_latest_cleanup_operation(self, project_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM cleanup_operations WHERE project_id = %s ORDER BY created_at DESC LIMIT 1;",
+                    (project_id,)
+                )
+                return self._format_cleanup_operation_row(cur.fetchone())
+
+    def list_cleanup_operations(self, project_id: str) -> List[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM cleanup_operations WHERE project_id = %s ORDER BY created_at DESC;",
+                    (project_id,)
+                )
+                rows = cur.fetchall()
+                return [self._format_cleanup_operation_row(r) for r in rows]
+
+    def _build_cleanup_preview_in_tx(
+        self, cur: Any, project_id: str, mode: str, lock_project: bool = False
+    ) -> Dict[str, Any]:
+        """Compute cleanup preview & blocking reasons using an existing cursor/transaction."""
+        if lock_project:
+            cur.execute("SELECT * FROM projects WHERE id = %s FOR UPDATE;", (project_id,))
+        else:
+            cur.execute("SELECT * FROM projects WHERE id = %s;", (project_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Project '{project_id}' not found.")
+        project = self._format_project_row(row)
+
+        blocking_reasons: List[str] = []
+
+        # 1. Verified export check
+        cur.execute(
+            """
+            SELECT id, file_storage_key, status, verified_at, created_at FROM exports
+            WHERE project_id = %s AND (status IN ('verified', 'delivered') OR verified_at IS NOT NULL)
+            ORDER BY created_at DESC;
+            """,
+            (project_id,)
+        )
+        verified_export_rows = [dict(r) for r in cur.fetchall()]
+        if not verified_export_rows:
+            blocking_reasons.append(
+                "Project has no verified export. A verified DOCX export is required before cleanup."
+            )
+
+        # All exports (to protect from deletion)
+        cur.execute("SELECT file_storage_key FROM exports WHERE project_id = %s;", (project_id,))
+        export_storage_keys = {r["file_storage_key"] for r in cur.fetchall() if r["file_storage_key"]}
+
+        # 2. Active background job fencing
+        cur.execute(
+            "SELECT id, status FROM jobs WHERE project_id = %s AND status IN ('queued', 'running', 'processing');",
+            (project_id,)
+        )
+        active_jobs = [dict(r) for r in cur.fetchall()]
+        if active_jobs:
+            blocking_reasons.append(
+                f"Project has active background job(s) in progress (e.g. job {active_jobs[0]['id']})."
+            )
+
+        # 3. Active cleanup operation fencing
+        cur.execute(
+            """
+            SELECT id, status FROM cleanup_operations
+            WHERE project_id = %s AND status IN ('pending', 'deleting_blobs', 'deleting_records');
+            """,
+            (project_id,)
+        )
+        active_cleanups = [dict(r) for r in cur.fetchall()]
+        if active_cleanups:
+            blocking_reasons.append(
+                f"A cleanup operation ({active_cleanups[0]['id']}) is already in progress for this project."
+            )
+
+        # 4. Check if already cleaned or currently cleaning
+        curr_cleanup_status = project.get("cleanup_status", "retained")
+        if curr_cleanup_status == "cleaning":
+            blocking_reasons.append("Project cleanup is currently in progress.")
+        elif curr_cleanup_status == "deleting":
+            blocking_reasons.append("Project permanent deletion is currently in progress.")
+        elif curr_cleanup_status == "cleaned_all_source":
+            blocking_reasons.append(
+                "Project has already undergone full cleanup (both source PDF and extracted assets)."
+            )
+        elif curr_cleanup_status == "cleaned_extracted" and mode == "extracted":
+            blocking_reasons.append(
+                "Extracted assets have already been cleaned for this project."
+            )
+
+        # 5. Determine target blob keys (strictly images + source PDF if Mode B; NEVER exports)
+        cur.execute(
+            "SELECT file_storage_key FROM image_assets WHERE project_id = %s ORDER BY page_number ASC, placement_index ASC;",
+            (project_id,)
+        )
+        target_blob_keys: List[str] = []
+        for r in cur.fetchall():
+            k = r["file_storage_key"]
+            if k and k not in export_storage_keys and not k.startswith("exports/"):
+                target_blob_keys.append(k)
+
+        source_key = project.get("source_storage_key", "")
+        if mode == "all_source" and source_key and source_key not in export_storage_keys:
+            if source_key not in target_blob_keys:
+                target_blob_keys.append(source_key)
+
+        # 6. Count database records to be removed
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE project_id = %s;", (project_id,))
+        jobs_count = list(cur.fetchone().values())[0]
+
+        cur.execute(
+            "SELECT COUNT(*) FROM job_batches WHERE job_id IN (SELECT id FROM jobs WHERE project_id = %s);",
+            (project_id,)
+        )
+        job_batches_count = list(cur.fetchone().values())[0]
+
+        cur.execute(
+            "SELECT COUNT(*) FROM approvals WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+            (project_id,)
+        )
+        approvals_count = list(cur.fetchone().values())[0]
+
+        cur.execute(
+            "SELECT COUNT(*) FROM alt_text_versions WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+            (project_id,)
+        )
+        alt_text_versions_count = list(cur.fetchone().values())[0]
+
+        cur.execute("SELECT COUNT(*) FROM image_assets WHERE project_id = %s;", (project_id,))
+        image_assets_count = list(cur.fetchone().values())[0]
+
+        cur.execute("SELECT COUNT(*) FROM figure_groups WHERE project_id = %s;", (project_id,))
+        figure_groups_count = list(cur.fetchone().values())[0]
+
+        cur.execute("SELECT COUNT(*) FROM ai_usage_ledger WHERE project_id = %s;", (project_id,))
+        ai_usage_count = list(cur.fetchone().values())[0]
+
+        cur.execute("SELECT COUNT(*) FROM audit_events WHERE project_id = %s;", (project_id,))
+        audit_events_count = list(cur.fetchone().values())[0]
+
+        return {
+            "project_id": project_id,
+            "cleanup_mode": mode,
+            "can_cleanup": len(blocking_reasons) == 0,
+            "blocking_reasons": blocking_reasons,
+            "target_blob_keys": target_blob_keys,
+            "target_blob_count": len(target_blob_keys),
+            "records_to_delete": {
+                "jobs": jobs_count,
+                "job_batches": job_batches_count,
+                "approvals": approvals_count,
+                "alt_text_versions": alt_text_versions_count,
+                "image_assets": image_assets_count,
+                "figure_groups": figure_groups_count,
+            },
+            "preserved_assets": {
+                "exports_count": len(export_storage_keys),
+                "export_storage_keys": sorted(list(export_storage_keys)),
+                "source_pdf_preserved": (mode != "all_source"),
+                "source_storage_key": source_key,
+                "ai_usage_count": ai_usage_count,
+                "audit_events_count": audit_events_count,
+            },
+        }
+
+    def preview_project_cleanup(self, project_id: str, cleanup_mode: str = "extracted") -> Dict[str, Any]:
+        """
+        Inspect project assets and dependencies to produce a dry-run preview
+        of what post-export cleanup will delete and preserve.
+        Enforces verified export requirement, active job fencing, and active cleanup fencing.
+        """
+        mode = self._normalize_cleanup_mode(cleanup_mode)
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                return self._build_cleanup_preview_in_tx(cur, project_id, mode, lock_project=False)
+
+    def prepare_cleanup_operation(self, project_id: str, cleanup_mode: str = "extracted") -> Dict[str, Any]:
+        """
+        Validates cleanup eligibility under a FOR UPDATE project row lock, creates a durable
+        pending cleanup manifest row, captures approved alt text in an audit snapshot,
+        and sets project status to 'cleaning'.
+        """
+        mode = self._normalize_cleanup_mode(cleanup_mode)
+        audit_summary = []
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                preview = self._build_cleanup_preview_in_tx(cur, project_id, mode, lock_project=True)
+                if not preview["can_cleanup"]:
+                    raise CleanupBlockedError("; ".join(preview["blocking_reasons"]))
+
+                target_keys = preview["target_blob_keys"]
+                records_summary = preview["records_to_delete"]
+
+                cur.execute(
+                    """
+                    SELECT
+                        ia.id as image_id,
+                        ia.page_number,
+                        ia.suggested_filename,
+                        ia.original_caption,
+                        ia.file_storage_key,
+                        app.id as approval_id,
+                        app.reviewer_id,
+                        app.approved_at,
+                        v.version_number as approved_version_number,
+                        v.text as approved_text
+                    FROM image_assets ia
+                    LEFT JOIN approvals app ON app.image_id = ia.id
+                    LEFT JOIN alt_text_versions v ON v.id = app.alt_text_version_id
+                    WHERE ia.project_id = %s
+                    ORDER BY ia.page_number ASC, ia.placement_index ASC;
+                    """,
+                    (project_id,)
+                )
+                for r in cur.fetchall():
+                    row_dict = dict(r)
+                    app_dict = None
+                    if row_dict.get("approval_id"):
+                        app_dict = {
+                            "approval_id": row_dict["approval_id"],
+                            "version_number": row_dict.get("approved_version_number"),
+                            "text": row_dict.get("approved_text"),
+                            "reviewer_id": row_dict.get("reviewer_id"),
+                            "approved_at": _to_iso(row_dict.get("approved_at")),
+                        }
+                    audit_summary.append({
+                        "image_id": row_dict["image_id"],
+                        "page_number": row_dict["page_number"],
+                        "suggested_filename": row_dict["suggested_filename"],
+                        "original_caption": row_dict.get("original_caption", ""),
+                        "file_storage_key": row_dict["file_storage_key"],
+                        "approved_version": app_dict,
+                    })
+
+                operation_id = str(uuid.uuid4())
+                now = utc_now_iso()
+
+                cur.execute(
+                    """
+                    INSERT INTO cleanup_operations (
+                        id, project_id, cleanup_mode, status, target_blob_keys,
+                        deleted_blob_keys, missing_blob_keys, failed_blob_keys,
+                        db_records_summary, audit_summary, error_message, retry_count,
+                        started_at, created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'pending', %s, '[]', '[]', '{}', %s, %s, NULL, 0, %s, %s, %s);
+                    """,
+                    (
+                        operation_id, project_id, mode,
+                        json.dumps(target_keys),
+                        json.dumps(records_summary),
+                        json.dumps(audit_summary),
+                        now, now, now
+                    )
+                )
+                cur.execute(
+                    "UPDATE projects SET cleanup_status = 'cleaning', updated_at = %s WHERE id = %s;",
+                    (now, project_id)
+                )
+
+        self.record_audit_event(
+            event_id=str(uuid.uuid4()),
+            project_id=project_id,
+            event_type="cleanup_started",
+            target_type="project",
+            target_id=project_id,
+            details={
+                "cleanup_operation_id": operation_id,
+                "cleanup_mode": mode,
+                "target_blob_count": len(target_keys),
+            },
+            actor_id="editor",
+        )
+
+        return self.get_cleanup_operation(operation_id)
+
+    def update_cleanup_operation_blobs(
+        self,
+        operation_id: str,
+        status: str,
+        deleted_keys: List[str],
+        missing_keys: List[str],
+        failed_keys: Dict[str, str],
+        error_message: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Records intermediate progress of storage object deletions into the manifest.
+        If status is 'failed', resets project cleanup_status to 'retained' and logs an audit event.
+        """
+        now = utc_now_iso()
+        op = self.get_cleanup_operation(operation_id)
+        if not op:
+            raise ValueError(f"Cleanup operation '{operation_id}' not found.")
+
+        project_id = op["project_id"]
+
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cleanup_operations
+                    SET status = %s,
+                        deleted_blob_keys = %s,
+                        missing_blob_keys = %s,
+                        failed_blob_keys = %s,
+                        error_message = %s,
+                        updated_at = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        status,
+                        json.dumps(deleted_keys),
+                        json.dumps(missing_keys),
+                        json.dumps(failed_keys),
+                        error_message,
+                        now,
+                        operation_id
+                    )
+                )
+                if status == "failed":
+                    cur.execute(
+                        "UPDATE projects SET cleanup_status = 'retained', updated_at = %s WHERE id = %s;",
+                        (now, project_id)
+                    )
+
+        if status == "failed":
+            self.record_audit_event(
+                event_id=str(uuid.uuid4()),
+                project_id=project_id,
+                event_type="cleanup_failed",
+                target_type="cleanup_operation",
+                target_id=operation_id,
+                details={
+                    "error_message": error_message,
+                    "failed_blob_count": len(failed_keys),
+                },
+                actor_id="editor",
+            )
+
+        return self.get_cleanup_operation(operation_id)
+
+    def finalize_cleanup_records(self, operation_id: str) -> Dict[str, Any]:
+        """
+        Within an atomic transaction, validates that all target blob deletions have succeeded,
+        then deletes dependent database records in referential foreign-key order, updates project
+        cleanup status, marks the cleanup operation as completed, and appends a final audit event.
+        """
+        op = self.get_cleanup_operation(operation_id)
+        if not op:
+            raise ValueError(f"Cleanup operation '{operation_id}' not found.")
+
+        if op["status"] == "completed":
+            return op
+
+        project_id = op["project_id"]
+        mode = op["cleanup_mode"]
+        target_keys = set(op.get("target_blob_keys") or [])
+        deleted_keys = set(op.get("deleted_blob_keys") or [])
+        missing_keys = set(op.get("missing_blob_keys") or [])
+        failed_keys = dict(op.get("failed_blob_keys") or {})
+
+        unresolved = target_keys - deleted_keys - missing_keys
+        if unresolved or failed_keys:
+            raise CleanupBlockedError(
+                f"Cannot finalize database records: {len(unresolved)} target keys unresolved, "
+                f"{len(failed_keys)} failed keys present."
+            )
+
+        now = utc_now_iso()
+
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                # 1. Job batches and jobs
+                cur.execute("SELECT id FROM jobs WHERE project_id = %s;", (project_id,))
+                job_ids = [r["id"] for r in cur.fetchall()]
+                if job_ids:
+                    ph = ",".join(["%s"] * len(job_ids))
+                    cur.execute(f"DELETE FROM job_batches WHERE job_id IN ({ph});", tuple(job_ids))
+                cur.execute("DELETE FROM jobs WHERE project_id = %s;", (project_id,))
+
+                # 2. Approvals and alt text versions
+                cur.execute("SELECT id FROM image_assets WHERE project_id = %s;", (project_id,))
+                image_ids = [r["id"] for r in cur.fetchall()]
+                if image_ids:
+                    ph = ",".join(["%s"] * len(image_ids))
+                    cur.execute(f"DELETE FROM approvals WHERE image_id IN ({ph});", tuple(image_ids))
+                    cur.execute(f"DELETE FROM alt_text_versions WHERE image_id IN ({ph});", tuple(image_ids))
+
+                # 3. Disassociate image_id in AI usage ledger while preserving token/cost history
+                cur.execute("UPDATE ai_usage_ledger SET image_id = NULL WHERE project_id = %s;", (project_id,))
+
+                # 4. Image assets
+                cur.execute("DELETE FROM image_assets WHERE project_id = %s;", (project_id,))
+
+                # 5. Figure groups
+                cur.execute("DELETE FROM figure_groups WHERE project_id = %s;", (project_id,))
+
+                # 6. Update project status and source storage key if Mode B
+                new_cleanup_status = "cleaned_all_source" if mode == "all_source" else "cleaned_extracted"
+                if mode == "all_source":
+                    cur.execute(
+                        "UPDATE projects SET source_storage_key = '', cleanup_status = %s, updated_at = %s WHERE id = %s;",
+                        (new_cleanup_status, now, project_id)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE projects SET cleanup_status = %s, updated_at = %s WHERE id = %s;",
+                        (new_cleanup_status, now, project_id)
+                    )
+
+                # 7. Mark cleanup operation as completed
+                cur.execute(
+                    """
+                    UPDATE cleanup_operations
+                    SET status = 'completed', completed_at = %s, updated_at = %s
+                    WHERE id = %s;
+                    """,
+                    (now, now, operation_id)
+                )
+
+        self.record_audit_event(
+            event_id=str(uuid.uuid4()),
+            project_id=project_id,
+            event_type="cleanup_completed",
+            target_type="project",
+            target_id=project_id,
+            details={
+                "cleanup_operation_id": operation_id,
+                "cleanup_mode": mode,
+                "deleted_records": op.get("db_records_summary") or {},
+                "deleted_blob_count": len(deleted_keys),
+                "missing_blob_count": len(missing_keys),
+            },
+            actor_id="editor",
+        )
+
+        return self.get_cleanup_operation(operation_id)
+
+    def execute_project_cleanup(self, project_id: str, cleanup_mode: str, storage: Any) -> Dict[str, Any]:
+        """
+        Coordinates the complete safe post-export cleanup workflow:
+          1. Pre-validation and manifest initialization (pending)
+          2. Storage object deletion with individual failure tracking (deleting_blobs)
+          3. Atomic referential database record purging (deleting_records -> completed)
+        If blob deletions fail, database records are left completely intact.
+        """
+        op = self.prepare_cleanup_operation(project_id, cleanup_mode)
+        op_id = op["id"]
+        target_keys = op.get("target_blob_keys") or []
+
+        self.update_cleanup_operation_blobs(
+            operation_id=op_id,
+            status="deleting_blobs",
+            deleted_keys=[],
+            missing_keys=[],
+            failed_keys={},
+        )
+
+        try:
+            deletion_result = storage.delete_objects(project_id, target_keys)
+        except Exception as exc:
+            self.update_cleanup_operation_blobs(
+                operation_id=op_id,
+                status="failed",
+                deleted_keys=[],
+                missing_keys=[],
+                failed_keys={k: str(exc) for k in target_keys},
+                error_message=f"Storage deletion exception: {str(exc)}",
+            )
+            raise
+
+        if deletion_result.has_failures:
+            self.update_cleanup_operation_blobs(
+                operation_id=op_id,
+                status="failed",
+                deleted_keys=deletion_result.deleted,
+                missing_keys=deletion_result.missing,
+                failed_keys=deletion_result.failed,
+                error_message=f"Storage deletion failed for {len(deletion_result.failed)} object(s).",
+            )
+            raise StorageError(
+                f"Storage deletion partially failed for project {project_id}: {deletion_result.failed}"
+            )
+
+        self.update_cleanup_operation_blobs(
+            operation_id=op_id,
+            status="deleting_records",
+            deleted_keys=deletion_result.deleted,
+            missing_keys=deletion_result.missing,
+            failed_keys={},
+        )
+
+        return self.finalize_cleanup_records(op_id)
+
+    def retry_cleanup_operation(self, operation_id: str, storage: Any) -> Dict[str, Any]:
+        """
+        Retries an incomplete or failed cleanup operation for any unresolved target blob keys.
+        """
+        op = self.get_cleanup_operation(operation_id)
+        if not op:
+            raise ValueError(f"Cleanup operation '{operation_id}' not found.")
+
+        if op["status"] == "completed":
+            return op
+
+        project_id = op["project_id"]
+        target_keys = op.get("target_blob_keys") or []
+        deleted_keys = set(op.get("deleted_blob_keys") or [])
+        missing_keys = set(op.get("missing_blob_keys") or [])
+
+        unresolved = [k for k in target_keys if k not in deleted_keys and k not in missing_keys]
+
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE cleanup_operations SET retry_count = retry_count + 1 WHERE id = %s;",
+                    (operation_id,)
+                )
+
+        if unresolved:
+            self.update_cleanup_operation_blobs(
+                operation_id=operation_id,
+                status="deleting_blobs",
+                deleted_keys=list(deleted_keys),
+                missing_keys=list(missing_keys),
+                failed_keys={},
+            )
+            try:
+                res = storage.delete_objects(project_id, unresolved)
+            except Exception as exc:
+                new_failed = dict(op.get("failed_blob_keys") or {})
+                for k in unresolved:
+                    new_failed[k] = str(exc)
+                self.update_cleanup_operation_blobs(
+                    operation_id=operation_id,
+                    status="failed",
+                    deleted_keys=list(deleted_keys),
+                    missing_keys=list(missing_keys),
+                    failed_keys=new_failed,
+                    error_message=f"Storage deletion retry exception: {str(exc)}",
+                )
+                raise
+
+            deleted_keys.update(res.deleted)
+            missing_keys.update(res.missing)
+
+            if res.has_failures:
+                self.update_cleanup_operation_blobs(
+                    operation_id=operation_id,
+                    status="failed",
+                    deleted_keys=list(deleted_keys),
+                    missing_keys=list(missing_keys),
+                    failed_keys=res.failed,
+                    error_message=f"Storage deletion retry failed for {len(res.failed)} object(s).",
+                )
+                raise StorageError(f"Storage deletion retry failed: {res.failed}")
+
+        self.update_cleanup_operation_blobs(
+            operation_id=operation_id,
+            status="deleting_records",
+            deleted_keys=list(deleted_keys),
+            missing_keys=list(missing_keys),
+            failed_keys={},
+        )
+
+        return self.finalize_cleanup_records(operation_id)
+
+    def get_project_storage_summary(self, project_id: str) -> Dict[str, Any]:
+        """
+        Returns estimated project storage observability: counts of source, extracted,
+        and export assets, along with cleanup eligibility and latest operation status.
+        """
+        project = self.get_project(project_id)
+        if not project:
+            raise ValueError(f"Project '{project_id}' not found.")
+
+        images = self.list_project_images(project_id)
+        exports = self.list_project_exports(project_id)
+        latest_op = self.get_latest_cleanup_operation(project_id)
+
+        source_key = project.get("source_storage_key", "")
+        has_source = bool(source_key)
+
+        image_keys = [img["file_storage_key"] for img in images if img.get("file_storage_key")]
+        export_keys = [exp["file_storage_key"] for exp in exports if exp.get("file_storage_key")]
+
+        verified_exports = [
+            exp for exp in exports
+            if exp.get("status") in ("verified", "delivered") or exp.get("verified_at")
+        ]
+
+        curr_cleanup_status = project.get("cleanup_status", "retained")
+        is_eligible = (
+            len(verified_exports) > 0
+            and curr_cleanup_status not in ("cleaned_all_source", "cleaning")
+        )
+
+        return {
+            "project_id": project_id,
+            "project_name": project.get("name", ""),
+            "cleanup_status": curr_cleanup_status,
+            "has_source_file": has_source,
+            "source_storage_key": source_key,
+            "image_count": len(images),
+            "image_storage_keys": image_keys,
+            "export_count": len(exports),
+            "export_storage_keys": export_keys,
+            "verified_export_count": len(verified_exports),
+            "is_cleanup_eligible": is_eligible,
+            "latest_cleanup_operation": latest_op,
+        }
+
+    # ============================================================
+    # Orphan Upload Recovery
+    # ============================================================
+
+    ORPHAN_CLAIM_TTL_SECONDS = 300
+
+    def list_expired_incomplete_uploads(
+        self,
+        limit: int = 50,
+        claim_ttl_seconds: int = ORPHAN_CLAIM_TTL_SECONDS,
+    ) -> List[Dict[str, Any]]:
+        """Return expired upload intents that never completed or became a project source."""
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        stale_before = (now_dt - timedelta(seconds=max(1, int(claim_ttl_seconds)))).isoformat()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM upload_keys
+                    WHERE (
+                        status IN ('uploading', 'expired', 'orphan_cleanup_failed')
+                        OR (status = 'cleaning_orphan' AND updated_at < %s)
+                    )
+                      AND expires_at < %s
+                      AND project_id IS NULL
+                    ORDER BY expires_at ASC
+                    LIMIT %s;
+                    """,
+                    (stale_before, now, limit),
+                )
+                return [self._format_upload_key_row(r) for r in cur.fetchall()]
+
+    def claim_orphan_upload_cleanup(
+        self,
+        upload_key: str,
+        claim_ttl_seconds: int = ORPHAN_CLAIM_TTL_SECONDS,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Atomically claim an expired incomplete upload for orphan Blob cleanup.
+        Reclaims stale 'cleaning_orphan' rows only after claim_ttl_seconds has elapsed.
+        Returns None if it is currently finalizing, already completed, freshly claimed, or not expired.
+        """
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        stale_before = (now_dt - timedelta(seconds=max(1, int(claim_ttl_seconds)))).isoformat()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE upload_keys
+                    SET status = 'cleaning_orphan', updated_at = %s
+                    WHERE upload_key = %s
+                      AND (
+                          status IN ('uploading', 'expired', 'orphan_cleanup_failed')
+                          OR (status = 'cleaning_orphan' AND updated_at < %s)
+                      )
+                      AND expires_at < %s
+                      AND project_id IS NULL
+                    RETURNING *;
+                    """,
+                    (now, upload_key, stale_before, now),
+                )
+                return self._format_upload_key_row(cur.fetchone())
+
+    def mark_orphan_upload_cleaned(self, upload_key: str) -> None:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_keys SET status = 'cleaned_orphan', updated_at = %s WHERE upload_key = %s AND status = 'cleaning_orphan';",
+                    (utc_now_iso(), upload_key),
+                )
+
+    def mark_orphan_upload_cleanup_failed(self, upload_key: str) -> None:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_keys SET status = 'orphan_cleanup_failed', updated_at = %s WHERE upload_key = %s AND status = 'cleaning_orphan';",
+                    (utc_now_iso(), upload_key),
+                )
+
+    def recover_orphan_uploads(
+        self,
+        storage: Any,
+        limit: int = 50,
+        claim_ttl_seconds: int = ORPHAN_CLAIM_TTL_SECONDS,
+    ) -> Dict[str, Any]:
+        """
+        Safely delete orphaned Blob objects from expired, incomplete uploads.
+        Idempotent and retry-safe; never deletes objects belonging to finalizing or completed projects.
+        """
+        candidates = self.list_expired_incomplete_uploads(
+            limit=limit,
+            claim_ttl_seconds=claim_ttl_seconds,
+        )
+        cleaned: List[str] = []
+        missing: List[str] = []
+        failed: Dict[str, str] = {}
+        skipped: List[str] = []
+
+        for candidate in candidates:
+            upload_key = candidate["upload_key"]
+            claimed = self.claim_orphan_upload_cleanup(
+                upload_key,
+                claim_ttl_seconds=claim_ttl_seconds,
+            )
+            if not claimed:
+                skipped.append(upload_key)
+                continue
+
+            blob_key = (claimed.get("blob_key") or "").strip()
+            if not blob_key or "/" not in blob_key:
+                self.mark_orphan_upload_cleaned(upload_key)
+                missing.append(upload_key)
+                continue
+
+            proj_prefix, rel_key = blob_key.split("/", 1)
+            if self.get_project(proj_prefix):
+                self.update_upload_key(upload_key, status="completed", project_id=proj_prefix)
+                skipped.append(upload_key)
+                continue
+
+            try:
+                res = storage.delete_object(proj_prefix, rel_key)
+                if res.has_failures:
+                    self.mark_orphan_upload_cleanup_failed(upload_key)
+                    failed[upload_key] = "; ".join(res.failed.values())
+                else:
+                    self.mark_orphan_upload_cleaned(upload_key)
+                    if res.deleted:
+                        cleaned.append(upload_key)
+                    else:
+                        missing.append(upload_key)
+            except Exception as exc:
+                self.mark_orphan_upload_cleanup_failed(upload_key)
+                failed[upload_key] = str(exc)
+
+        return {
+            "processed": len(candidates),
+            "cleaned": cleaned,
+            "missing": missing,
+            "failed": failed,
+            "skipped": skipped,
+        }
+
+    # ============================================================
+    # Permanent Project Deletion (All Assets, Exports & History)
+    # ============================================================
+
+    def _build_project_deletion_preview_in_tx(
+        self,
+        cur: Any,
+        project_id: str,
+        storage: Any = None,
+        lock_project: bool = False,
+    ) -> Dict[str, Any]:
+        if lock_project:
+            cur.execute("SELECT * FROM projects WHERE id = %s FOR UPDATE;", (project_id,))
+        else:
+            cur.execute("SELECT * FROM projects WHERE id = %s;", (project_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Project '{project_id}' not found.")
+        project = self._format_project_row(row)
+
+        blocking_reasons: List[str] = []
+
+        cur.execute(
+            "SELECT id, status FROM jobs WHERE project_id = %s AND status IN ('queued', 'running', 'processing');",
+            (project_id,),
+        )
+        active_jobs = [dict(r) for r in cur.fetchall()]
+        if active_jobs:
+            blocking_reasons.append(
+                f"Project has active background job(s) in progress (e.g. job {active_jobs[0]['id']})."
+            )
+
+        cur.execute(
+            "SELECT id, status FROM exports WHERE project_id = %s AND status IN ('queued', 'running', 'processing');",
+            (project_id,),
+        )
+        active_exports = [dict(r) for r in cur.fetchall()]
+        if active_exports:
+            blocking_reasons.append(
+                f"Project has active export job(s) in progress (e.g. export {active_exports[0]['id']})."
+            )
+
+        cur.execute(
+            """
+            SELECT id, cleanup_mode, status FROM cleanup_operations
+            WHERE project_id = %s AND status IN ('pending', 'deleting_blobs', 'deleting_records');
+            """,
+            (project_id,),
+        )
+        active_ops = [dict(r) for r in cur.fetchall()]
+        if active_ops:
+            blocking_reasons.append(
+                f"Another storage operation ({active_ops[0]['id']}) is already in progress for this project."
+            )
+
+        cstatus = project.get("cleanup_status") or "retained"
+        if cstatus in ("cleaning", "deleting"):
+            blocking_reasons.append(f"Project is currently in '{cstatus}' state.")
+
+        seen_keys: Set[str] = set()
+        target_blob_keys: List[str] = []
+
+        def _add_key(raw_key: Optional[str]) -> None:
+            k = (raw_key or "").strip().lstrip("/")
+            if not k:
+                return
+            prefix = f"{project_id}/"
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+            if k and k not in seen_keys:
+                seen_keys.add(k)
+                target_blob_keys.append(k)
+
+        _add_key(project.get("source_storage_key"))
+        cur.execute(
+            "SELECT file_storage_key FROM image_assets WHERE project_id = %s ORDER BY page_number ASC, placement_index ASC;",
+            (project_id,),
+        )
+        for r in cur.fetchall():
+            _add_key(r["file_storage_key"])
+        cur.execute("SELECT file_storage_key FROM exports WHERE project_id = %s;", (project_id,))
+        for r in cur.fetchall():
+            _add_key(r["file_storage_key"])
+        cur.execute(
+            "SELECT blob_key FROM upload_keys WHERE project_id = %s OR blob_key LIKE %s;",
+            (project_id, f"{project_id}/%"),
+        )
+        for r in cur.fetchall():
+            _add_key(r["blob_key"])
+
+        if storage is not None and hasattr(storage, "list_project_keys"):
+            for k in storage.list_project_keys(project_id):
+                _add_key(k)
+
+        def _count(sql: str, params: tuple) -> int:
+            cur.execute(sql, params)
+            return list(cur.fetchone().values())[0]
+
+        records_summary = {
+            "jobs": _count("SELECT COUNT(*) FROM jobs WHERE project_id = %s;", (project_id,)),
+            "job_batches": _count(
+                "SELECT COUNT(*) FROM job_batches WHERE job_id IN (SELECT id FROM jobs WHERE project_id = %s);",
+                (project_id,),
+            ),
+            "image_assets": _count("SELECT COUNT(*) FROM image_assets WHERE project_id = %s;", (project_id,)),
+            "alt_text_versions": _count(
+                "SELECT COUNT(*) FROM alt_text_versions WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+                (project_id,),
+            ),
+            "approvals": _count(
+                "SELECT COUNT(*) FROM approvals WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+                (project_id,),
+            ),
+            "figure_groups": _count("SELECT COUNT(*) FROM figure_groups WHERE project_id = %s;", (project_id,)),
+            "exports": _count("SELECT COUNT(*) FROM exports WHERE project_id = %s;", (project_id,)),
+            "audit_events": _count("SELECT COUNT(*) FROM audit_events WHERE project_id = %s;", (project_id,)),
+            "ai_usage_ledger": _count("SELECT COUNT(*) FROM ai_usage_ledger WHERE project_id = %s;", (project_id,)),
+            "upload_keys": _count(
+                "SELECT COUNT(*) FROM upload_keys WHERE project_id = %s OR blob_key LIKE %s;",
+                (project_id, f"{project_id}/%"),
+            ),
+        }
+
+        cur.execute(
+            """
+            SELECT * FROM cleanup_operations
+            WHERE project_id = %s AND cleanup_mode = 'delete_project' AND status != 'completed'
+            ORDER BY created_at DESC LIMIT 1;
+            """,
+            (project_id,),
+        )
+        existing_op_row = cur.fetchone()
+        existing_operation = self._format_cleanup_operation_row(existing_op_row) if existing_op_row else None
+        now_dt = datetime.now(timezone.utc)
+        can_resume = False
+        is_active_deletion = False
+        if existing_operation:
+            op_status = existing_operation.get("status")
+            if op_status in ("pending", "failed"):
+                can_resume = True
+            elif op_status in ("deleting_blobs", "deleting_records"):
+                exp_dt = _parse_utc_dt(existing_operation.get("lease_expires_at"))
+                if exp_dt is None or exp_dt <= now_dt:
+                    can_resume = True
+                else:
+                    is_active_deletion = True
+
+        return {
+            "project_id": project_id,
+            "project_name": project.get("name") or "",
+            "can_delete": len(blocking_reasons) == 0,
+            "blocking_reasons": blocking_reasons,
+            "target_blob_keys": target_blob_keys,
+            "target_blob_count": len(target_blob_keys),
+            "records_to_delete": records_summary,
+            "existing_operation": existing_operation,
+            "can_resume": can_resume,
+            "is_active_deletion": is_active_deletion,
+        }
+
+    def preview_project_deletion(self, project_id: str, storage: Any = None) -> Dict[str, Any]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                return self._build_project_deletion_preview_in_tx(cur, project_id, storage=storage, lock_project=False)
+
+    def prepare_project_deletion(self, project_id: str, storage: Any = None) -> Dict[str, Any]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                preview = self._build_project_deletion_preview_in_tx(cur, project_id, storage=storage, lock_project=True)
+                if not preview["can_delete"]:
+                    raise CleanupBlockedError("; ".join(preview["blocking_reasons"]))
+
+                operation_id = str(uuid.uuid4())
+                now = utc_now_iso()
+                cur.execute(
+                    """
+                    INSERT INTO cleanup_operations (
+                        id, project_id, cleanup_mode, status,
+                        target_blob_keys, deleted_blob_keys, missing_blob_keys, failed_blob_keys,
+                        db_records_summary, created_at, updated_at
+                    ) VALUES (%s, %s, 'delete_project', 'pending', %s, '[]', '[]', '{}', %s, %s, %s)
+                    RETURNING *;
+                    """,
+                    (
+                        operation_id,
+                        project_id,
+                        json.dumps(preview["target_blob_keys"]),
+                        json.dumps(preview["records_to_delete"]),
+                        now,
+                        now,
+                    ),
+                )
+                op_row = cur.fetchone()
+                cur.execute(
+                    "UPDATE projects SET cleanup_status = 'deleting', updated_at = %s WHERE id = %s;",
+                    (now, project_id),
+                )
+                return self._format_cleanup_operation_row(op_row)
+
+    def _claim_project_deletion_operation(self, operation_id: str) -> tuple[Dict[str, Any], Optional[str]]:
+        lease_seconds = get_deletion_lease_seconds()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        lease_token = str(uuid.uuid4())
+
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM cleanup_operations WHERE id = %s FOR UPDATE;",
+                    (operation_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError(f"Project deletion operation '{operation_id}' not found.")
+                op = self._format_cleanup_operation_row(row)
+                if op.get("cleanup_mode") != "delete_project":
+                    raise ValueError(f"Project deletion operation '{operation_id}' not found.")
+                status = op["status"]
+                if status == "completed":
+                    return op, None
+                if status in ("deleting_blobs", "deleting_records"):
+                    exp_dt = _parse_utc_dt(op.get("lease_expires_at"))
+                    if exp_dt is not None and exp_dt > now_dt:
+                        raise CleanupBlockedError(
+                            f"Project deletion operation '{operation_id}' is currently active (lease expires at {op.get('lease_expires_at')})."
+                        )
+                elif status not in ("pending", "failed"):
+                    raise CleanupBlockedError(
+                        f"Cannot execute project deletion operation '{operation_id}' in state '{status}'."
+                    )
+
+                next_status = "deleting_records" if status == "deleting_records" else "deleting_blobs"
+                retry_inc = 0 if status == "pending" else 1
+                cur.execute(
+                    """
+                    UPDATE cleanup_operations
+                    SET status = %s,
+                        lease_token = %s,
+                        lease_expires_at = %s,
+                        started_at = COALESCE(started_at, %s),
+                        retry_count = retry_count + %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    RETURNING *;
+                    """,
+                    (next_status, lease_token, lease_expires_at, now, retry_inc, now, operation_id),
+                )
+                updated_row = cur.fetchone()
+                return self._format_cleanup_operation_row(updated_row), lease_token
+
+    def _renew_deletion_lease(self, operation_id: str, lease_token: str) -> None:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires_at = (now_dt + timedelta(seconds=get_deletion_lease_seconds())).isoformat()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cleanup_operations
+                    SET lease_expires_at = %s, updated_at = %s
+                    WHERE id = %s AND lease_token = %s;
+                    """,
+                    (lease_expires_at, now, operation_id, lease_token),
+                )
+                if cur.rowcount == 0:
+                    raise CleanupBlockedError(
+                        f"Deletion lease lost for operation '{operation_id}' (reclaimed by another worker)."
+                    )
+
+    def _record_deletion_failure(
+        self,
+        operation_id: str,
+        lease_token: str,
+        deleted_all: List[str],
+        missing_all: List[str],
+        failed_map: Dict[str, str],
+        err_msg: str,
+    ) -> bool:
+        fail_now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cleanup_operations
+                    SET status = 'failed',
+                        deleted_blob_keys = %s,
+                        missing_blob_keys = %s,
+                        failed_blob_keys = %s,
+                        error_message = %s,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE id = %s AND lease_token = %s;
+                    """,
+                    (
+                        json.dumps(deleted_all),
+                        json.dumps(missing_all),
+                        json.dumps(failed_map),
+                        err_msg[:1000],
+                        fail_now,
+                        operation_id,
+                        lease_token,
+                    ),
+                )
+                return cur.rowcount > 0
+
+    def _run_project_deletion_operation(self, op: Dict[str, Any], storage: Any) -> Dict[str, Any]:
+        operation_id = op["id"]
+        project_id = op["project_id"]
+
+        if op["status"] == "completed":
+            return op
+
+        claimed_op, lease_token = self._claim_project_deletion_operation(operation_id)
+        if claimed_op["status"] == "completed" or lease_token is None:
+            return claimed_op
+
+        deleted_all = list(claimed_op.get("deleted_blob_keys") or [])
+        missing_all = list(claimed_op.get("missing_blob_keys") or [])
+        already_done = set(deleted_all) | set(missing_all)
+        target_keys = list(claimed_op.get("target_blob_keys") or [])
+        remaining_keys = [k for k in target_keys if k not in already_done]
+
+        failed_map: Dict[str, str] = {}
+
+        try:
+            if remaining_keys and claimed_op["status"] != "deleting_records":
+                chunk_size = 50
+                for start in range(0, len(remaining_keys), chunk_size):
+                    self._renew_deletion_lease(operation_id, lease_token)
+                    chunk = remaining_keys[start:start + chunk_size]
+                    del_res = storage.delete_objects(project_id, chunk)
+                    for k in del_res.deleted:
+                        if k not in deleted_all:
+                            deleted_all.append(k)
+                    for k in del_res.missing:
+                        if k not in missing_all:
+                            missing_all.append(k)
+                    for k, reason in (del_res.failed or {}).items():
+                        failed_map[k] = reason
+
+                if failed_map:
+                    err_msg = f"Failed to delete {len(failed_map)} storage object(s)."
+                    if not self._record_deletion_failure(
+                        operation_id, lease_token, deleted_all, missing_all, failed_map, err_msg
+                    ):
+                        raise CleanupBlockedError(
+                            f"Deletion lease lost for operation '{operation_id}' (reclaimed by another worker)."
+                        )
+                    raise StorageError(err_msg)
+
+            self._renew_deletion_lease(operation_id, lease_token)
+
+            if hasattr(storage, "get_project_dir"):
+                p_dir = storage.get_project_dir(project_id)
+                if hasattr(p_dir, "exists") and p_dir.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(p_dir, ignore_errors=True)
+
+            rec_now_dt = datetime.now(timezone.utc)
+            rec_now = rec_now_dt.isoformat()
+            rec_lease_exp = (rec_now_dt + timedelta(seconds=get_deletion_lease_seconds())).isoformat()
+            with self.db.session() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE cleanup_operations
+                        SET status = 'deleting_records',
+                            deleted_blob_keys = %s,
+                            missing_blob_keys = %s,
+                            failed_blob_keys = '{}',
+                            error_message = NULL,
+                            lease_expires_at = %s,
+                            updated_at = %s
+                        WHERE id = %s AND lease_token = %s;
+                        """,
+                        (json.dumps(deleted_all), json.dumps(missing_all), rec_lease_exp, rec_now, operation_id, lease_token),
+                    )
+                    if cur.rowcount == 0:
+                        raise CleanupBlockedError(
+                            f"Deletion lease lost for operation '{operation_id}' before database finalization."
+                        )
+                    cur.execute(
+                        "DELETE FROM approvals WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+                        (project_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM alt_text_versions WHERE image_id IN (SELECT id FROM image_assets WHERE project_id = %s);",
+                        (project_id,),
+                    )
+                    cur.execute("DELETE FROM ai_usage_ledger WHERE project_id = %s;", (project_id,))
+                    cur.execute(
+                        "DELETE FROM job_batches WHERE job_id IN (SELECT id FROM jobs WHERE project_id = %s);",
+                        (project_id,),
+                    )
+                    cur.execute("DELETE FROM jobs WHERE project_id = %s;", (project_id,))
+                    cur.execute("DELETE FROM exports WHERE project_id = %s;", (project_id,))
+                    cur.execute("DELETE FROM image_assets WHERE project_id = %s;", (project_id,))
+                    cur.execute("DELETE FROM figure_groups WHERE project_id = %s;", (project_id,))
+                    cur.execute("DELETE FROM audit_events WHERE project_id = %s;", (project_id,))
+                    cur.execute(
+                        "DELETE FROM upload_keys WHERE project_id = %s OR blob_key LIKE %s;",
+                        (project_id, f"{project_id}/%"),
+                    )
+                    cur.execute("DELETE FROM cleanup_operations WHERE project_id = %s;", (project_id,))
+                    cur.execute("DELETE FROM projects WHERE id = %s;", (project_id,))
+
+            return {
+                "id": operation_id,
+                "project_id": project_id,
+                "cleanup_mode": "delete_project",
+                "status": "completed",
+                "target_blob_keys": target_keys,
+                "deleted_blob_keys": deleted_all,
+                "missing_blob_keys": missing_all,
+                "failed_blob_keys": {},
+                "db_records_summary": claimed_op.get("db_records_summary") or {},
+                "completed_at": rec_now,
+            }
+        except (CleanupBlockedError, StorageError):
+            raise
+        except Exception as exc:
+            self._record_deletion_failure(
+                operation_id, lease_token, deleted_all, missing_all, failed_map, str(exc)
+            )
+            raise StorageError(f"Project deletion failed: {exc}") from exc
+
+    def execute_project_deletion(self, project_id: str, storage: Any) -> Dict[str, Any]:
+        op = self.prepare_project_deletion(project_id, storage=storage)
+        return self._run_project_deletion_operation(op, storage)
+
+    def retry_project_deletion(self, operation_id: str, storage: Any) -> Dict[str, Any]:
+        op = self.get_cleanup_operation(operation_id)
+        if not op or op.get("cleanup_mode") != "delete_project":
+            raise ValueError(f"Project deletion operation '{operation_id}' not found.")
+        if op["status"] == "completed":
+            return op
+        return self._run_project_deletion_operation(op, storage)

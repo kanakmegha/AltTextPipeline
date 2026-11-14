@@ -285,6 +285,24 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  // --- Post-Export Storage Cleanup ---
+  const openExportCleanupBtn = document.getElementById("openExportCleanupBtn");
+  if (openExportCleanupBtn) {
+    openExportCleanupBtn.addEventListener("click", () => {
+      if (typeof window.openCleanupModal === "function") {
+        window.openCleanupModal({
+          projectId,
+          projectName: currentProject?.project_name || currentProject?.name || "Project",
+          onComplete: () => {
+            refreshExportStatus();
+          },
+        });
+      } else {
+        alert("Cleanup modal is loading, please try again in a moment.");
+      }
+    });
+  }
+
   function escapeHtml(str) {
     if (!str) return "";
     return String(str)

@@ -2,17 +2,23 @@
   "private": true,
   "scripts": {
     "test": "node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit",
     "build": "npm run build:frontend",
     "build:frontend": "esbuild src/web/static/upload.js --bundle --format=iife --outfile=src/web/static/upload.bundle.js",
     "test:frontend": "node --test tests/*.test.mjs"
   },
   "dependencies": {
+    "@types/node": "^22.20.5",
     "@vercel/blob": "^2.0.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "typescript": "^7.0.2"
   },
   "overrides": {
-    "zod": ">=4.6.6"
+    "zod": ">=4.6.6",
+    "@types/node": {
+      "undici-types": "~8.9.0"
+    }
   }
 }

@@ -10,45 +10,27 @@ import os
 import shutil
 import hashlib
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Sequence, List, Dict, Any
+
+from .base_storage import (
+    BaseStorage,
+    StorageError,
+    PathTraversalError,
+    CleanupBlockedError,
+    DeletionResult,
+    validate_storage_key,
+    calculate_sha256,
+    calculate_file_sha256,
+)
 
 
-class StorageError(Exception):
-    """Base exception for storage operations."""
-    pass
-
-
-class PathTraversalError(StorageError):
-    """Raised when an unsafe path attempts to escape the project directory."""
-    pass
-
-
-class CleanupBlockedError(StorageError):
-    """Raised when a cleanup is attempted on active or unverified project assets."""
-    pass
-
-
-def calculate_sha256(data_bytes: bytes) -> str:
-    """Computes SHA-256 hash of bytes."""
-    return hashlib.sha256(data_bytes).hexdigest()
-
-
-def calculate_file_sha256(filepath: str) -> str:
-    """Computes SHA-256 hash of a file on disk."""
-    hasher = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(65536):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-class FileStore:
+class FileStore(BaseStorage):
     """
     Manages per-project isolated temporary storage on the filesystem.
     """
 
     def __init__(self, base_dir: str):
-        self.base_dir = Path(os.path.abspath(base_dir))
+        self.base_dir = Path(os.path.abspath(base_dir)).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_project_dir(self, project_id: str) -> Path:
@@ -176,15 +158,76 @@ class FileStore:
     def resolve_path(self, project_id: str, relative_key: str) -> Path:
         """
         Safely resolves a relative storage key within the project's directory.
-        Prevents path traversal attacks.
+        Prevents path traversal attacks and cross-project access.
         """
+        norm_key = validate_storage_key(project_id, relative_key)
         p_dir = self.get_project_dir(project_id)
-        target = (p_dir / relative_key).resolve()
+        target = (p_dir / norm_key).resolve()
 
         if not str(target).startswith(str(p_dir)):
             raise PathTraversalError(f"Unsafe path traversal detected: {relative_key}")
 
         return target
+
+    def exists(self, project_id: str, relative_key: str) -> bool:
+        """Check whether a stored object exists."""
+        try:
+            path = self.resolve_path(project_id, relative_key)
+            return path.is_file()
+        except PathTraversalError:
+            raise
+        except Exception:
+            return False
+
+    def delete_object(self, project_id: str, relative_key: str) -> DeletionResult:
+        """
+        Deletes a single object within project storage.
+        Idempotent: missing objects are recorded in result.missing.
+        """
+        result = DeletionResult()
+        target = self.resolve_path(project_id, relative_key)
+
+        try:
+            if target.is_file():
+                target.unlink()
+                result.deleted.append(relative_key)
+            elif target.is_dir():
+                result.failed[relative_key] = f"Cannot delete directory as an object: {relative_key}"
+            else:
+                result.missing.append(relative_key)
+        except Exception as exc:
+            result.failed[relative_key] = str(exc)
+
+        return result
+
+    def delete_objects(self, project_id: str, relative_keys: Sequence[str]) -> DeletionResult:
+        """
+        Deletes multiple objects within project storage.
+        Idempotent: missing objects are recorded in result.missing.
+        Failed deletions are recorded in result.failed without halting processing.
+        """
+        result = DeletionResult()
+        if not relative_keys:
+            return result
+
+        validated = []
+        for key in relative_keys:
+            target = self.resolve_path(project_id, key)
+            validated.append((key, target))
+
+        for key, target in validated:
+            try:
+                if target.is_file():
+                    target.unlink()
+                    result.deleted.append(key)
+                elif target.is_dir():
+                    result.failed[key] = f"Cannot delete directory as an object: {key}"
+                else:
+                    result.missing.append(key)
+            except Exception as exc:
+                result.failed[key] = str(exc)
+
+        return result
 
     def read_bytes(self, project_id: str, relative_key: str) -> bytes:
         """Reads file bytes for a verified project storage key."""
@@ -203,6 +246,48 @@ class FileStore:
                 "content_type": content_type, "etag": None}
 
     read_file = read_bytes
+
+    def download_to_file(
+        self,
+        project_id: str,
+        relative_key: str,
+        destination_path: str,
+    ) -> Tuple[int, str]:
+        """Stream local file into destination_path in chunks, computing SHA-256."""
+        path = self.resolve_path(project_id, relative_key)
+        if not path.is_file():
+            raise FileNotFoundError(f"Storage asset not found: {relative_key}")
+
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        try:
+            with open(path, "rb") as src, open(destination_path, "wb") as dst:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    hasher.update(chunk)
+                    total_bytes += len(chunk)
+            return total_bytes, hasher.hexdigest()
+        except Exception:
+            if os.path.exists(destination_path):
+                try:
+                    os.unlink(destination_path)
+                except OSError:
+                    pass
+            raise
+
+    def list_project_keys(self, project_id: str) -> List[str]:
+        """List all relative file keys inside project_id's directory."""
+        p_dir = self.get_project_dir(project_id)
+        if not p_dir.exists():
+            return []
+        keys: List[str] = []
+        for item in sorted(p_dir.rglob("*")):
+            if item.is_file():
+                keys.append(item.relative_to(p_dir).as_posix())
+        return keys
 
     def cleanup_project(
         self,

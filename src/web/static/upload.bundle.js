@@ -1,3 +1,4 @@
+"use strict";
 (() => {
   var __create = Object.create;
   var __defProp = Object.defineProperty;
@@ -4787,6 +4788,7 @@ ${newlined}
   // src/web/static/upload-status.js
   var require_upload_status = __commonJS({
     "src/web/static/upload-status.js"(exports, module) {
+      "use strict";
       function getProjectReviewUrl2(status, projectId) {
         if (status !== "completed" && status !== "ready_for_review") return null;
         return `/review/${encodeURIComponent(projectId)}`;
@@ -6511,6 +6513,699 @@ ${newlined}
 
   // src/web/static/upload.js
   var import_upload_status = __toESM(require_upload_status());
+
+  // src/web/static/cleanup-modal.js
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+  var modalElement = null;
+  function ensureModalDom() {
+    if (modalElement && document.body.contains(modalElement)) {
+      return modalElement;
+    }
+    const div = document.createElement("div");
+    div.id = "cleanupModalBackdrop";
+    div.className = "modal-backdrop";
+    div.style.display = "none";
+    div.setAttribute("role", "dialog");
+    div.setAttribute("aria-modal", "true");
+    div.setAttribute("aria-labelledby", "cleanupModalTitle");
+    div.innerHTML = `
+    <div class="modal-dialog" style="max-width: 620px; width: 90%; margin: 40px auto; background: var(--panel-bg, #1e1e24); border: 1px solid var(--border-color, #333); border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+      <div class="modal-header" style="display: flex; justify-content: space-between; align-items: flex-start; padding: 16px 20px; border-bottom: 1px solid var(--border-color, #333);">
+        <div class="modal-title-wrap">
+          <h3 id="cleanupModalTitle" style="margin: 0; font-size: 18px; color: var(--text-color, #fff);">Project Storage Cleanup</h3>
+          <p id="cleanupModalSubtitle" class="text-muted" style="margin: 4px 0 0 0; font-size: 13px;"></p>
+        </div>
+        <button type="button" id="closeCleanupModalBtn" class="modal-close-btn" aria-label="Close dialog" style="background: none; border: none; font-size: 20px; color: #888; cursor: pointer;">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 18px 20px;">
+        <!-- Mode Selection -->
+        <div class="cleanup-mode-selector" style="margin-bottom: 16px;">
+          <label style="font-weight: 600; font-size: 13px; display: block; margin-bottom: 8px;">Select Cleanup Mode:</label>
+          <div style="display: flex; gap: 10px;">
+            <label class="cleanup-mode-card" id="modeACard" style="flex: 1; border: 2px solid #3b82f6; background: rgba(59,130,246,0.08); padding: 10px 12px; border-radius: 6px; cursor: pointer; transition: all 0.2s ease;">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <input type="radio" name="cleanupModeRadio" value="extracted" checked id="modeARadio" />
+                <strong style="font-size: 13px;">Mode A: Clean Extracted Data</strong>
+              </div>
+              <span class="text-muted" style="font-size: 11px; display: block; margin-top: 4px; line-height: 1.4;">
+                Deletes extracted images and temporary batch metadata.<br />
+                <strong>Preserves</strong> original PDF and all exported Word DOCX files.
+              </span>
+            </label>
+            <label class="cleanup-mode-card" id="modeBCard" style="flex: 1; border: 1px solid var(--border-color, #444); background: rgba(255,255,255,0.02); padding: 10px 12px; border-radius: 6px; cursor: pointer; transition: all 0.2s ease;">
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <input type="radio" name="cleanupModeRadio" value="all_source" id="modeBRadio" />
+                <strong style="font-size: 13px;">Mode B: Clean Source &amp; Extracted</strong>
+              </div>
+              <span class="text-muted" style="font-size: 11px; display: block; margin-top: 4px; line-height: 1.4;">
+                Deletes extracted images, temporary batches, and original source PDF.<br />
+                <strong>Preserves</strong> all exported Word DOCX files and history.
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Preview Manifest Box -->
+        <div id="cleanupPreviewContent" style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 14px; margin-bottom: 16px;">
+          <div id="cleanupPreviewLoading" style="display: flex; align-items: center; gap: 8px; font-size: 13px;">
+            <span>\u23F3</span> <span>Inspecting project assets and preparing preview\u2026</span>
+          </div>
+          <div id="cleanupPreviewDetails" style="display: none;">
+            <div style="margin-bottom: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="font-weight: 600; font-size: 13px; color: #f87171;">\u{1F5D1}\uFE0F To be deleted:</span>
+                <span id="cleanupDeleteCounts" style="font-weight: 600; font-size: 12px; color: #f87171;"></span>
+              </div>
+              <ul id="cleanupDeleteList" style="margin: 0; padding-left: 20px; font-size: 12px; color: #fca5a5; line-height: 1.5;"></ul>
+            </div>
+
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="font-weight: 600; font-size: 13px; color: #34d399;">\u{1F6E1}\uFE0F To be retained (Protected):</span>
+                <span id="cleanupRetainCounts" style="font-weight: 600; font-size: 12px; color: #34d399;"></span>
+              </div>
+              <ul id="cleanupRetainList" style="margin: 0; padding-left: 20px; font-size: 12px; color: #6ee7b7; line-height: 1.5;"></ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Blocking / Warning Alert -->
+        <div id="cleanupBlockingAlert" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 6px; padding: 12px; margin-bottom: 16px; color: #fca5a5; font-size: 12px;">
+          <strong style="display: block; margin-bottom: 4px;">\u26A0\uFE0F Cleanup cannot proceed:</strong>
+          <ul id="cleanupBlockingList" style="margin: 0; padding-left: 18px; line-height: 1.4;"></ul>
+        </div>
+
+        <!-- Progress / Status Box -->
+        <div id="cleanupProgressBox" style="display: none; margin-bottom: 16px; padding: 12px; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color, #444);">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="cleanupProgressIcon" style="font-size: 16px;">\u23F3</span>
+            <span id="cleanupProgressText" style="font-size: 13px; font-weight: 600;"></span>
+          </div>
+          <div id="cleanupFailedBox" style="display: none; margin-top: 10px; padding: 10px; background: rgba(239,68,68,0.15); border: 1px solid #ef4444; border-radius: 4px; font-size: 12px;">
+            <strong>Some storage objects could not be deleted:</strong>
+            <ul id="cleanupFailedKeysList" style="margin: 4px 0 8px 16px; word-break: break-all;"></ul>
+            <button type="button" id="cleanupRetryBtn" class="btn-secondary btn-sm" style="margin-top: 4px;">Retry Deletion</button>
+          </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div style="display: flex; justify-content: flex-end; gap: 10px; padding-top: 8px; border-top: 1px solid var(--border-color, #333);">
+          <button type="button" id="cancelCleanupBtn" class="btn-secondary" style="padding: 6px 14px;">Cancel</button>
+          <button type="button" id="confirmCleanupBtn" class="btn-primary" style="padding: 6px 16px; background: #dc2626; border-color: #dc2626;">Confirm Clean up</button>
+        </div>
+      </div>
+    </div>
+  `;
+    document.body.appendChild(div);
+    modalElement = div;
+    return div;
+  }
+  function openCleanupModal({ projectId, projectName = "", onComplete = null }) {
+    const modal = ensureModalDom();
+    const titleEl = modal.querySelector("#cleanupModalTitle");
+    const subtitleEl = modal.querySelector("#cleanupModalSubtitle");
+    const closeBtn = modal.querySelector("#closeCleanupModalBtn");
+    const cancelBtn = modal.querySelector("#cancelCleanupBtn");
+    const confirmBtn = modal.querySelector("#confirmCleanupBtn");
+    const modeARadio = modal.querySelector("#modeARadio");
+    const modeBRadio = modal.querySelector("#modeBRadio");
+    const modeACard = modal.querySelector("#modeACard");
+    const modeBCard = modal.querySelector("#modeBCard");
+    const previewLoading = modal.querySelector("#cleanupPreviewLoading");
+    const previewDetails = modal.querySelector("#cleanupPreviewDetails");
+    const deleteCounts = modal.querySelector("#cleanupDeleteCounts");
+    const deleteList = modal.querySelector("#cleanupDeleteList");
+    const retainCounts = modal.querySelector("#cleanupRetainCounts");
+    const retainList = modal.querySelector("#cleanupRetainList");
+    const blockingAlert = modal.querySelector("#cleanupBlockingAlert");
+    const blockingList = modal.querySelector("#cleanupBlockingList");
+    const progressBox = modal.querySelector("#cleanupProgressBox");
+    const progressIcon = modal.querySelector("#cleanupProgressIcon");
+    const progressText = modal.querySelector("#cleanupProgressText");
+    const failedBox = modal.querySelector("#cleanupFailedBox");
+    const failedKeysList = modal.querySelector("#cleanupFailedKeysList");
+    const retryBtn = modal.querySelector("#cleanupRetryBtn");
+    let currentMode = "extracted";
+    let activeOperationId = null;
+    let isExecuting = false;
+    subtitleEl.textContent = projectName ? `Project: ${projectName}` : `Project ID: ${projectId}`;
+    modeARadio.checked = true;
+    currentMode = "extracted";
+    updateModeCardStyles();
+    previewLoading.style.display = "flex";
+    previewDetails.style.display = "none";
+    blockingAlert.style.display = "none";
+    progressBox.style.display = "none";
+    failedBox.style.display = "none";
+    confirmBtn.disabled = true;
+    confirmBtn.style.display = "inline-block";
+    confirmBtn.textContent = "Confirm Clean up";
+    cancelBtn.textContent = "Cancel";
+    function updateModeCardStyles() {
+      if (currentMode === "extracted") {
+        modeACard.style.borderColor = "#3b82f6";
+        modeACard.style.background = "rgba(59,130,246,0.1)";
+        modeBCard.style.borderColor = "var(--border-color, #444)";
+        modeBCard.style.background = "rgba(255,255,255,0.02)";
+      } else {
+        modeBCard.style.borderColor = "#ef4444";
+        modeBCard.style.background = "rgba(239,68,68,0.1)";
+        modeACard.style.borderColor = "var(--border-color, #444)";
+        modeACard.style.background = "rgba(255,255,255,0.02)";
+      }
+    }
+    async function loadPreview() {
+      previewLoading.style.display = "flex";
+      previewDetails.style.display = "none";
+      blockingAlert.style.display = "none";
+      confirmBtn.disabled = true;
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/cleanup/preview?mode=${encodeURIComponent(currentMode)}`, {
+          credentials: "include"
+        });
+        if (!res.ok) {
+          let errMessage = `Error ${res.status}`;
+          try {
+            const errData = await res.json();
+            errMessage = errData.detail?.message || errData.detail || errMessage;
+          } catch (_) {
+          }
+          throw new Error(errMessage);
+        }
+        const data = await res.json();
+        const preview = data.preview || {};
+        previewLoading.style.display = "none";
+        previewDetails.style.display = "block";
+        const targetBlobCount = preview.target_blob_count || 0;
+        const recDelete = preview.records_to_delete || {};
+        const preserved = preview.preserved_assets || {};
+        const exportKeys = preserved.export_storage_keys || [];
+        const sourceKey = preserved.source_storage_key || "";
+        const sourceFilename = sourceKey ? sourceKey.split("/").pop() : "source.pdf";
+        deleteCounts.textContent = `${targetBlobCount} storage files`;
+        deleteList.innerHTML = `
+        <li><strong>${recDelete.image_assets || 0}</strong> extracted image assets</li>
+        <li><strong>${recDelete.job_batches || 0}</strong> extraction batch records</li>
+        <li><strong>${recDelete.jobs || 0}</strong> extraction jobs</li>
+        ${currentMode === "all_source" && sourceKey ? `<li><strong>1</strong> source PDF file (${escapeHtml(sourceFilename)})</li>` : `<li>Source PDF: <em>Preserved (Not deleted)</em></li>`}
+      `;
+        retainCounts.textContent = `${exportKeys.length} DOCX export(s)`;
+        const exportListHtml = exportKeys.length > 0 ? `<li><strong>${exportKeys.length}</strong> exported Word (DOCX) files</li>` : `<li>Exported Word files: <em>None created yet</em></li>`;
+        retainList.innerHTML = `
+        ${exportListHtml}
+        <li><strong>${preserved.audit_events_count || 0}</strong> editorial audit &amp; approval records</li>
+        <li><strong>${preserved.ai_usage_count || 0}</strong> AI usage ledger records</li>
+        ${currentMode === "extracted" && sourceKey ? `<li><strong>1</strong> original source PDF (${escapeHtml(sourceFilename)})</li>` : ""}
+      `;
+        if (!preview.can_cleanup || preview.blocking_reasons && preview.blocking_reasons.length > 0) {
+          blockingAlert.style.display = "block";
+          blockingList.innerHTML = (preview.blocking_reasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("");
+          confirmBtn.disabled = true;
+        } else {
+          blockingAlert.style.display = "none";
+          confirmBtn.disabled = false;
+        }
+      } catch (err) {
+        previewLoading.style.display = "none";
+        blockingAlert.style.display = "block";
+        blockingList.innerHTML = `<li>Failed to fetch cleanup preview: ${escapeHtml(err.message)}</li>`;
+        confirmBtn.disabled = true;
+      }
+    }
+    function closeModal() {
+      if (isExecuting) return;
+      modal.style.display = "none";
+      document.removeEventListener("keydown", onKeyDown);
+    }
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        closeModal();
+      }
+    }
+    closeBtn.onclick = closeModal;
+    cancelBtn.onclick = closeModal;
+    document.addEventListener("keydown", onKeyDown);
+    modeARadio.onchange = () => {
+      currentMode = "extracted";
+      updateModeCardStyles();
+      loadPreview();
+    };
+    modeBRadio.onchange = () => {
+      currentMode = "all_source";
+      updateModeCardStyles();
+      loadPreview();
+    };
+    confirmBtn.onclick = async () => {
+      isExecuting = true;
+      confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
+      modeARadio.disabled = true;
+      modeBRadio.disabled = true;
+      progressBox.style.display = "block";
+      failedBox.style.display = "none";
+      progressIcon.textContent = "\u23F3";
+      progressText.textContent = `Cleaning up project storage (${currentMode === "extracted" ? "Mode A: Extracted Data" : "Mode B: Source & Extracted Data"})\u2026`;
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/cleanup/execute`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ mode: currentMode })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          let msg = `Cleanup failed (HTTP ${res.status})`;
+          if (data && data.detail) {
+            if (typeof data.detail === "object" && data.detail.blocking_reasons) {
+              msg = data.detail.blocking_reasons.join(" ");
+            } else if (typeof data.detail === "string") {
+              msg = data.detail;
+            }
+          }
+          throw new Error(msg);
+        }
+        const op = data.operation || {};
+        activeOperationId = op.id;
+        if (op.status === "completed") {
+          progressIcon.textContent = "\u2705";
+          progressText.textContent = `Cleanup completed successfully! Extracted data purged, exports preserved.`;
+          confirmBtn.style.display = "none";
+          cancelBtn.disabled = false;
+          cancelBtn.textContent = "Close";
+          isExecuting = false;
+          if (typeof onComplete === "function") {
+            onComplete(op);
+          }
+        } else if (op.status === "failed") {
+          progressIcon.textContent = "\u26A0\uFE0F";
+          progressText.textContent = `Cleanup failed with ${Object.keys(op.failed_blob_keys || {}).length} failed object(s).`;
+          renderFailedKeys(op.failed_blob_keys || {});
+          cancelBtn.disabled = false;
+          isExecuting = false;
+        }
+      } catch (err) {
+        progressIcon.textContent = "\u274C";
+        progressText.textContent = `Error: ${err.message}`;
+        cancelBtn.disabled = false;
+        isExecuting = false;
+      }
+    };
+    function renderFailedKeys(failedKeys) {
+      const keys = Object.keys(failedKeys);
+      if (keys.length === 0) {
+        failedBox.style.display = "none";
+        return;
+      }
+      failedBox.style.display = "block";
+      failedKeysList.innerHTML = keys.map((k) => `<li><code>${escapeHtml(k)}</code>: ${escapeHtml(failedKeys[k])}</li>`).join("");
+      retryBtn.onclick = async () => {
+        retryBtn.disabled = true;
+        retryBtn.textContent = "Retrying...";
+        try {
+          const res = await fetch(`/api/cleanup/${encodeURIComponent(activeOperationId)}/retry`, {
+            method: "POST",
+            credentials: "include"
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Retry failed");
+          const op = data.operation || {};
+          if (op.status === "completed") {
+            progressIcon.textContent = "\u2705";
+            progressText.textContent = `Retry completed successfully! All storage objects cleaned up.`;
+            failedBox.style.display = "none";
+            confirmBtn.style.display = "none";
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = "Close";
+            if (typeof onComplete === "function") {
+              onComplete(op);
+            }
+          } else {
+            renderFailedKeys(op.failed_blob_keys || {});
+            retryBtn.disabled = false;
+            retryBtn.textContent = "Retry Deletion";
+          }
+        } catch (e) {
+          alert(`Retry error: ${e.message}`);
+          retryBtn.disabled = false;
+          retryBtn.textContent = "Retry Deletion";
+        }
+      };
+    }
+    modal.style.display = "block";
+    loadPreview();
+  }
+  if (typeof window !== "undefined") {
+    window.openCleanupModal = openCleanupModal;
+  }
+
+  // src/web/static/delete-project-modal.js
+  function escapeHtml2(str) {
+    if (!str) return "";
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+  var deleteModalElement = null;
+  function ensureDeleteModalDom() {
+    if (deleteModalElement && document.body.contains(deleteModalElement)) {
+      return deleteModalElement;
+    }
+    const div = document.createElement("div");
+    div.id = "deleteProjectModalBackdrop";
+    div.className = "modal-backdrop";
+    div.style.display = "none";
+    div.setAttribute("role", "dialog");
+    div.setAttribute("aria-modal", "true");
+    div.setAttribute("aria-labelledby", "deleteProjectModalTitle");
+    div.innerHTML = `
+    <div class="modal-dialog" style="max-width: 580px; width: 90%; margin: 40px auto; background: var(--panel-bg, #1e1e24); border: 1px solid #ef4444; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.6);">
+      <div class="modal-header" style="display: flex; justify-content: space-between; align-items: flex-start; padding: 16px 20px; border-bottom: 1px solid var(--border-color, #333);">
+        <div>
+          <h3 id="deleteProjectModalTitle" style="margin: 0; font-size: 18px; color: #f87171;">Permanently Delete Project</h3>
+          <p id="deleteProjectModalSubtitle" class="text-muted" style="margin: 4px 0 0 0; font-size: 13px;"></p>
+        </div>
+        <button type="button" id="closeDeleteProjectModalBtn" class="modal-close-btn" aria-label="Close dialog" style="background: none; border: none; font-size: 20px; color: #888; cursor: pointer;">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 18px 20px;">
+        <div style="background: rgba(239,68,68,0.12); border: 1px solid #ef4444; border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12.5px; color: #fca5a5; line-height: 1.5;">
+          <strong>Warning \u2014 Permanent &amp; Irreversible Action:</strong><br />
+          All project content and exports will be permanently deleted, including the original source PDF, extracted images, generated/approved alt text, version history, and all exported DOCX files.
+        </div>
+
+        <div id="deleteProjectPreviewBox" style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12px;">
+          <div id="deleteProjectPreviewLoading">Inspecting project records and storage objects\u2026</div>
+          <div id="deleteProjectPreviewDetails" style="display: none;">
+            <div style="font-weight: 600; margin-bottom: 6px; color: #f87171;">Items to be permanently deleted:</div>
+            <ul id="deleteProjectManifestList" style="margin: 0; padding-left: 18px; color: #fca5a5; line-height: 1.5;"></ul>
+          </div>
+        </div>
+
+        <div id="deleteProjectBlockingAlert" style="display: none; background: rgba(239,68,68,0.15); border: 1px solid #ef4444; border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; color: #fca5a5; font-size: 12px;">
+          <strong>Cannot delete project right now:</strong>
+          <ul id="deleteProjectBlockingList" style="margin: 4px 0 0 18px;"></ul>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label for="deleteProjectConfirmInput" style="display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 6px;">
+            Type <code id="deleteProjectExpectedName" style="color: #fca5a5;"></code> to confirm permanent deletion:
+          </label>
+          <input type="text" id="deleteProjectConfirmInput" autocomplete="off" placeholder="Type exact project name" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 4px; border: 1px solid var(--border-color, #444); background: rgba(0,0,0,0.3); color: inherit; font-size: 13px;" />
+        </div>
+
+        <div id="deleteProjectProgressBox" style="display: none; margin-bottom: 14px; padding: 10px 12px; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color, #444); font-size: 12.5px;">
+          <div id="deleteProjectProgressText"></div>
+          <div id="deleteProjectFailedBox" style="display: none; margin-top: 8px; padding: 8px; background: rgba(239,68,68,0.15); border: 1px solid #ef4444; border-radius: 4px;">
+            <strong>Deletion incomplete \u2014 some storage objects could not be deleted:</strong>
+            <ul id="deleteProjectFailedList" style="margin: 4px 0 8px 16px; word-break: break-all;"></ul>
+            <button type="button" id="deleteProjectRetryBtn" class="btn-secondary btn-sm">Retry Deletion</button>
+          </div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; padding-top: 8px; border-top: 1px solid var(--border-color, #333);">
+          <button type="button" id="cancelDeleteProjectBtn" class="btn-secondary" style="padding: 6px 14px;">Cancel</button>
+          <button type="button" id="confirmDeleteProjectBtn" class="btn-primary" disabled style="padding: 6px 16px; background: #dc2626; border-color: #dc2626;">Permanently Delete Project</button>
+        </div>
+      </div>
+    </div>
+  `;
+    document.body.appendChild(div);
+    deleteModalElement = div;
+    return div;
+  }
+  function openDeleteProjectModal({ projectId, projectName = "", onComplete = null }) {
+    const modal = ensureDeleteModalDom();
+    const subtitleEl = modal.querySelector("#deleteProjectModalSubtitle");
+    const expectedNameEl = modal.querySelector("#deleteProjectExpectedName");
+    const confirmInput = modal.querySelector("#deleteProjectConfirmInput");
+    const closeBtn = modal.querySelector("#closeDeleteProjectModalBtn");
+    const cancelBtn = modal.querySelector("#cancelDeleteProjectBtn");
+    const confirmBtn = modal.querySelector("#confirmDeleteProjectBtn");
+    const previewLoading = modal.querySelector("#deleteProjectPreviewLoading");
+    const previewDetails = modal.querySelector("#deleteProjectPreviewDetails");
+    const manifestList = modal.querySelector("#deleteProjectManifestList");
+    const blockingAlert = modal.querySelector("#deleteProjectBlockingAlert");
+    const blockingList = modal.querySelector("#deleteProjectBlockingList");
+    const progressBox = modal.querySelector("#deleteProjectProgressBox");
+    const progressText = modal.querySelector("#deleteProjectProgressText");
+    const failedBox = modal.querySelector("#deleteProjectFailedBox");
+    const failedList = modal.querySelector("#deleteProjectFailedList");
+    const retryBtn = modal.querySelector("#deleteProjectRetryBtn");
+    let expectedName = (projectName || "").trim();
+    let canDelete = false;
+    let isDeleting = false;
+    let activeOperationId = null;
+    let pollTimer = null;
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+    subtitleEl.textContent = expectedName ? `Project: ${expectedName}` : `Project ID: ${projectId}`;
+    expectedNameEl.textContent = expectedName;
+    confirmInput.value = "";
+    confirmInput.disabled = false;
+    confirmBtn.disabled = true;
+    confirmBtn.style.display = "inline-block";
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "Cancel";
+    previewLoading.style.display = "block";
+    previewDetails.style.display = "none";
+    blockingAlert.style.display = "none";
+    progressBox.style.display = "none";
+    failedBox.style.display = "none";
+    function updateConfirmButtonState() {
+      const typed = (confirmInput.value || "").trim();
+      confirmBtn.disabled = isDeleting || !canDelete || !expectedName || typed !== expectedName;
+    }
+    confirmInput.oninput = updateConfirmButtonState;
+    function closeModal() {
+      if (isDeleting) return;
+      stopPolling();
+      modal.style.display = "none";
+    }
+    closeBtn.onclick = closeModal;
+    cancelBtn.onclick = closeModal;
+    function pollExistingOperation(opId) {
+      stopPolling();
+      pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/cleanup/${encodeURIComponent(opId)}`, {
+            credentials: "include"
+          });
+          if (res.status === 404) {
+            stopPolling();
+            progressText.textContent = "Project and all associated data permanently deleted.";
+            failedBox.style.display = "none";
+            confirmBtn.style.display = "none";
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = "Close";
+            isDeleting = false;
+            if (typeof onComplete === "function") onComplete({ id: opId, status: "completed" });
+            return;
+          }
+          if (!res.ok) return;
+          const data = await res.json();
+          const op = data.operation || {};
+          if (op.status === "completed") {
+            stopPolling();
+            progressText.textContent = "Project and all associated data permanently deleted.";
+            failedBox.style.display = "none";
+            confirmBtn.style.display = "none";
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = "Close";
+            isDeleting = false;
+            if (typeof onComplete === "function") onComplete(op);
+            return;
+          }
+          const expMs = op.lease_expires_at ? Date.parse(op.lease_expires_at) : 0;
+          const isStale = op.status === "failed" || op.status === "pending" || !expMs || expMs <= Date.now();
+          if (isStale) {
+            stopPolling();
+            isDeleting = false;
+            cancelBtn.disabled = false;
+            renderRecoverableOperation(op);
+          } else {
+            progressText.textContent = `Deletion in progress (status: ${op.status})\u2026`;
+          }
+        } catch (_) {
+        }
+      }, 1500);
+    }
+    function renderRecoverableOperation(op) {
+      activeOperationId = op.id;
+      canDelete = false;
+      confirmInput.disabled = true;
+      confirmBtn.style.display = "none";
+      blockingAlert.style.display = "none";
+      progressBox.style.display = "block";
+      const errSuffix = op.error_message ? ` \u2014 ${op.error_message}` : "";
+      progressText.textContent = `Incomplete deletion found (status: ${op.status})${errSuffix}.`;
+      renderFailedKeys(op.failed_blob_keys || {}, { allowResumeWithoutFailedKeys: true });
+      updateConfirmButtonState();
+    }
+    async function loadPreview() {
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/delete/preview`, {
+          credentials: "include"
+        });
+        if (!res.ok) {
+          let msg = `Error ${res.status}`;
+          try {
+            const errData = await res.json();
+            msg = errData.detail || msg;
+          } catch (_) {
+          }
+          throw new Error(msg);
+        }
+        const data = await res.json();
+        const preview = data.preview || {};
+        if (preview.project_name) {
+          expectedName = preview.project_name.trim();
+          expectedNameEl.textContent = expectedName;
+          subtitleEl.textContent = `Project: ${expectedName}`;
+        }
+        const recs = preview.records_to_delete || {};
+        previewLoading.style.display = "none";
+        previewDetails.style.display = "block";
+        manifestList.innerHTML = `
+        <li><strong>${preview.target_blob_count || 0}</strong> storage object(s) (source PDF, images, and DOCX exports)</li>
+        <li><strong>${recs.image_assets || 0}</strong> image asset record(s) &amp; alt text</li>
+        <li><strong>${recs.exports || 0}</strong> DOCX export record(s)</li>
+        <li><strong>${recs.jobs || 0}</strong> job(s) &amp; <strong>${recs.audit_events || 0}</strong> audit/history record(s)</li>
+      `;
+        const existingOp = preview.existing_operation || null;
+        if (existingOp && existingOp.id) {
+          activeOperationId = existingOp.id;
+          canDelete = false;
+          confirmInput.disabled = true;
+          confirmBtn.style.display = "none";
+          if (preview.is_active_deletion) {
+            blockingAlert.style.display = "none";
+            progressBox.style.display = "block";
+            failedBox.style.display = "none";
+            progressText.textContent = `Deletion is currently running (status: ${existingOp.status}). Waiting for completion\u2026`;
+            pollExistingOperation(existingOp.id);
+          } else {
+            renderRecoverableOperation(existingOp);
+          }
+          updateConfirmButtonState();
+          return;
+        }
+        if (!preview.can_delete || preview.blocking_reasons && preview.blocking_reasons.length > 0) {
+          canDelete = false;
+          blockingAlert.style.display = "block";
+          blockingList.innerHTML = (preview.blocking_reasons || []).map((r) => `<li>${escapeHtml2(r)}</li>`).join("");
+        } else {
+          canDelete = true;
+          blockingAlert.style.display = "none";
+        }
+        updateConfirmButtonState();
+      } catch (err) {
+        canDelete = false;
+        previewLoading.style.display = "none";
+        blockingAlert.style.display = "block";
+        blockingList.innerHTML = `<li>Failed to load deletion preview: ${escapeHtml2(err.message)}</li>`;
+        updateConfirmButtonState();
+      }
+    }
+    function renderFailedKeys(failedMap, { allowResumeWithoutFailedKeys = false } = {}) {
+      const keys = Object.keys(failedMap || {});
+      if (keys.length === 0 && !allowResumeWithoutFailedKeys) {
+        failedBox.style.display = "none";
+        return;
+      }
+      failedBox.style.display = "block";
+      failedList.innerHTML = keys.length > 0 ? keys.map((k) => `<li><code>${escapeHtml2(k)}</code>: ${escapeHtml2(failedMap[k])}</li>`).join("") : "<li>Previous deletion attempt did not finish. Resume using the existing operation.</li>";
+      retryBtn.disabled = false;
+      retryBtn.textContent = allowResumeWithoutFailedKeys && keys.length === 0 ? "Resume Deletion" : "Retry Deletion";
+      retryBtn.onclick = async () => {
+        isDeleting = true;
+        retryBtn.disabled = true;
+        retryBtn.textContent = "Resuming\u2026";
+        cancelBtn.disabled = true;
+        try {
+          const res = await fetch(`/api/deletions/${encodeURIComponent(activeOperationId)}/retry`, {
+            method: "POST",
+            credentials: "include"
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Retry failed");
+          const op = data.operation || {};
+          if (data.status === "deleted" || op.status === "completed") {
+            stopPolling();
+            progressText.textContent = "Project and all associated data permanently deleted.";
+            failedBox.style.display = "none";
+            confirmBtn.style.display = "none";
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = "Close";
+            isDeleting = false;
+            if (typeof onComplete === "function") onComplete(op);
+          } else {
+            isDeleting = false;
+            cancelBtn.disabled = false;
+            renderFailedKeys(op.failed_blob_keys || {}, { allowResumeWithoutFailedKeys: true });
+          }
+        } catch (err) {
+          isDeleting = false;
+          cancelBtn.disabled = false;
+          progressText.textContent = `Retry error: ${err.message}`;
+          retryBtn.disabled = false;
+          retryBtn.textContent = "Retry Deletion";
+        }
+      };
+    }
+    confirmBtn.onclick = async () => {
+      isDeleting = true;
+      confirmInput.disabled = true;
+      confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
+      progressBox.style.display = "block";
+      failedBox.style.display = "none";
+      progressText.textContent = "Permanently deleting project storage objects and database records\u2026";
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/delete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ confirm_project_name: (confirmInput.value || "").trim() })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || `Deletion failed (HTTP ${res.status})`);
+        }
+        const op = data.operation || {};
+        activeOperationId = op.id || null;
+        if (data.status === "deleted" || op.status === "completed") {
+          progressText.textContent = "Project and all associated data permanently deleted.";
+          confirmBtn.style.display = "none";
+          cancelBtn.disabled = false;
+          cancelBtn.textContent = "Close";
+          isDeleting = false;
+          if (typeof onComplete === "function") onComplete(op);
+        } else {
+          progressText.textContent = `Deletion incomplete: ${Object.keys(op.failed_blob_keys || {}).length} storage object(s) could not be deleted.`;
+          renderFailedKeys(op.failed_blob_keys || {});
+          cancelBtn.disabled = false;
+          isDeleting = false;
+        }
+      } catch (err) {
+        progressText.textContent = `Deletion failed: ${err.message}`;
+        confirmInput.disabled = false;
+        cancelBtn.disabled = false;
+        isDeleting = false;
+        updateConfirmButtonState();
+      }
+    };
+    modal.style.display = "block";
+    loadPreview();
+  }
+  if (typeof window !== "undefined") {
+    window.openDeleteProjectModal = openDeleteProjectModal;
+  }
+
+  // src/web/static/upload.js
   document.addEventListener("DOMContentLoaded", () => {
     const dropzone = document.getElementById("dropzone");
     const fileInput = document.getElementById("pdfFile");
@@ -6568,7 +7263,7 @@ ${newlined}
           if (aiConfigBadge) {
             const dot = '<span class="badge-dot"></span>';
             if (config.is_configured) {
-              aiConfigBadge.innerHTML = `${dot} AI: ${escapeHtml(config.provider_name)}`;
+              aiConfigBadge.innerHTML = `${dot} AI: ${escapeHtml3(config.provider_name)}`;
               aiConfigBadge.classList.remove("offline");
               aiConfigBadge.classList.add("online");
             } else {
@@ -6640,9 +7335,28 @@ ${newlined}
         }
       });
     }
+    let maxUploadBytes = null;
+    let maxUploadMb = null;
+    fetch("/api/uploads/config", { credentials: "include" }).then((r) => r.ok ? r.json() : null).then((cfg) => {
+      if (cfg && typeof cfg.max_upload_bytes === "number") {
+        maxUploadBytes = cfg.max_upload_bytes;
+        maxUploadMb = cfg.max_upload_mb || Math.floor(maxUploadBytes / (1024 * 1024));
+      }
+    }).catch(() => {
+    });
     function handleFileSelected(file) {
-      if (!file.name.toLowerCase().endsWith(".pdf")) {
-        showError("Please select a valid PDF file (.pdf).");
+      const isPdfName = file.name.toLowerCase().endsWith(".pdf");
+      const isPdfType = !file.type || file.type === "application/pdf";
+      if (!isPdfName || !isPdfType) {
+        showError("Unsupported or invalid PDF: please select a valid .pdf file.");
+        return;
+      }
+      if (file.size <= 0) {
+        showError("Unsupported or invalid PDF: file is empty.");
+        return;
+      }
+      if (maxUploadBytes && file.size > maxUploadBytes) {
+        showError(`File exceeds the configured upload limit (${maxUploadMb} MB).`);
         return;
       }
       clearError();
@@ -6699,7 +7413,7 @@ ${newlined}
         uploadErrorBox.style.display = "none";
       }
     }
-    function escapeHtml(str) {
+    function escapeHtml3(str) {
       if (!str) return "";
       return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
@@ -6773,7 +7487,7 @@ ${newlined}
             isProcessing = false;
             if (extractBtn) extractBtn.disabled = false;
             const errMsg = data.error || "Extraction failed.";
-            showError(`Extraction Error: ${errMsg}`);
+            showError(`Worker processing failure: ${errMsg}`);
           } else {
             const totalImages = data.total_images || 0;
             const batches = data.total_batches ? `Batch ${data.completed_batches || 0}/${data.total_batches}` : "Preparing page batches";
@@ -6875,36 +7589,49 @@ ${newlined}
               errorMsg = errData.detail || errorMsg;
             } catch (_) {
             }
-            throw new Error(errorMsg);
+            if (authRes.status === 413) {
+              throw new Error(`File exceeds configured upload limit: ${errorMsg}`);
+            }
+            if (authRes.status === 400) {
+              throw new Error(errorMsg);
+            }
+            throw new Error(`Upload authorization failure: ${errorMsg}`);
           }
           const authData = await authRes.json();
           const uploadKey = authData.upload_key;
           if (selectedFile.size > authData.max_size_bytes) {
-            throw new Error("File exceeds the configured upload limit.");
+            throw new Error(
+              `File exceeds configured upload limit (${Math.floor(authData.max_size_bytes / (1024 * 1024))} MB).`
+            );
           }
           const csrfResponse = await fetch("/api/auth/csrf-token", {
             credentials: "include"
           });
           if (!csrfResponse.ok) {
-            throw new Error("Could not prepare a secure upload.");
+            throw new Error("Upload authorization failure: could not prepare a secure upload.");
           }
           const csrfData = await csrfResponse.json();
-          const blobResult = await upload(authData.pathname, selectedFile, {
-            access: "private",
-            handleUploadUrl: authData.handle_upload_url,
-            clientPayload: JSON.stringify({
-              upload_key: uploadKey,
-              csrf_token: csrfData.csrf_token
-            }),
-            contentType: "application/pdf",
-            multipart: selectedFile.size > 5 * 1024 * 1024,
-            onUploadProgress: ({ percentage }) => setProgress(
-              10 + Math.round(percentage * 0.4),
-              `Uploading ${escapeHtml(selectedFile.name)} (${Math.round(percentage)}%)\u2026`
-            )
-          });
+          let blobResult;
+          try {
+            blobResult = await upload(authData.pathname, selectedFile, {
+              access: "private",
+              handleUploadUrl: authData.handle_upload_url,
+              clientPayload: JSON.stringify({
+                upload_key: uploadKey,
+                csrf_token: csrfData.csrf_token
+              }),
+              contentType: "application/pdf",
+              multipart: selectedFile.size > 5 * 1024 * 1024,
+              onUploadProgress: ({ percentage }) => setProgress(
+                10 + Math.round(percentage * 0.4),
+                `Uploading ${escapeHtml3(selectedFile.name)} (${Math.round(percentage)}%)\u2026`
+              )
+            });
+          } catch (blobErr) {
+            throw new Error(`Blob upload failure: ${blobErr?.message || "direct upload failed"}`);
+          }
           if (blobResult.pathname !== authData.pathname) {
-            throw new Error("Blob returned an unexpected object path.");
+            throw new Error("Blob upload failure: returned an unexpected object path.");
           }
           setProgress(55, "Verifying private upload and creating project\u2026");
           const completeRes = await fetch(`/api/uploads/${uploadKey}/complete`, {
@@ -6951,42 +7678,97 @@ ${newlined}
         }
       });
     }
-    async function loadRecentProjects() {
+    const PROJECTS_PAGE_SIZE = 10;
+    let currentProjectsPage = 0;
+    async function loadRecentProjects(page = currentProjectsPage) {
       if (!recentProjectsList) return;
+      currentProjectsPage = Math.max(0, page);
+      const offset = currentProjectsPage * PROJECTS_PAGE_SIZE;
       try {
-        const res = await fetch("/api/projects", {
-          credentials: "include"
-        });
+        const res = await fetch(
+          `/api/projects?limit=${PROJECTS_PAGE_SIZE}&offset=${offset}`,
+          { credentials: "include" }
+        );
         if (!res.ok) return;
         const data = await res.json();
         const projects = data.projects || [];
-        if (projects.length === 0) {
+        const totalCount = typeof data.total_count === "number" ? data.total_count : projects.length;
+        if (totalCount === 0) {
           recentProjectsList.innerHTML = '<p class="text-muted" style="margin:0; font-size:13px;">No projects created yet. Upload a PDF above to begin.</p>';
           return;
         }
-        recentProjectsList.innerHTML = projects.slice(0, 5).map((p) => {
+        if (projects.length === 0 && currentProjectsPage > 0) {
+          return loadRecentProjects(currentProjectsPage - 1);
+        }
+        const rowsHtml = projects.map((p) => {
           const dateStr = p.created_at ? new Date(p.created_at).toLocaleDateString() : "";
           return `
           <div class="recent-project-row">
             <div class="recent-project-info">
               <span style="font-size: 18px;" aria-hidden="true">\u{1F4C1}</span>
               <div>
-                <div class="recent-project-name">${escapeHtml(p.name || "Untitled Project")}</div>
-                <div class="recent-project-meta">${escapeHtml(p.source_filename || "")} \xB7 ${dateStr}</div>
+                <div class="recent-project-name">${escapeHtml3(p.name || "Untitled Project")}</div>
+                <div class="recent-project-meta">${escapeHtml3(p.source_filename || "")} \xB7 ${dateStr}</div>
               </div>
             </div>
             <div class="recent-project-actions">
               <a href="/review/${p.id}" class="btn-secondary btn-sm" style="text-decoration:none;">Review &amp; Edit</a>
               <a href="/export/${p.id}" class="btn-secondary btn-sm" style="text-decoration:none;">Export</a>
+              <button type="button" class="btn-secondary btn-sm btn-cleanup-trigger" data-project-id="${p.id}" data-project-name="${escapeHtml3(p.name || "Untitled Project")}">Clean up</button>
+              <button type="button" class="btn-secondary btn-sm btn-delete-project-trigger" data-project-id="${p.id}" data-project-name="${escapeHtml3(p.name || "Untitled Project")}" style="color:#f87171; border-color:rgba(248,113,113,0.4);">Delete Project</button>
             </div>
           </div>
         `;
         }).join("");
+        const totalPages = Math.max(1, Math.ceil(totalCount / PROJECTS_PAGE_SIZE));
+        const paginationHtml = totalPages > 1 ? `
+          <div class="projects-pagination" style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding-top:10px; border-top:1px solid var(--border-color, #333); font-size:12px;">
+            <span class="text-muted">Showing ${offset + 1}\u2013${offset + projects.length} of ${totalCount} projects</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="btn-secondary btn-sm btn-projects-prev" ${currentProjectsPage === 0 ? "disabled" : ""}>\u2190 Previous</button>
+              <span class="text-muted">Page ${currentProjectsPage + 1} of ${totalPages}</span>
+              <button type="button" class="btn-secondary btn-sm btn-projects-next" ${currentProjectsPage + 1 >= totalPages ? "disabled" : ""}>Next \u2192</button>
+            </div>
+          </div>
+        ` : "";
+        recentProjectsList.innerHTML = rowsHtml + paginationHtml;
       } catch (err) {
         console.warn("Could not load recent projects:", err);
       }
     }
-    loadRecentProjects();
+    loadRecentProjects(0);
+    if (recentProjectsList) {
+      recentProjectsList.addEventListener("click", (e) => {
+        const prevBtn = e.target.closest(".btn-projects-prev");
+        if (prevBtn && !prevBtn.disabled) {
+          loadRecentProjects(currentProjectsPage - 1);
+          return;
+        }
+        const nextBtn = e.target.closest(".btn-projects-next");
+        if (nextBtn && !nextBtn.disabled) {
+          loadRecentProjects(currentProjectsPage + 1);
+          return;
+        }
+        const deleteBtn = e.target.closest(".btn-delete-project-trigger");
+        if (deleteBtn) {
+          openDeleteProjectModal({
+            projectId: deleteBtn.dataset.projectId,
+            projectName: deleteBtn.dataset.projectName,
+            onComplete: () => loadRecentProjects(currentProjectsPage)
+          });
+          return;
+        }
+        const btn = e.target.closest(".btn-cleanup-trigger");
+        if (!btn) return;
+        const projectId = btn.dataset.projectId;
+        const projectName = btn.dataset.projectName;
+        openCleanupModal({
+          projectId,
+          projectName,
+          onComplete: () => loadRecentProjects(currentProjectsPage)
+        });
+      });
+    }
     window.addEventListener("beforeunload", () => {
       stopPolling();
     });

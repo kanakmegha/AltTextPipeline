@@ -185,7 +185,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Durable Cleanup Operations Manifest Table
+CREATE TABLE IF NOT EXISTS cleanup_operations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    cleanup_mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    target_blob_keys TEXT NOT NULL,
+    deleted_blob_keys TEXT NOT NULL DEFAULT '[]',
+    missing_blob_keys TEXT NOT NULL DEFAULT '[]',
+    failed_blob_keys TEXT NOT NULL DEFAULT '{}',
+    db_records_summary TEXT NOT NULL DEFAULT '{}',
+    audit_summary TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes for performance & quick foreign-key joins
+CREATE INDEX IF NOT EXISTS idx_cleanup_ops_project ON cleanup_operations(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_image_assets_project ON image_assets(project_id);
 CREATE INDEX IF NOT EXISTS idx_image_assets_status ON image_assets(processing_status);
 CREATE INDEX IF NOT EXISTS idx_alt_versions_image ON alt_text_versions(image_id);

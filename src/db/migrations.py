@@ -319,4 +319,49 @@ def apply_migrations(db: DatabaseConnection) -> int:
             conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (10, now_iso))
             current_version = 10
 
+        # Migration 11: Durable Cleanup Operations Manifest Table
+        if current_version < 11:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cleanup_operations (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    cleanup_mode TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    target_blob_keys TEXT NOT NULL,
+                    deleted_blob_keys TEXT NOT NULL DEFAULT '[]',
+                    missing_blob_keys TEXT NOT NULL DEFAULT '[]',
+                    failed_blob_keys TEXT NOT NULL DEFAULT '{}',
+                    db_records_summary TEXT NOT NULL DEFAULT '{}',
+                    audit_summary TEXT NOT NULL DEFAULT '[]',
+                    error_message TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cleanup_ops_project ON cleanup_operations(project_id, status);"
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (11, now_iso))
+            current_version = 11
+
+        # Migration 12: Lease token and expiration columns on cleanup_operations for crash recovery
+        if current_version < 12:
+            cols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(cleanup_operations);").fetchall()
+            ]
+            if "lease_token" not in cols:
+                conn.execute("ALTER TABLE cleanup_operations ADD COLUMN lease_token TEXT;")
+            if "lease_expires_at" not in cols:
+                conn.execute("ALTER TABLE cleanup_operations ADD COLUMN lease_expires_at TEXT;")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (12, now_iso))
+            current_version = 12
+
     return current_version

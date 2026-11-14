@@ -114,13 +114,31 @@
               <p class="text-muted">No exports generated for this project yet.</p>
             </div>
           </div>
+
+          <!-- Post-Export Storage Cleanup Card -->
+          <div class="export-card" style="grid-column: 1 / -1; margin-top: 10px; border: 1px solid rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.03);">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+              <div>
+                <h3 class="export-card-title" style="margin-bottom: 4px;">🧹 Project Storage Cleanup</h3>
+                <p class="panel-subtitle" style="margin: 0; font-size: 13px;">
+                  Reclaim storage after downloading your report. Clean up intermediate extracted images (Mode A) or source PDF (Mode B).
+                  Your exported Word DOCX files are permanently protected.
+                </p>
+              </div>
+              <div>
+                <button id="openExportCleanupBtn" class="btn-secondary" type="button" style="white-space: nowrap;">
+                  Clean up Project Storage
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
   </div>
 
   <script src="/static/api-client.js"></script>
-
+  <script type="module" src="/static/cleanup-modal.js"></script>
   <script src="/static/export.js"></script>
 </body>
 </html>

@@ -1,8 +1,10 @@
 """Crash-recoverable extraction job execution shared by Render and tests."""
 
+import gc
 import hashlib
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -15,6 +17,8 @@ from src.extraction.engine import ExtractionEngine
 
 logger = logging.getLogger("alttext.worker")
 LEASE_SECONDS = 300
+DEFAULT_PDF_BATCH_SIZE = 25
+PDF_BATCH_SIZE = DEFAULT_PDF_BATCH_SIZE
 
 
 def _env_int(name, default, minimum=1, maximum=64):
@@ -31,18 +35,103 @@ def _iso(dt):
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _strip_ipc_image_bytes(result, temp_dir):
+    """Clear in-memory image_bytes when images were written to temp_dir to avoid large IPC payloads."""
+    if not temp_dir:
+        return
+    context = result.grouping_context or {}
+    for page_imgs in context.get("images_by_page", {}).values():
+        for img in page_imgs:
+            if img.suggested_filename and os.path.isfile(os.path.join(temp_dir, img.suggested_filename)):
+                img.image_bytes = b""
+    for img in getattr(result, "images", []) or []:
+        if img.suggested_filename and os.path.isfile(os.path.join(temp_dir, img.suggested_filename)):
+            img.image_bytes = b""
+
+
+def _split_pdf_batch_to_temp_file(source_pdf_path, page_numbers, dest_pdf_path):
+    """Split selected 1-based page_numbers from source_pdf_path into a standalone temporary PDF."""
+    src_doc = fitz.open(source_pdf_path)
+    batch_doc = fitz.open()
+    try:
+        for pno in page_numbers:
+            batch_doc.insert_pdf(src_doc, from_page=pno - 1, to_page=pno - 1)
+        batch_doc.save(dest_pdf_path, garbage=3, deflate=True)
+    finally:
+        batch_doc.close()
+        src_doc.close()
+
+
+def _remap_batch_result_pages(result, page_numbers):
+    """Map local 1..N page numbers from a split batch PDF back to original document page numbers."""
+    page_map = {idx + 1: orig_pno for idx, orig_pno in enumerate(page_numbers)}
+    for img in getattr(result, "images", []) or []:
+        img.page_number = page_map.get(img.page_number, img.page_number)
+
+    context = result.grouping_context or {}
+    if context:
+        remapped_imgs = {}
+        for local_pno, imgs in context.get("images_by_page", {}).items():
+            orig_pno = page_map.get(local_pno, local_pno)
+            for img in imgs:
+                img.page_number = orig_pno
+            remapped_imgs[orig_pno] = imgs
+        context["images_by_page"] = remapped_imgs
+
+        remapped_blocks = {}
+        for local_pno, blocks in context.get("text_blocks_by_page", {}).items():
+            orig_pno = page_map.get(local_pno, local_pno)
+            for blk in blocks:
+                if hasattr(blk, "page_number"):
+                    blk.page_number = orig_pno
+            remapped_blocks[orig_pno] = blocks
+        context["text_blocks_by_page"] = remapped_blocks
+
+        context["page_dimensions"] = {
+            page_map.get(local_pno, local_pno): dim
+            for local_pno, dim in context.get("page_dimensions", {}).items()
+        }
+
+    for err in getattr(result, "errors", []) or []:
+        if isinstance(err, dict) and "page" in err:
+            err["page"] = page_map.get(err["page"], err["page"])
+
+
 def _extract_pdf_batch(pdf_path, page_numbers):
-    """Process one batch with a fresh PyMuPDF document handle in the child process."""
-    return ExtractionEngine().process_pdf(pdf_path, page_numbers=page_numbers, group_results=False)
+    """Split one batch into a temporary PDF and process it with a fresh PyMuPDF handle."""
+    temp_dir = tempfile.mkdtemp(prefix="pdf_batch_")
+    batch_pdf_path = os.path.join(temp_dir, "batch.pdf")
+    try:
+        _split_pdf_batch_to_temp_file(pdf_path, page_numbers, batch_pdf_path)
+        local_pages = list(range(1, len(page_numbers) + 1))
+        result = ExtractionEngine().process_pdf(
+            batch_pdf_path, page_numbers=local_pages, output_images_dir=temp_dir, group_results=False
+        )
+        _remap_batch_result_pages(result, page_numbers)
+        _strip_ipc_image_bytes(result, temp_dir)
+        return result, temp_dir
+    except Exception:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 def _process_batch(pdf_path, pages, engine):
     if engine is None:
         return _extract_pdf_batch(pdf_path, pages)
-    return engine.process_pdf(pdf_path, page_numbers=pages, group_results=False)
+    temp_dir = tempfile.mkdtemp(prefix="pdf_batch_")
+    try:
+        result = engine.process_pdf(
+            pdf_path, page_numbers=pages, output_images_dir=temp_dir, group_results=False
+        )
+        return result, temp_dir
+    except Exception:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
-def _persist_batch_images(repo, filestore, project_id, result):
+def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=None):
     context = result.grouping_context or {}
     images_by_page = context.get("images_by_page", {})
     images_to_upload = []
@@ -56,10 +145,16 @@ def _persist_batch_images(repo, filestore, project_id, result):
         return context
 
     def _save_one(img):
+        payload = img.image_bytes
+        if not payload and batch_temp_dir and img.suggested_filename:
+            disk_path = os.path.join(batch_temp_dir, img.suggested_filename)
+            if os.path.isfile(disk_path):
+                with open(disk_path, "rb") as f:
+                    payload = f.read()
         key, checksum, size = filestore.save_image(
             project_id=project_id,
             image_id=img.image_id,
-            image_bytes=img.image_bytes,
+            image_bytes=payload,
             ext=img.image_format,
         )
         return img, key, checksum, size
@@ -83,6 +178,10 @@ def _persist_batch_images(repo, filestore, project_id, result):
             association_type=img.association_type,
             association_confidence=img.association_confidence, panel_label=img.panel_label,
         )
+        if not repo.find_image_asset_by_source(project_id, img.page_number, img.xref, img.placement_index):
+            raise RuntimeError(f"Failed to verify persisted image asset {img.image_id} in database")
+        if hasattr(filestore, "exists") and not filestore.exists(project_id, image_key):
+            raise RuntimeError(f"Failed to verify persisted image object {image_key} in storage")
         # Keep grouping metadata in memory but release image payloads as soon as they are persisted.
         img.image_bytes = b""
 
@@ -163,14 +262,26 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
     try:
         repo.update_project_status(project_id, status="extracting")
         t0_download = time.perf_counter()
-        source = filestore.read_bytes(project_id, project["source_storage_key"])
-        if not source.startswith(b"%PDF-"):
-            raise ValueError("Stored source is not a PDF")
-        repo.update_project_source_checksum(project_id, hashlib.sha256(source).hexdigest())
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(source)
             tmp_path = tmp.name
-        del source
+
+        if hasattr(filestore, "download_to_file"):
+            _, source_checksum = filestore.download_to_file(
+                project_id, project["source_storage_key"], tmp_path
+            )
+            with open(tmp_path, "rb") as f:
+                header = f.read(5)
+            if header != b"%PDF-":
+                raise ValueError("Stored source is not a PDF")
+            repo.update_project_source_checksum(project_id, source_checksum)
+        else:
+            source = filestore.read_bytes(project_id, project["source_storage_key"])
+            if not source.startswith(b"%PDF-"):
+                raise ValueError("Stored source is not a PDF")
+            repo.update_project_source_checksum(project_id, hashlib.sha256(source).hexdigest())
+            with open(tmp_path, "wb") as f:
+                f.write(source)
+            del source
         dur_download = time.perf_counter() - t0_download
 
         t0_open = time.perf_counter()
@@ -188,8 +299,8 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
         if not page_numbers:
             raise ValueError("Extraction job has no valid pages to process")
 
-        batch_size = _env_int("PDF_BATCH_SIZE", 5)
-        max_parallel = _env_int("MAX_PARALLEL_BATCHES", 2)
+        batch_size = _env_int("PDF_BATCH_SIZE", 25)
+        max_parallel = _env_int("MAX_PARALLEL_BATCHES", 1, minimum=1, maximum=4)
         page_batches = [page_numbers[i:i + batch_size] for i in range(0, len(page_numbers), batch_size)]
         repo.initialize_job_batches(job_id, page_batches, total_document_pages, max_attempts=max_retries)
         batch_rows = {row["batch_index"]: row for row in repo.list_job_batches(job_id)}
@@ -219,16 +330,22 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
                     job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
                 ):
                     raise RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
-                t0_extract = time.perf_counter()
-                result = _process_batch(tmp_path, pages, engine)
-                dur_extract = time.perf_counter() - t0_extract
-                if lease_lost.is_set() or not repo.renew_job_lease(
-                    job_id, worker_id, _iso(datetime.now(timezone.utc))
-                ):
-                    raise RuntimeError("Worker lost the extraction job lease")
-                t0_persist = time.perf_counter()
-                contexts.append(_persist_batch_images(repo, filestore, project_id, result))
-                dur_persist = time.perf_counter() - t0_persist
+                batch_temp_dir = None
+                try:
+                    t0_extract = time.perf_counter()
+                    result, batch_temp_dir = _process_batch(tmp_path, pages, engine)
+                    dur_extract = time.perf_counter() - t0_extract
+                    if lease_lost.is_set() or not repo.renew_job_lease(
+                        job_id, worker_id, _iso(datetime.now(timezone.utc))
+                    ):
+                        raise RuntimeError("Worker lost the extraction job lease")
+                    t0_persist = time.perf_counter()
+                    contexts.append(_persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=batch_temp_dir))
+                    dur_persist = time.perf_counter() - t0_persist
+                finally:
+                    if batch_temp_dir and os.path.exists(batch_temp_dir):
+                        shutil.rmtree(batch_temp_dir, ignore_errors=True)
+                    gc.collect()
                 if batch["status"] != "completed":
                     if result.errors:
                         repo.set_job_batch_status(
@@ -316,15 +433,19 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
             for future in done:
                 index, batch = active.pop(future)
                 try:
-                    result = future.result()
+                    result, batch_temp_dir = future.result()
                     if lease_lost.is_set() or not repo.renew_job_lease(
                         job_id, worker_id, _iso(datetime.now(timezone.utc))
                     ):
                         lease_lost.set()
+                        if batch_temp_dir and os.path.exists(batch_temp_dir):
+                            shutil.rmtree(batch_temp_dir, ignore_errors=True)
                         raise RuntimeError("Worker lost the extraction job lease")
                     t0_persist = time.perf_counter()
-                    contexts.append(_persist_batch_images(repo, filestore, project_id, result))
+                    contexts.append(_persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=batch_temp_dir))
                     dur_persist = time.perf_counter() - t0_persist
+                    if batch_temp_dir and os.path.exists(batch_temp_dir):
+                        shutil.rmtree(batch_temp_dir, ignore_errors=True)
                     if result.errors:
                         raise RuntimeError(f"Page batch {index + 1} reported extraction errors: {result.errors[:3]}")
                     if batch["status"] != "completed":
