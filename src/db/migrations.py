@@ -364,4 +364,53 @@ def apply_migrations(db: DatabaseConnection) -> int:
             conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (12, now_iso))
             current_version = 12
 
+        # Migration 13: Persistent Word document design configuration on projects
+        if current_version < 13:
+            pcols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(projects);").fetchall()
+            ]
+            if "doc_design_config" not in pcols:
+                conn.execute("ALTER TABLE projects ADD COLUMN doc_design_config TEXT;")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (13, now_iso))
+            current_version = 13
+
+        # Migration 14: User-level Word document preferences + safe migration from owned projects
+        if current_version < 14:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_doc_preferences (
+                    user_id TEXT PRIMARY KEY,
+                    doc_design_config TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            pcols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(projects);").fetchall()
+            ]
+            if "owner_id" in pcols and "doc_design_config" in pcols:
+                rows = conn.execute(
+                    """
+                    SELECT owner_id, doc_design_config, updated_at
+                    FROM projects
+                    WHERE owner_id IS NOT NULL AND TRIM(owner_id) != ''
+                      AND doc_design_config IS NOT NULL AND TRIM(doc_design_config) != ''
+                    ORDER BY updated_at DESC;
+                    """
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO user_doc_preferences (user_id, doc_design_config, updated_at)
+                        VALUES (?, ?, ?);
+                        """,
+                        (row[0], row[1], row[2] or now_iso),
+                    )
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (14, now_iso))
+            current_version = 14
+
     return current_version

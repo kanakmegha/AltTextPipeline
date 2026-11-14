@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AltTextPipeline — Settings</title>
+  <meta name="description" content="Configure application-wide Word Document Preferences for all future DOCX exports." />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/doc-designer.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Application Header -->
+    <header class="app-header">
+      <div class="brand-wrapper">
+        <div class="brand-icon" aria-hidden="true">A</div>
+        <div class="brand-titles">
+          <h1>AltTextPipeline</h1>
+          <p>Extraction Inspector &amp; Editorial Grounding Testbed</p>
+        </div>
+      </div>
+
+      <nav class="pipeline-stepper" aria-label="Pipeline Stages">
+        <a href="/" class="step-item" title="Upload new PDF">
+          <span class="step-badge">1</span>
+          <span>Upload &amp; Extract</span>
+        </a>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <span class="step-item disabled" aria-disabled="true" title="Open a project to access Review &amp; Edit">
+          <span class="step-badge">2</span>
+          <span>Review &amp; Edit</span>
+        </span>
+        <span class="step-separator" aria-hidden="true">→</span>
+        <span class="step-item disabled" aria-disabled="true" title="Open a project to access Export to Word">
+          <span class="step-badge">3</span>
+          <span>Export to Word</span>
+        </span>
+      </nav>
+
+      <div class="header-badges">
+        <div class="text-size-widget" role="group" aria-label="Reading text size controls">
+          <span class="text-size-label">Text:</span>
+          <button type="button" class="btn-text-size active" data-size="normal" aria-label="Normal text size" title="Normal text (100%)">A</button>
+          <button type="button" class="btn-text-size" data-size="large" aria-label="Large text size" title="Large text (115%)">A+</button>
+          <button type="button" class="btn-text-size" data-size="xlarge" aria-label="Extra large text size" title="Extra Large text (130%)">A++</button>
+        </div>
+        <a href="/settings" class="btn-secondary btn-sm" aria-current="page" style="text-decoration: none; border-color: rgba(99, 102, 241, 0.7);">⚙ Settings</a>
+      </div>
+    </header>
+
+    <!-- Settings Navigation Strip -->
+    <div class="stage-nav-bar">
+      <div class="project-summary-strip">
+        <h2 class="project-title-badge">Settings → Word Document Preferences</h2>
+        <span class="review-summary-pill">Applied automatically to all future Word exports</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <a id="settingsBackToExportLink" href="/" class="btn-secondary btn-sm" style="text-decoration: none; display: none;">◀ Back to Export</a>
+        <a href="/" class="btn-secondary btn-sm" style="text-decoration: none;">◀ Home</a>
+      </div>
+    </div>
+
+    <!-- Settings -> Word Document Preferences (4-Step Visual Designer) -->
+    <section id="docDesignerRoot" class="doc-designer-panel" aria-label="Settings — Word Document Preferences">
+      <div class="panel">
+        <div class="designer-header-row">
+          <div>
+            <h2 class="panel-title" style="margin-bottom: 4px;">Word Document Preferences</h2>
+            <p class="panel-subtitle" style="margin: 0;">Configure your preferred Word document format once, preview it with project data, and save it for all future DOCX exports.</p>
+          </div>
+          <div class="designer-save-bar">
+            <span id="designerSaveBadge" class="designer-save-badge">Default preferences</span>
+            <button id="designerSaveBtn" type="button" class="btn-primary btn-sm">Save Preferences</button>
+            <button id="designerResetBtn" type="button" class="btn-secondary btn-sm">Reset to Default</button>
+          </div>
+        </div>
+
+        <div id="designerPreviewProjectBar" style="display: none; margin-bottom: 14px; align-items: center; gap: 10px;">
+          <label for="designerPreviewProjectSelect" style="font-size: 12.5px; color: #cbd5e1; font-weight: 600;">Preview &amp; available fields from project:</label>
+          <select id="designerPreviewProjectSelect" class="designer-select" style="max-width: 340px;"></select>
+        </div>
+
+        <div class="designer-layout">
+          <div class="designer-steps">
+            <!-- Step 1 -->
+            <div class="designer-step-card">
+              <h3 class="designer-step-title"><span class="designer-step-num">1</span> Choose a starting design</h3>
+              <div id="designerPresetGrid" class="preset-cards-grid"></div>
+            </div>
+
+            <!-- Step 2 -->
+            <div class="designer-step-card">
+              <h3 class="designer-step-title"><span class="designer-step-num">2</span> Choose what information appears</h3>
+              <p class="panel-subtitle" style="margin: 0 0 10px 0; font-size: 12.5px;">Toggle fields on or off and drag or use arrows to change their order in the document.</p>
+              <div id="designerFieldsList" class="designer-fields-list"></div>
+            </div>
+
+            <!-- Step 3 -->
+            <div class="designer-step-card">
+              <h3 class="designer-step-title"><span class="designer-step-num">3</span> Customize wording and appearance</h3>
+
+              <div style="margin-bottom: 14px;">
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 8px; color: #e2e8f0;">Document Wording</div>
+                <div class="designer-subgrid">
+                  <div class="designer-field-group">
+                    <label for="designerDocTitle">Document title</label>
+                    <input id="designerDocTitle" class="designer-input" type="text" maxlength="200" placeholder="e.g. Accessibility Review" />
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerFooterText">Optional footer</label>
+                    <input id="designerFooterText" class="designer-input" type="text" maxlength="200" placeholder="e.g. Internal Publishing Document" />
+                  </div>
+                </div>
+                <div class="designer-field-group">
+                  <label for="designerIntroText">Optional introduction</label>
+                  <textarea id="designerIntroText" class="designer-textarea" maxlength="2000" placeholder="Add a short introduction shown at the top of the document..."></textarea>
+                </div>
+
+                <div style="font-size: 12.5px; font-weight: 600; margin: 8px 0 6px 0; color: #cbd5e1;">Custom Section Labels</div>
+                <div id="designerSectionLabelsGrid" class="designer-subgrid"></div>
+
+                <div style="font-size: 12.5px; font-weight: 600; margin: 10px 0 6px 0; color: #cbd5e1;">Additional Phrases</div>
+                <div id="designerPhrasesList"></div>
+                <div class="custom-phrase-add">
+                  <input id="designerNewPhraseText" class="designer-input" type="text" maxlength="300" placeholder="e.g. Prepared for Editorial Review" />
+                  <select id="designerNewPhrasePlacement" class="designer-select" aria-label="Phrase placement">
+                    <option value="header">Top of document</option>
+                    <option value="before_alt_text">Before alt text</option>
+                    <option value="after_alt_text">After alt text</option>
+                    <option value="closing">Closing section</option>
+                  </select>
+                  <button id="designerAddPhraseBtn" type="button" class="btn-secondary btn-sm">Add Phrase</button>
+                </div>
+
+                <div class="designer-field-group" style="margin-top: 10px; margin-bottom: 0;">
+                  <label for="designerClosingText">Optional closing text</label>
+                  <textarea id="designerClosingText" class="designer-textarea" maxlength="2000" placeholder="Add closing notes at the end of the document..."></textarea>
+                </div>
+              </div>
+
+              <div style="border-top: 1px solid rgba(148,163,184,0.2); padding-top: 12px;">
+                <div style="font-size: 13px; font-weight: 700; margin-bottom: 8px; color: #e2e8f0;">Appearance</div>
+                <div class="designer-subgrid">
+                  <div class="designer-field-group">
+                    <label for="designerFontFamily">Font</label>
+                    <select id="designerFontFamily" class="designer-select">
+                      <option value="Calibri">Calibri</option>
+                      <option value="Arial">Arial</option>
+                      <option value="Georgia">Georgia</option>
+                      <option value="Times New Roman">Times New Roman</option>
+                      <option value="Verdana">Verdana</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerFontSize">Text size</label>
+                    <select id="designerFontSize" class="designer-select">
+                      <option value="small">Small</option>
+                      <option value="medium">Medium</option>
+                      <option value="large">Large</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerHeadingStyle">Heading appearance</label>
+                    <select id="designerHeadingStyle" class="designer-select">
+                      <option value="plain">Plain</option>
+                      <option value="bold">Bold</option>
+                      <option value="accent">Accent color</option>
+                      <option value="uppercase">Uppercase</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerAlignment">Text alignment</label>
+                    <select id="designerAlignment" class="designer-select">
+                      <option value="left">Left</option>
+                      <option value="center">Center</option>
+                      <option value="justify">Justified</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerEntrySpacing">Spacing between entries</label>
+                    <select id="designerEntrySpacing" class="designer-select">
+                      <option value="compact">Compact</option>
+                      <option value="normal">Normal</option>
+                      <option value="spacious">Spacious</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerEntrySeparator">Separator between entries</label>
+                    <select id="designerEntrySeparator" class="designer-select">
+                      <option value="none">None</option>
+                      <option value="line">Divider line</option>
+                      <option value="page_break">Page break</option>
+                    </select>
+                  </div>
+                  <div class="designer-field-group">
+                    <label for="designerImageSize">Image display size</label>
+                    <select id="designerImageSize" class="designer-select">
+                      <option value="small">Small</option>
+                      <option value="medium">Medium</option>
+                      <option value="large">Large</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 4: Live Preview -->
+          <div class="designer-preview-sticky">
+            <div class="designer-step-card">
+              <h3 class="designer-step-title"><span class="designer-step-num">4</span> Live Preview</h3>
+              <div class="preview-desk">
+                <div class="preview-meta-bar">
+                  <span>Live Document Preview</span>
+                  <span id="docPreviewPageInfo">Loading preview…</span>
+                </div>
+                <div id="docPreviewPaper" class="preview-paper" aria-live="polite"></div>
+              </div>
+              <p class="panel-subtitle" style="margin: 12px 0 0 0; font-size: 12.5px; color: #94a3b8;">
+                Click <strong>Save Preferences</strong> above to apply this format automatically to all future Word exports.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/api-client.js"></script>
+  <script type="module" src="/static/settings.js"></script>
+</body>
+</html>

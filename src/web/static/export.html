@@ -50,6 +50,7 @@
         </span>
         <span id="aiSpendBadge" class="badge">Spend: $0.00 / $2.00</span>
         <span class="badge">SQLite WAL</span>
+        <a href="/settings?project_id={{project_id}}" class="btn-secondary btn-sm" style="text-decoration: none;">⚙ Settings</a>
       </div>
     </header>
 
@@ -99,9 +100,21 @@
               <ul id="exportBlockingList" class="blocking-list"></ul>
             </div>
 
+            <div id="activeDocFormatCard" style="margin-top: 14px; padding: 12px 14px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.22); background: rgba(15, 23, 42, 0.45); display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+              <div>
+                <div style="font-size: 13.5px; font-weight: 600; color: #f8fafc;">
+                  Word document format: <span id="activeDocFormatName" style="color: #818cf8;">Minimal</span>
+                </div>
+                <div id="activeDocFormatNote" style="font-size: 12.5px; color: #94a3b8; margin-top: 2px;">
+                  Using your saved document preferences.
+                </div>
+              </div>
+              <a id="changeDocFormatLink" href="/settings?project_id={{project_id}}" class="btn-secondary btn-sm" style="text-decoration: none; white-space: nowrap;">Change document format</a>
+            </div>
+
             <div class="export-action-wrap">
               <button id="startDocxExportBtn" class="btn-primary btn-lg" type="button" disabled>
-                <span>Generate &amp; Download DOCX</span>
+                <span>Generate Word Document</span>
                 <span class="btn-icon">⬇</span>
               </button>
             </div>
@@ -139,6 +152,6 @@
 
   <script src="/static/api-client.js"></script>
   <script type="module" src="/static/cleanup-modal.js"></script>
-  <script src="/static/export.js"></script>
+  <script type="module" src="/static/export.js"></script>
 </body>
 </html>

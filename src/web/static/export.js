@@ -195,6 +195,23 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       }
 
+      // Active Word document format summary
+      const activeDesign = data.active_doc_design || {};
+      const activeDocFormatName = document.getElementById("activeDocFormatName");
+      const activeDocFormatNote = document.getElementById("activeDocFormatNote");
+      const changeDocFormatLink = document.getElementById("changeDocFormatLink");
+      if (activeDocFormatName) {
+        activeDocFormatName.textContent = activeDesign.preset_name || "Minimal";
+      }
+      if (activeDocFormatNote) {
+        activeDocFormatNote.textContent = activeDesign.is_saved
+          ? "Using your saved document preferences."
+          : "Using default document preferences.";
+      }
+      if (changeDocFormatLink) {
+        changeDocFormatLink.href = activeDesign.settings_url || `/settings?project_id=${encodeURIComponent(projectId)}`;
+      }
+
       // Recent exports
       renderExportsHistory(recentExports);
     } catch (err) {

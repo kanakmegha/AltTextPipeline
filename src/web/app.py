@@ -63,7 +63,17 @@ from src.ai.prompts import (
     resolve_language_name,
 )
 from src.ai.cleaner import clean_alt_text_response, is_contaminated_alt_text
-from src.export import check_export_eligibility, export_project_docx, DocxBuilder, ExportValidationError
+from src.export import (
+    check_export_eligibility,
+    export_project_docx,
+    get_default_design_config,
+    get_project_design_context,
+    resolve_effective_doc_design,
+    STYLE_PRESETS,
+    validate_design_config,
+    DocxBuilder,
+    ExportValidationError,
+)
 from src.web import auth
 
 
@@ -607,6 +617,13 @@ def create_app(
         content = export_file.read_text(encoding="utf-8")
         content = content.replace("{{project_id}}", project_id).replace("{{project_name}}", project.get("name") or "Project Export")
         return HTMLResponse(content)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page():
+        settings_file = STATIC_DIR / "settings.html"
+        if not settings_file.exists():
+            return HTMLResponse("<h2>Settings frontend static files missing.</h2>", status_code=404)
+        return HTMLResponse(settings_file.read_text(encoding="utf-8"))
 
     @app.get("/api/health")
     async def health_check():
@@ -1778,7 +1795,7 @@ def create_app(
 
     @app.get("/api/projects/{project_id}/exports/status")
     async def get_project_export_status(request: Request, project_id: str):
-        _authorize_project_access(request, project_id)
+        project = _authorize_project_access(request, project_id)
         eligibility = check_export_eligibility(repo, project_id)
 
         def _enrich_export_item(exp: Dict[str, Any]) -> Dict[str, Any]:
@@ -1844,6 +1861,14 @@ def create_app(
             "unresolved_reviews_count": unresolved_reviews,
         }
 
+        user = getattr(request.state, "user", None)
+        user_id = (user.get("id") if isinstance(user, dict) else None) or (
+            None if auth.is_auth_enabled() else auth.get_single_user_id()
+        )
+        effective_design, design_source = resolve_effective_doc_design(repo, project, user_id=user_id)
+        active_preset_id = (effective_design or {}).get("style_preset") or "minimal"
+        active_preset_name = STYLE_PRESETS.get(active_preset_id, STYLE_PRESETS["minimal"])["name"]
+
         return {
             "eligibility": eligibility,
             "checklist": checklist,
@@ -1853,13 +1878,236 @@ def create_app(
             "latest_export": latest_export,
             "all_exports": all_exports,
             "recent_exports": all_exports,
+            "active_doc_design": {
+                "preset": active_preset_id,
+                "preset_name": active_preset_name,
+                "source": design_source,
+                "is_saved": design_source != "default",
+                "settings_url": f"/settings?project_id={project_id}",
+            },
+        }
+
+    def _get_request_user_id(request: Request) -> str:
+        user = getattr(request.state, "user", None)
+        if isinstance(user, dict) and user.get("id"):
+            return str(user["id"])
+        if not auth.is_auth_enabled():
+            return auth.get_single_user_id()
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    def _list_authorized_projects(request: Request) -> List[Dict[str, Any]]:
+        user = getattr(request.state, "user", None)
+        if auth.is_auth_enabled():
+            owner_id = user["id"] if isinstance(user, dict) and user.get("id") else ""
+            return repo.list_projects(owner_id=owner_id)
+        return auth.filter_authorized_projects(repo.list_projects(), user)
+
+    @app.get("/api/settings/doc-design")
+    async def get_user_doc_design_endpoint(request: Request, project_id: Optional[str] = None):
+        user_id = _get_request_user_id(request)
+        user_projects = _list_authorized_projects(request)
+
+        preview_project: Optional[Dict[str, Any]] = None
+        if project_id:
+            preview_project = _authorize_project_access(request, project_id)
+        else:
+            for candidate in user_projects:
+                imgs = repo.list_project_images(candidate["id"])
+                if imgs:
+                    preview_project = candidate
+                    break
+            if preview_project is None and user_projects:
+                preview_project = user_projects[0]
+
+        preview_project_name = (preview_project.get("name") if preview_project else None) or "Accessibility Review"
+        if preview_project is not None:
+            ctx = get_project_design_context(repo, preview_project["id"])
+        else:
+            ctx = {
+                "available_fields": [
+                    {"id": "image", "label": "Extracted image", "available": True},
+                    {"id": "filename", "label": "Filename", "available": True},
+                    {"id": "page_number", "label": "Page number", "available": True},
+                    {"id": "figure_label", "label": "Figure number", "available": True},
+                    {"id": "original_caption", "label": "Original caption", "available": True},
+                    {"id": "generated_alt_text", "label": "Generated alt text", "available": True},
+                    {"id": "approved_alt_text", "label": "Approved alt text", "available": True},
+                    {"id": "image_id", "label": "Image ID", "available": True},
+                    {"id": "review_status", "label": "Review status", "available": True},
+                ],
+                "sample_item": {
+                    "image_id": "sample_fig_1",
+                    "suggested_filename": "figure_1_sample.png",
+                    "page_number": 1,
+                    "figure_label": "Figure 1.1",
+                    "original_caption": "Figure 1.1: Representative chart from your document.",
+                    "generated_alt_text": "Bar chart comparing annual totals across four quarters.",
+                    "approved_alt_text": "Bar chart comparing annual totals across four quarters with steady growth from Q1 to Q4.",
+                    "review_status": "approved",
+                    "image_url": "",
+                },
+                "preview_items": [],
+                "total_images": 0,
+            }
+
+        saved = repo.get_user_doc_design(user_id) if hasattr(repo, "get_user_doc_design") else None
+        is_saved = saved is not None
+        effective = (
+            validate_design_config(saved, project_name=preview_project_name)
+            if saved is not None
+            else get_default_design_config(project_name=preview_project_name)
+        )
+        presets_summary = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "description": p["description"],
+                "defaults": p["defaults"],
+            }
+            for p in STYLE_PRESETS.values()
+        ]
+        return {
+            "user_id": user_id,
+            "project_id": preview_project["id"] if preview_project else None,
+            "project_name": preview_project_name,
+            "projects": [
+                {"id": p["id"], "name": p.get("name") or p["id"]}
+                for p in user_projects
+            ],
+            "design_config": effective,
+            "is_saved": is_saved,
+            "available_fields": ctx["available_fields"],
+            "sample_item": ctx["sample_item"],
+            "preview_items": ctx["preview_items"],
+            "total_images": ctx["total_images"],
+            "presets": presets_summary,
+        }
+
+    @app.put("/api/settings/doc-design")
+    async def save_user_doc_design_endpoint(request: Request):
+        user_id = _get_request_user_id(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON request body.")
+        raw_cfg = body.get("design_config", body) if isinstance(body, dict) else body
+        try:
+            validated = validate_design_config(raw_cfg, project_name="Accessibility Review")
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        saved_meta = repo.save_user_doc_design(user_id, validated)
+        return {
+            "status": "saved",
+            "user_id": user_id,
+            "design_config": validated,
+            "saved_at": saved_meta.get("saved_at"),
+            "is_saved": True,
+        }
+
+    @app.delete("/api/settings/doc-design")
+    async def reset_user_doc_design_endpoint(request: Request):
+        user_id = _get_request_user_id(request)
+        repo.reset_user_doc_design(user_id)
+        return {
+            "status": "reset",
+            "user_id": user_id,
+            "design_config": get_default_design_config(project_name="Accessibility Review"),
+            "is_saved": False,
+        }
+
+    @app.get("/api/projects/{project_id}/doc-design")
+    async def get_project_doc_design_endpoint(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id)
+        project_name = project.get("name") or "Accessibility Review"
+        saved = repo.get_project_doc_design(project_id) if hasattr(repo, "get_project_doc_design") else None
+        is_saved = saved is not None
+        effective = (
+            validate_design_config(saved, project_name=project_name)
+            if saved is not None
+            else get_default_design_config(project_name=project_name)
+        )
+        ctx = get_project_design_context(repo, project_id)
+        presets_summary = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "description": p["description"],
+                "defaults": p["defaults"],
+            }
+            for p in STYLE_PRESETS.values()
+        ]
+        return {
+            "project_id": project_id,
+            "project_name": project_name,
+            "design_config": effective,
+            "is_saved": is_saved,
+            "available_fields": ctx["available_fields"],
+            "sample_item": ctx["sample_item"],
+            "preview_items": ctx["preview_items"],
+            "total_images": ctx["total_images"],
+            "presets": presets_summary,
+        }
+
+    @app.put("/api/projects/{project_id}/doc-design")
+    async def save_project_doc_design_endpoint(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id)
+        project_name = project.get("name") or "Accessibility Review"
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON request body.")
+        raw_cfg = body.get("design_config", body) if isinstance(body, dict) else body
+        try:
+            validated = validate_design_config(raw_cfg, project_name=project_name)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        saved_meta = repo.save_project_doc_design(project_id, validated)
+        return {
+            "status": "saved",
+            "project_id": project_id,
+            "design_config": validated,
+            "saved_at": saved_meta.get("saved_at"),
+            "is_saved": True,
+        }
+
+    @app.delete("/api/projects/{project_id}/doc-design")
+    async def reset_project_doc_design_endpoint(request: Request, project_id: str):
+        project = _authorize_project_access(request, project_id)
+        project_name = project.get("name") or "Accessibility Review"
+        repo.reset_project_doc_design(project_id)
+        return {
+            "status": "reset",
+            "project_id": project_id,
+            "design_config": get_default_design_config(project_name=project_name),
+            "is_saved": False,
         }
 
     @app.post("/api/projects/{project_id}/exports/docx")
     async def export_docx_endpoint(request: Request, project_id: str):
-        _authorize_project_access(request, project_id)
+        project = _authorize_project_access(request, project_id)
+        design_config = None
         try:
-            export_record = export_project_docx(repo, filestore, project_id)
+            raw_body = await request.body()
+            if raw_body:
+                parsed = json.loads(raw_body.decode("utf-8"))
+                if isinstance(parsed, dict) and parsed.get("design_config") is not None:
+                    design_config = validate_design_config(
+                        parsed["design_config"],
+                        project_name=project.get("name") or "Document",
+                    )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail={"message": str(ve)})
+        except Exception:
+            raise HTTPException(status_code=400, detail={"message": "Invalid JSON request body."})
+        user_id = _get_request_user_id(request)
+        try:
+            export_record = export_project_docx(
+                repo,
+                filestore,
+                project_id,
+                design_config=design_config,
+                user_id=user_id,
+            )
             return {
                 "status": "success",
                 "export_id": export_record["id"],

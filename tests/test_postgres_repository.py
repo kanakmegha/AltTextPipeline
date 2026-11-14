@@ -828,6 +828,29 @@ def test_postgres_permanent_project_deletion_and_retry(repo):
     assert repo.get_export(f"exp_{pid_keep}") is not None
 
 
+def test_postgres_project_doc_design_save_restore_reset(repo):
+    pid = f"pg_des_{uuid.uuid4().hex[:8]}"
+    repo.create_project(pid, "PG Designer Book", f"{pid}.pdf", f"source/{pid}.pdf", "chk")
+    assert repo.get_project_doc_design(pid) is None
+
+    cfg = {
+        "style_preset": "professional",
+        "document_title": "PG Accessibility Report",
+        "font_family": "Arial",
+        "fields": [{"key": "image", "enabled": True}, {"key": "approved_alt_text", "enabled": True}],
+    }
+    saved = repo.save_project_doc_design(pid, cfg)
+    assert saved["config"]["document_title"] == "PG Accessibility Report"
+
+    restored = repo.get_project_doc_design(pid)
+    assert restored is not None
+    assert restored["style_preset"] == "professional"
+    assert restored["document_title"] == "PG Accessibility Report"
+
+    repo.reset_project_doc_design(pid)
+    assert repo.get_project_doc_design(pid) is None
+
+
 def test_postgres_deletion_crash_recovery_lease_fencing_and_partial_db(repo, monkeypatch):
     from datetime import datetime, timedelta, timezone
     import threading
@@ -935,3 +958,45 @@ def test_postgres_deletion_crash_recovery_lease_fencing_and_partial_db(repo, mon
     assert repo.get_project(pid_del) is None
     assert repo.get_project(pid_keep) is not None
     assert repo.get_export(f"exp_{pid_keep}") is not None
+
+
+def test_postgres_project_doc_design_save_restore_reset(repo):
+    pid = f"pg_des_{uuid.uuid4().hex[:8]}"
+    repo.create_project(pid, "PG Designer Book", f"{pid}.pdf", f"source/{pid}.pdf", "chk")
+    assert repo.get_project_doc_design(pid) is None
+
+    cfg = {
+        "style_preset": "professional",
+        "document_title": "PG Accessibility Report",
+        "font_family": "Arial",
+        "fields": [{"key": "image", "enabled": True}, {"key": "approved_alt_text", "enabled": True}],
+    }
+    saved = repo.save_project_doc_design(pid, cfg)
+    assert saved["config"]["document_title"] == "PG Accessibility Report"
+
+    restored = repo.get_project_doc_design(pid)
+    assert restored is not None
+    assert restored["style_preset"] == "professional"
+    assert restored["document_title"] == "PG Accessibility Report"
+
+    repo.reset_project_doc_design(pid)
+    assert repo.get_project_doc_design(pid) is None
+
+
+def test_postgres_user_doc_design_save_restore_reset_and_isolation(repo):
+    u1 = f"pg_user1_{uuid.uuid4().hex[:8]}"
+    u2 = f"pg_user2_{uuid.uuid4().hex[:8]}"
+    assert repo.get_user_doc_design(u1) is None
+
+    cfg1 = {"style_preset": "editorial", "document_title": "User 1 Prefs"}
+    cfg2 = {"style_preset": "table", "document_title": "User 2 Prefs"}
+    repo.save_user_doc_design(u1, cfg1)
+    repo.save_user_doc_design(u2, cfg2)
+
+    assert repo.get_user_doc_design(u1)["document_title"] == "User 1 Prefs"
+    assert repo.get_user_doc_design(u2)["document_title"] == "User 2 Prefs"
+
+    repo.reset_user_doc_design(u1)
+    assert repo.get_user_doc_design(u1) is None
+    assert repo.get_user_doc_design(u2)["document_title"] == "User 2 Prefs"
+    repo.reset_user_doc_design(u2)

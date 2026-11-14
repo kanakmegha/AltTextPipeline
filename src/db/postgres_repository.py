@@ -3224,3 +3224,103 @@ class PostgresRepository:
         if op["status"] == "completed":
             return op
         return self._run_project_deletion_operation(op, storage)
+
+    # ============================================================
+    # Word Document Design Configuration
+    # ============================================================
+
+    def get_project_doc_design(self, project_id: str) -> Optional[Dict[str, Any]]:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT doc_design_config FROM projects WHERE id = %s;",
+                    (project_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                raw = row.get("doc_design_config")
+                if not raw:
+                    return None
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    return parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    return None
+
+    def save_project_doc_design(self, project_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        now = utc_now_iso()
+        serialized = json.dumps(config)
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE projects SET doc_design_config = %s, updated_at = %s WHERE id = %s;",
+                    (serialized, now, project_id),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError(f"Project '{project_id}' not found.")
+        return {"config": config, "saved_at": now}
+
+    def reset_project_doc_design(self, project_id: str) -> None:
+        now = utc_now_iso()
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE projects SET doc_design_config = NULL, updated_at = %s WHERE id = %s;",
+                    (now, project_id),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError(f"Project '{project_id}' not found.")
+
+    def get_user_doc_design(self, user_id: str) -> Optional[Dict[str, Any]]:
+        uid = (user_id or "").strip()
+        if not uid:
+            return None
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT doc_design_config FROM user_doc_preferences WHERE user_id = %s;",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                raw = row.get("doc_design_config")
+                if not raw:
+                    return None
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    return parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    return None
+
+    def save_user_doc_design(self, user_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        uid = (user_id or "").strip()
+        if not uid:
+            raise ValueError("Authenticated user_id is required to save Word document preferences.")
+        now = utc_now_iso()
+        serialized = json.dumps(config)
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_doc_preferences (user_id, doc_design_config, updated_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        doc_design_config = EXCLUDED.doc_design_config,
+                        updated_at = EXCLUDED.updated_at;
+                    """,
+                    (uid, serialized, now),
+                )
+        return {"user_id": uid, "config": config, "saved_at": now}
+
+    def reset_user_doc_design(self, user_id: str) -> None:
+        uid = (user_id or "").strip()
+        if not uid:
+            return
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_doc_preferences WHERE user_id = %s;",
+                    (uid,),
+                )
