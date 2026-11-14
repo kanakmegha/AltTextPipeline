@@ -461,4 +461,3 @@ def test_sqlite_deletion_crash_recovery_lease_fencing_and_partial_db(env_setup, 
     # 7. Cross-project isolation intact
     assert repo.get_project(pid_keep) is not None
     assert store.exists(pid_keep, keep_info["exp_key"])
-

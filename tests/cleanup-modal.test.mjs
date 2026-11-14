@@ -164,4 +164,3 @@ test("cleanup modal Mode A sends mode=extracted and Mode B sends mode=all_source
   const execReqA = requests.find((r) => r.url.includes("/cleanup/execute"));
   assert.deepEqual(JSON.parse(execReqA.body), { mode: "extracted" });
 });
-

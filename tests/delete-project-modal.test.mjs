@@ -201,4 +201,3 @@ test("reopening delete modal with incomplete deletion resumes existing operation
   assert.equal(calls.some((c) => c.url.endsWith("/delete")), false);
   assert.equal(calls.some((c) => c.url.endsWith("/api/deletions/op-crashed-99/retry")), true);
 });
-

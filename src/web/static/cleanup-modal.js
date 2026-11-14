@@ -405,4 +405,3 @@ export function openCleanupModal({ projectId, projectName = "", onComplete = nul
 if (typeof window !== "undefined") {
   window.openCleanupModal = openCleanupModal;
 }
-

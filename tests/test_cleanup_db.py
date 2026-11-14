@@ -520,4 +520,3 @@ def test_postgres_cleanup_parity_mode_a_and_mode_b():
         assert proj_b["source_storage_key"] == ""
         assert len(pg_repo.list_project_images(pid_b)) == 0
         assert len(pg_repo.list_project_exports(pid_b)) == 1
-
