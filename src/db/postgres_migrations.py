@@ -406,4 +406,45 @@ def apply_migrations(db: PostgresConnection) -> int:
         _record_version(db, 12)
         current_version = 12
 
+    # Migration 13: Persistent Word document design configuration on projects
+    if current_version < 13:
+        with db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS doc_design_config TEXT;"
+                )
+        _record_version(db, 13)
+        current_version = 13
+
+    # Migration 14: User-level Word document preferences + safe migration from owned projects
+    if current_version < 14:
+        with db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_doc_preferences (
+                        user_id TEXT PRIMARY KEY,
+                        doc_design_config TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                if _column_exists(db, "projects", "owner_id") and _column_exists(db, "projects", "doc_design_config"):
+                    cur.execute(
+                        """
+                        INSERT INTO user_doc_preferences (user_id, doc_design_config, updated_at)
+                        SELECT DISTINCT ON (owner_id)
+                            owner_id,
+                            doc_design_config,
+                            COALESCE(updated_at, CURRENT_TIMESTAMP)
+                        FROM projects
+                        WHERE owner_id IS NOT NULL AND BTRIM(owner_id) <> ''
+                          AND doc_design_config IS NOT NULL AND BTRIM(doc_design_config) <> ''
+                        ORDER BY owner_id, updated_at DESC
+                        ON CONFLICT (user_id) DO NOTHING;
+                        """
+                    )
+        _record_version(db, 14)
+        current_version = 14
+
     return current_version

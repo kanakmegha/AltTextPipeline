@@ -11,6 +11,7 @@ from src.db.repository import Repository
 from src.storage.filestore import FileStore
 from src.ai.cleaner import clean_alt_text_response, is_contaminated_alt_text
 from .docx_builder import DocxBuilder
+from .design_config import FIELD_CATALOG, validate_design_config
 
 
 def check_export_eligibility(repo: Repository, project_id: str) -> Dict[str, Any]:
@@ -96,11 +97,130 @@ def check_export_eligibility(repo: Repository, project_id: str) -> Dict[str, Any
     }
 
 
+def _load_figure_groups(repo: Repository, images: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Fetch distinct figure groups referenced by project images."""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for img in images:
+        gid = img.get("group_id")
+        if gid and gid not in groups:
+            grp = repo.get_figure_group(gid)
+            if grp:
+                groups[gid] = grp
+    return groups
+
+
+def get_project_design_context(repo: Repository, project_id: str) -> Dict[str, Any]:
+    """
+    Inspect real project images/versions/groups to determine which fields
+    actually have data available and build a real representative sample for preview.
+    """
+    images = repo.list_project_images(project_id)
+    groups = _load_figure_groups(repo, images)
+
+    has_caption = any(bool((img.get("original_caption") or "").strip()) for img in images)
+    has_figure_label = False
+    has_generated = False
+    has_approved = False
+    sample_item: Optional[Dict[str, Any]] = None
+    preview_items: List[Dict[str, Any]] = []
+
+    for img in images:
+        grp = groups.get(img.get("group_id") or "")
+        fig_label = (grp.get("figure_label") if grp else None) or None
+        if fig_label:
+            has_figure_label = True
+
+        latest_ver = repo.get_latest_version(img["id"])
+        gen_text = ((latest_ver.get("alt_text") or latest_ver.get("text") or "").strip() if latest_ver else "")
+        if gen_text:
+            has_generated = True
+
+        approval = repo.get_approval_for_image(img["id"])
+        app_text = ""
+        if approval and approval.get("alt_text_version_id"):
+            av = repo.get_alt_text_version(approval["alt_text_version_id"])
+            if av:
+                app_text = (av.get("text") or av.get("alt_text") or "").strip()
+        if app_text:
+            has_approved = True
+
+        entry = {
+            "image_id": img["id"],
+            "suggested_filename": img.get("suggested_filename") or "",
+            "page_number": img.get("page_number"),
+            "figure_label": fig_label or "",
+            "original_caption": (img.get("original_caption") or "").strip(),
+            "generated_alt_text": gen_text,
+            "approved_alt_text": app_text or gen_text,
+            "review_status": img.get("processing_status") or "extracted",
+            "image_url": f"/api/projects/{project_id}/images/{img['id']}/file",
+        }
+        if len(preview_items) < 3:
+            preview_items.append(entry)
+        if sample_item is None and (app_text or entry["original_caption"]):
+            sample_item = entry
+
+    if sample_item is None and preview_items:
+        sample_item = preview_items[0]
+
+    availability_map = {
+        "image": len(images) > 0,
+        "image_id": len(images) > 0,
+        "filename": any(bool(img.get("suggested_filename")) for img in images),
+        "page_number": any(img.get("page_number") is not None for img in images),
+        "figure_label": has_figure_label,
+        "original_caption": has_caption,
+        "generated_alt_text": has_generated,
+        "approved_alt_text": has_approved or len(images) > 0,
+        "review_status": len(images) > 0,
+    }
+    available_fields = [
+        {"key": f["key"], "label": f["label"], "available": availability_map.get(f["key"], False)}
+        for f in FIELD_CATALOG
+        if availability_map.get(f["key"], False)
+    ]
+
+    return {
+        "available_fields": available_fields,
+        "sample_item": sample_item,
+        "preview_items": preview_items,
+        "total_images": len(images),
+    }
+
+
+def resolve_effective_doc_design(
+    repo: Repository,
+    project: Dict[str, Any],
+    user_id: Optional[str] = None,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """
+    Resolve effective Word document design configuration with precedence:
+    1. User-level saved preference (user_doc_preferences)
+    2. Legacy project-level configuration (projects.doc_design_config)
+    3. None (default format)
+    """
+    project_name = project.get("name", "Document")
+    effective_uid = (user_id or project.get("owner_id") or "").strip()
+    if effective_uid and hasattr(repo, "get_user_doc_design"):
+        user_cfg = repo.get_user_doc_design(effective_uid)
+        if user_cfg is not None:
+            return validate_design_config(user_cfg, project_name=project_name), "user"
+
+    if hasattr(repo, "get_project_doc_design"):
+        proj_cfg = repo.get_project_doc_design(project["id"])
+        if proj_cfg is not None:
+            return validate_design_config(proj_cfg, project_name=project_name), "project_legacy"
+
+    return None, "default"
+
+
 def export_project_docx(
     repo: Repository,
     filestore: FileStore,
     project_id: str,
     include_page_breaks: bool = False,
+    design_config: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds, validates, and stores a DOCX export using strictly approved records.
@@ -115,6 +235,15 @@ def export_project_docx(
     project = repo.get_project(project_id)
     # List images in reading order: page_number ASC, placement_index ASC
     images = repo.list_project_images(project_id)
+    groups = _load_figure_groups(repo, images)
+
+    if design_config is not None:
+        effective_design = validate_design_config(
+            design_config,
+            project_name=project.get("name", "Document"),
+        )
+    else:
+        effective_design, _ = resolve_effective_doc_design(repo, project, user_id=user_id)
 
     builder_items: List[Dict[str, Any]] = []
     for img in images:
@@ -139,12 +268,20 @@ def export_project_docx(
         else:
             final_alt = raw_alt
 
+        grp = groups.get(img.get("group_id") or "")
+        fig_label = (grp.get("figure_label") if grp else None) or ""
+        latest_ver = repo.get_latest_version(img["id"])
+        gen_alt = ((latest_ver.get("alt_text") or latest_ver.get("text") or "").strip() if latest_ver else "")
+
         builder_items.append({
             "image_id": img["id"],
             "suggested_filename": img["suggested_filename"],
             "page_number": img["page_number"],
+            "figure_label": fig_label,
             "original_caption": img.get("original_caption"),
+            "generated_alt_text": gen_alt,
             "approved_alt_text": final_alt,
+            "review_status": img.get("processing_status") or "approved",
             "image_bytes": img_bytes,
             "image_format": img.get("image_format", "png"),
             "source_path": img["file_storage_key"],
@@ -155,6 +292,7 @@ def export_project_docx(
         project_name=project.get("name", "Document"),
         items=builder_items,
         include_page_breaks=include_page_breaks,
+        design_config=effective_design,
     )
 
     export_id = str(uuid.uuid4())

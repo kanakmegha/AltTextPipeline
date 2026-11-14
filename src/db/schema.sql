@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS projects (
     status TEXT NOT NULL DEFAULT 'created',
     cleanup_status TEXT NOT NULL DEFAULT 'retained',
     owner_id TEXT,
+    doc_design_config TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -212,5 +213,12 @@ CREATE INDEX IF NOT EXISTS idx_exports_project ON exports(project_id);
 CREATE INDEX IF NOT EXISTS idx_ai_usage_project ON ai_usage_ledger(project_id);
 CREATE INDEX IF NOT EXISTS idx_figure_groups_project ON figure_groups(project_id);
 CREATE INDEX IF NOT EXISTS idx_image_assets_group ON image_assets(group_id);
+
+-- User-level Word Document Preferences Table
+CREATE TABLE IF NOT EXISTS user_doc_preferences (
+    user_id TEXT PRIMARY KEY,
+    doc_design_config TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_audit_events_project ON audit_events(project_id);
 CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
