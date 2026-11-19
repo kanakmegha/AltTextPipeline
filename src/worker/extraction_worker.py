@@ -98,16 +98,12 @@ def _remap_batch_result_pages(result, page_numbers):
 
 
 def _extract_pdf_batch(pdf_path, page_numbers):
-    """Split one batch into a temporary PDF and process it with a fresh PyMuPDF handle."""
+    """Process one page batch directly from the read-only source PDF with a fresh PyMuPDF handle."""
     temp_dir = tempfile.mkdtemp(prefix="pdf_batch_")
-    batch_pdf_path = os.path.join(temp_dir, "batch.pdf")
     try:
-        _split_pdf_batch_to_temp_file(pdf_path, page_numbers, batch_pdf_path)
-        local_pages = list(range(1, len(page_numbers) + 1))
         result = ExtractionEngine().process_pdf(
-            batch_pdf_path, page_numbers=local_pages, output_images_dir=temp_dir, group_results=False
+            pdf_path, page_numbers=page_numbers, output_images_dir=temp_dir, group_results=False
         )
-        _remap_batch_result_pages(result, page_numbers)
         _strip_ipc_image_bytes(result, temp_dir)
         return result, temp_dir
     except Exception:

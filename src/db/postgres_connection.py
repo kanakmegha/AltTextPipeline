@@ -14,21 +14,30 @@ Key differences from SQLite:
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Generator, Optional, Any
 
 import psycopg2
+import psycopg2.extensions
 import psycopg2.extras
+import psycopg2.pool
 from psycopg2.extensions import connection as pg_connection
 
 
 class PostgresConnection:
     """
-    Manages PostgreSQL connections with dict-row access and transaction
-    context management, mirroring the SQLite DatabaseConnection interface.
+    Manages PostgreSQL connections with thread-safe, fork-safe connection pooling,
+    dict-row access, and transaction context management, mirroring the SQLite
+    DatabaseConnection interface.
     """
 
-    def __init__(self, database_url: Optional[str] = None):
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        minconn: Optional[int] = None,
+        maxconn: Optional[int] = None,
+    ):
         self.database_url = (
             database_url
             or os.environ.get("DATABASE_URL")
@@ -40,9 +49,50 @@ class PostgresConnection:
                 "DATABASE_URL, NEON_DB_URL, or POSTGRES_URL is required for PostgreSQL connections. "
                 "Set it to your PostgreSQL connection string."
             )
+        raw_min = minconn if minconn is not None else int(os.environ.get("PG_POOL_MIN_CONN", "1"))
+        raw_max = maxconn if maxconn is not None else int(os.environ.get("PG_POOL_MAX_CONN", "5"))
+        self.minconn = max(1, int(raw_min))
+        self.maxconn = max(self.minconn, min(20, int(raw_max)))
+        self._pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+        self._pool_pid: Optional[int] = None
+        self._pool_lock = threading.Lock()
+
+    def _get_pool(self) -> psycopg2.pool.ThreadedConnectionPool:
+        """
+        Return the process-local connection pool, lazily creating it if needed.
+        If the current PID differs from the PID that created the pool (after fork),
+        discard the inherited reference without closing the parent's sockets.
+        """
+        pid = os.getpid()
+        with self._pool_lock:
+            if self._pool is None or self._pool_pid != pid:
+                self._pool = psycopg2.pool.ThreadedConnectionPool(
+                    self.minconn,
+                    self.maxconn,
+                    self.database_url,
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                )
+                self._pool_pid = pid
+            return self._pool
+
+    def close_pool(self) -> None:
+        """Close all pooled connections created by the current process."""
+        pid = os.getpid()
+        with self._pool_lock:
+            if self._pool is not None and self._pool_pid == pid:
+                try:
+                    self._pool.closeall()
+                finally:
+                    self._pool = None
+                    self._pool_pid = None
+            elif self._pool is not None:
+                self._pool = None
+                self._pool_pid = None
+
+    close = close_pool
 
     def get_connection(self) -> pg_connection:
-        """Create a configured connection with RealDictCursor row factory."""
+        """Create a configured standalone connection with RealDictCursor row factory."""
         conn = psycopg2.connect(
             self.database_url,
             cursor_factory=psycopg2.extras.RealDictCursor,
@@ -53,22 +103,39 @@ class PostgresConnection:
     @contextmanager
     def session(self) -> Generator[pg_connection, None, None]:
         """
-        Context manager for automatic commit and rollback.
-
-        Usage:
-            with db.session() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT ...", (...))
+        Context manager for pooled connections with automatic commit, rollback,
+        and broken-connection disposal.
         """
-        conn = self.get_connection()
+        pool = self._get_pool()
+        conn = pool.getconn()
+        if getattr(conn, "closed", 0):
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        conn.autocommit = False
+
+        discard = False
         try:
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            try:
+                if not getattr(conn, "closed", 0):
+                    conn.rollback()
+                else:
+                    discard = True
+            except Exception:
+                discard = True
             raise
         finally:
-            conn.close()
+            if not discard and not getattr(conn, "closed", 0):
+                try:
+                    if conn.status != psycopg2.extensions.STATUS_READY:
+                        conn.rollback()
+                except Exception:
+                    discard = True
+            else:
+                discard = True
+            pool.putconn(conn, close=discard)
 
     def execute_script(self, sql: str) -> None:
         """

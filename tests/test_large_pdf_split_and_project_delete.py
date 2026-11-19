@@ -128,12 +128,12 @@ def test_temporary_pdf_splitting_and_sequential_worker_execution(env_setup, tmp_
     assert len(split_doc) == 25
     split_doc.close()
 
-    # Verify _extract_pdf_batch remaps local page numbers back to original [26..50]
+    # Verify _extract_pdf_batch reads directly without creating a temporary batch.pdf
     res_b2, b2_temp = _extract_pdf_batch(str(store.resolve_path(pid, src_key)), list(range(26, 51)))
     try:
         assert len(res_b2.images) == 1
         assert res_b2.images[0].page_number == 27
-        assert os.path.isfile(os.path.join(b2_temp, "batch.pdf"))
+        assert not os.path.isfile(os.path.join(b2_temp, "batch.pdf"))
     finally:
         import shutil
         shutil.rmtree(b2_temp, ignore_errors=True)
