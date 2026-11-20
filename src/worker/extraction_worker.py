@@ -19,6 +19,21 @@ from src.extraction.engine import ExtractionEngine
 
 logger = logging.getLogger("alttext.worker")
 LEASE_SECONDS = 300
+
+
+class JobCancelledError(RuntimeError):
+    """Raised when a project deletion or explicit job cancellation aborts extraction."""
+
+
+def _is_cancelled_or_deleting(repo, job_id, project_id) -> bool:
+    if hasattr(repo, "is_job_cancelled_or_project_deleting"):
+        return bool(repo.is_job_cancelled_or_project_deleting(job_id, project_id))
+    return False
+
+
+def _check_not_cancelled(repo, job_id, project_id) -> None:
+    if _is_cancelled_or_deleting(repo, job_id, project_id):
+        raise JobCancelledError(f"Extraction job {job_id} cancelled because project {project_id} is deleting")
 DEFAULT_PDF_BATCH_SIZE = 25
 PDF_BATCH_SIZE = DEFAULT_PDF_BATCH_SIZE
 DEFAULT_PERSIST_MICRO_BATCH_SIZE = 8
@@ -181,7 +196,7 @@ def _process_batch(pdf_path, pages, engine):
 _ORIG_EXTRACT_PDF_BATCH = _extract_pdf_batch
 
 
-def _persist_images_list(repo, filestore, project_id, image_entries, metrics=None, known_source_map=None):
+def _persist_images_list(repo, filestore, project_id, image_entries, metrics=None, known_source_map=None, job_id=None):
     """
     Persist a list of (ExtractedImage, optional_disk_path) items using
     job-scoped source-map caching, deterministic UUID5 IDs, bounded Blob upload
@@ -255,6 +270,9 @@ def _persist_images_list(repo, filestore, project_id, image_entries, metrics=Non
             }
         return 0
 
+    if job_id is not None:
+        _check_not_cancelled(repo, job_id, project_id)
+
     def _save_one(entry):
         img, disk_path = entry
         payload = img.image_bytes
@@ -300,6 +318,8 @@ def _persist_images_list(repo, filestore, project_id, image_entries, metrics=Non
     t0_insert = time.perf_counter()
     db_insert_count = 0
     if uploaded:
+        if job_id is not None:
+            _check_not_cancelled(repo, job_id, project_id)
         if hasattr(repo, "create_image_assets_batch"):
             batch_items = [
                 {
@@ -395,7 +415,7 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
     return context
 
 
-def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None):
+def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None, job_id=None):
     images_by_page, text_blocks_by_page, page_dimensions = {}, {}, {}
     for context in contexts:
         images_by_page.update(context.get("images_by_page", {}))
@@ -423,6 +443,8 @@ def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None
 
     groups_created = 0
     if group_payloads:
+        if job_id is not None:
+            _check_not_cancelled(repo, job_id, project_id)
         if hasattr(repo, "create_figure_groups_batch"):
             groups_created = repo.create_figure_groups_batch(group_payloads)
         else:
@@ -483,6 +505,8 @@ def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None
         })
 
     if association_updates:
+        if job_id is not None:
+            _check_not_cancelled(repo, job_id, project_id)
         if hasattr(repo, "update_image_group_associations_batch"):
             repo.update_image_group_associations_batch(association_updates)
         else:
@@ -545,6 +569,7 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
     tmp_path = None
     t0_job = time.perf_counter()
     try:
+        _check_not_cancelled(repo, job_id, project_id)
         repo.update_project_status(project_id, status="extracting")
         t0_download = time.perf_counter()
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -633,6 +658,7 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
         def _ensure_lease():
             if stopped.is_set():
                 return
+            _check_not_cancelled(repo, job_id, project_id)
             if lease_lost.is_set():
                 raise RuntimeError("Worker lost the extraction job lease")
             now_mono = time.monotonic()
@@ -717,9 +743,10 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
 
         _ensure_lease()
         t0_group = time.perf_counter()
-        img_count, group_count = _finalize_document_grouping(repo, project_id, active_engine, contexts, metrics=job_metrics)
+        img_count, group_count = _finalize_document_grouping(repo, project_id, active_engine, contexts, metrics=job_metrics, job_id=job_id)
         dur_group = time.perf_counter() - t0_group
         _stop_heartbeat()
+        _check_not_cancelled(repo, job_id, project_id)
         if lease_lost.is_set():
             raise RuntimeError("Worker lost the extraction job lease")
         if not repo.update_claimed_job_status(job_id, worker_id, "completed"):
@@ -742,6 +769,9 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
         return True
     except Exception as exc:
         _stop_heartbeat()
+        if isinstance(exc, JobCancelledError) or _is_cancelled_or_deleting(repo, job_id, project_id):
+            logger.info("Extraction job %s cancelled (project %s deleting)", job_id, project_id)
+            return False
         logger.exception("Extraction job %s failed", job_id)
         current = repo.get_job(job_id) or claimed
         retry = int(current.get("attempt_count", 1)) < int(current.get("max_attempts", 3))
@@ -1005,6 +1035,7 @@ def _process_pages_continuous(
                     buffer,
                     metrics=metrics,
                     known_source_map=known_source_map,
+                    job_id=job_id,
                 )
             _mark_batches_persisted(buffer_batch_counts)
             buffer = []
@@ -1038,6 +1069,7 @@ def _process_pages_continuous(
                         [first_entry],
                         metrics=metrics,
                         known_source_map=known_source_map,
+                        job_id=job_id,
                     )
                     first_image_flushed = True
                     entries = entries[1:]
@@ -1167,6 +1199,7 @@ def _process_pages_continuous(
                 _drain_completed_batches()
 
                 if first_error is not None:
+                    persist_stop.set()
                     for fut in list(active):
                         fut.cancel()
                     break

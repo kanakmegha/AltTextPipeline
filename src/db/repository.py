@@ -141,7 +141,10 @@ class Repository:
         values.append(now)
         values.append(project_id)
 
-        query = f"UPDATE projects SET {', '.join(fields)} WHERE id = ?;"
+        if status is not None and cleanup_status is None:
+            query = f"UPDATE projects SET {', '.join(fields)} WHERE id = ? AND COALESCE(cleanup_status, 'retained') != 'deleting';"
+        else:
+            query = f"UPDATE projects SET {', '.join(fields)} WHERE id = ?;"
         with self.db.session() as conn:
             conn.execute(query, tuple(values))
 
@@ -464,7 +467,12 @@ class Repository:
         project_ids = {item["project_id"] for item in items}
         with self.db.session() as conn:
             existing_keys = set()
+            blocked_projects = set()
             for pid in project_ids:
+                prow = conn.execute("SELECT cleanup_status FROM projects WHERE id = ?;", (pid,)).fetchone()
+                if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                    blocked_projects.add(pid)
+                    continue
                 cur = conn.execute(
                     "SELECT page_number, xref, placement_index FROM image_assets WHERE project_id = ?;",
                     (pid,),
@@ -474,6 +482,8 @@ class Repository:
 
             rows_to_insert = []
             for item in items:
+                if item["project_id"] in blocked_projects:
+                    continue
                 key = (
                     item["project_id"],
                     int(item["page_number"]),
@@ -538,12 +548,19 @@ class Repository:
         project_ids = {g["project_id"] for g in groups}
         with self.db.session() as conn:
             existing_ids = set()
+            blocked_projects = set()
             for pid in project_ids:
+                prow = conn.execute("SELECT cleanup_status FROM projects WHERE id = ?;", (pid,)).fetchone()
+                if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                    blocked_projects.add(pid)
+                    continue
                 cur = conn.execute("SELECT id FROM figure_groups WHERE project_id = ?;", (pid,))
                 for row in cur.fetchall():
                     existing_ids.add(row["id"])
             rows_to_insert = []
             for g in groups:
+                if g["project_id"] in blocked_projects:
+                    continue
                 gid = g["group_id"]
                 if gid in existing_ids:
                     continue
@@ -608,7 +625,12 @@ class Repository:
                     needs_caption_review = ?,
                     review_reasons = ?,
                     updated_at = ?
-                WHERE id = ?;
+                WHERE id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM projects p
+                      WHERE p.id = image_assets.project_id
+                        AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                  );
                 """,
                 rows,
             )
@@ -654,7 +676,12 @@ class Repository:
                     needs_caption_review = ?,
                     review_reasons = ?,
                     updated_at = ?
-                WHERE id = ?;
+                WHERE id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM projects p
+                      WHERE p.id = image_assets.project_id
+                        AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                  );
                 """,
                 (caption, caption_position, 1 if needs_review else 0, reasons_json, now, image_id)
             )
@@ -1033,7 +1060,12 @@ class Repository:
                    started_at=COALESCE(started_at, ?), lease_updated_at=?, error_message=NULL,
                    worker_id=?,max_attempts=COALESCE(?,max_attempts)
                    WHERE id=? AND attempt_count < COALESCE(?,max_attempts)
-                   AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?));""",
+                   AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?))
+                   AND EXISTS (
+                       SELECT 1 FROM projects p
+                       WHERE p.id = jobs.project_id
+                         AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                   );""",
                 (now, now, worker_id, max_attempts, job_id, max_attempts, stale_before),
             )
             if not cursor.rowcount:
@@ -1135,9 +1167,24 @@ class Repository:
             rows = conn.execute(
                 """SELECT id FROM jobs WHERE job_type='extraction' AND attempt_count < max_attempts
                    AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < ?))
+                   AND EXISTS (
+                       SELECT 1 FROM projects p
+                       WHERE p.id = jobs.project_id
+                         AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                   )
                    ORDER BY created_at LIMIT ?;""", (stale_before, limit)
             ).fetchall()
         return [job for row in rows if (job := self.get_job(row[0]))]
+
+    def is_job_cancelled_or_project_deleting(self, job_id: str, project_id: str) -> bool:
+        with self.db.session() as conn:
+            prow = conn.execute("SELECT cleanup_status FROM projects WHERE id = ?;", (project_id,)).fetchone()
+            if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                return True
+            jrow = conn.execute("SELECT status FROM jobs WHERE id = ?;", (job_id,)).fetchone()
+            if not jrow or jrow["status"] == "cancelled":
+                return True
+        return False
 
     def fail_exhausted_jobs(self, stale_before: str) -> List[str]:
         now = utc_now_iso()
@@ -2796,10 +2843,6 @@ class Repository:
                 (project_id,),
             ).fetchall()
         ]
-        if active_jobs:
-            blocking_reasons.append(
-                f"Project has active background job(s) in progress (e.g. job {active_jobs[0]['id']})."
-            )
 
         active_exports = [
             dict(r)
@@ -2926,6 +2969,7 @@ class Repository:
             "existing_operation": existing_operation,
             "can_resume": can_resume,
             "is_active_deletion": is_active_deletion,
+            "active_extraction_jobs": active_jobs,
         }
 
     def preview_project_deletion(self, project_id: str, storage: Any = None) -> Dict[str, Any]:
@@ -2960,6 +3004,29 @@ class Repository:
             )
             conn.execute(
                 "UPDATE projects SET cleanup_status = 'deleting', updated_at = ? WHERE id = ?;",
+                (now, project_id),
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    error_message = 'Cancelled because project is being deleted',
+                    completed_at = COALESCE(completed_at, ?),
+                    lease_updated_at = NULL,
+                    worker_id = NULL
+                WHERE project_id = ? AND status IN ('queued', 'running', 'processing');
+                """,
+                (now, project_id),
+            )
+            conn.execute(
+                """
+                UPDATE job_batches
+                SET status = 'cancelled',
+                    error_message = 'Cancelled because project is being deleted',
+                    completed_at = COALESCE(completed_at, ?)
+                WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?)
+                  AND status IN ('queued', 'running');
+                """,
                 (now, project_id),
             )
             row = conn.execute("SELECT * FROM cleanup_operations WHERE id = ?;", (operation_id,)).fetchone()
@@ -3120,6 +3187,35 @@ class Repository:
                     raise StorageError(err_msg)
 
             self._renew_deletion_lease(operation_id, lease_token)
+
+            # Final sweep for any Blobs uploaded by an in-flight worker racing with cancellation
+            if storage is not None and hasattr(storage, "list_project_keys") and claimed_op["status"] != "deleting_records":
+                already_handled = set(deleted_all) | set(missing_all)
+                extra_keys = []
+                for raw_k in storage.list_project_keys(project_id):
+                    k = (raw_k or "").strip().lstrip("/")
+                    if k.startswith(f"{project_id}/"):
+                        k = k[len(f"{project_id}/"):]
+                    if k and k not in already_handled and k not in extra_keys:
+                        extra_keys.append(k)
+                if extra_keys:
+                    extra_res = storage.delete_objects(project_id, extra_keys)
+                    for k in extra_res.deleted:
+                        if k not in deleted_all:
+                            deleted_all.append(k)
+                    for k in extra_res.missing:
+                        if k not in missing_all:
+                            missing_all.append(k)
+                    if extra_res.failed:
+                        failed_map.update(extra_res.failed)
+                        err_msg = f"Failed to delete {len(failed_map)} storage object(s)."
+                        if not self._record_deletion_failure(
+                            operation_id, lease_token, deleted_all, missing_all, failed_map, err_msg
+                        ):
+                            raise CleanupBlockedError(
+                                f"Deletion lease lost for operation '{operation_id}' (reclaimed by another worker)."
+                            )
+                        raise StorageError(err_msg)
 
             # Remove project directory on local FileStore if empty/cleaned
             if hasattr(storage, "get_project_dir"):
