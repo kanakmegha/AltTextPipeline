@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta, timezone
 
 import pymupdf as fitz
@@ -127,17 +127,63 @@ def _process_batch(pdf_path, pages, engine):
         raise
 
 
-def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=None):
+def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=None, metrics=None, known_source_map=None):
     context = result.grouping_context or {}
     images_by_page = context.get("images_by_page", {})
-    images_to_upload = []
 
+    t0_lookup = time.perf_counter()
+    db_lookup_count = 0
+    if known_source_map is not None:
+        existing_map = known_source_map
+    elif hasattr(repo, "list_image_asset_source_keys"):
+        existing_map = repo.list_image_asset_source_keys(project_id)
+        db_lookup_count = 1
+    else:
+        existing_map = None
+
+    images_to_upload = []
+    seen_keys = set()
     for page in sorted(images_by_page):
         for image in images_by_page[page]:
-            if not repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index):
-                images_to_upload.append(image)
+            src_key = (int(image.page_number), int(image.xref), int(image.placement_index))
+            if src_key in seen_keys:
+                continue
+            seen_keys.add(src_key)
+            if existing_map is not None:
+                existing_id = existing_map.get(src_key)
+                if existing_id:
+                    image.image_id = existing_id
+                    continue
+            else:
+                db_lookup_count += 1
+                existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
+                if existing:
+                    image.image_id = existing["id"]
+                    continue
+            # Use deterministic image_id so Blob storage keys are idempotent across retries and DB failures.
+            image.image_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"alttext-image:{project_id}:{image.page_number}:{image.xref}:{image.placement_index}",
+                )
+            )
+            images_to_upload.append(image)
+    dur_db_lookup = time.perf_counter() - t0_lookup
 
     if not images_to_upload:
+        if metrics is not None:
+            metrics["dur_db_lookup"] += dur_db_lookup
+            metrics["db_lookup_count"] += db_lookup_count
+            metrics["batch_last"] = {
+                "dur_db_lookup": dur_db_lookup,
+                "dur_blob_upload": 0.0,
+                "dur_db_insert": 0.0,
+                "dur_blob_verify": 0.0,
+                "db_lookup_count": db_lookup_count,
+                "blob_upload_count": 0,
+                "db_insert_count": 0,
+                "blob_verify_count": 0,
+            }
         return context
 
     def _save_one(img):
@@ -155,69 +201,188 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
         )
         return img, key, checksum, size
 
+    t0_upload = time.perf_counter()
+    uploaded = []
+    first_upload_error = None
     max_upload_workers = min(4, len(images_to_upload))
     if max_upload_workers > 1:
         with ThreadPoolExecutor(max_workers=max_upload_workers) as uploader:
-            uploaded = list(uploader.map(_save_one, images_to_upload))
+            future_map = {uploader.submit(_save_one, img): img for img in images_to_upload}
+            for future in as_completed(future_map):
+                try:
+                    uploaded.append(future.result())
+                except Exception as exc:
+                    if first_upload_error is None:
+                        first_upload_error = exc
     else:
-        uploaded = [_save_one(img) for img in images_to_upload]
+        for img in images_to_upload:
+            try:
+                uploaded.append(_save_one(img))
+            except Exception as exc:
+                if first_upload_error is None:
+                    first_upload_error = exc
+    dur_blob_upload = time.perf_counter() - t0_upload
+    blob_upload_count = len(uploaded)
 
-    for img, image_key, image_checksum, _ in uploaded:
-        repo.create_image_asset(
-            image_id=img.image_id, project_id=project_id, page_number=img.page_number,
-            xref=img.xref, placement_index=img.placement_index, bbox=img.bbox.to_dict(),
-            original_caption=img.caption, caption_position=img.caption_position,
-            needs_caption_review=img.needs_caption_review, review_reasons=img.review_reasons,
-            suggested_filename=img.suggested_filename, file_storage_key=image_key,
-            file_checksum=image_checksum, image_format=img.image_format,
-            processing_status="ready_for_review", group_id=None,
-            association_type=img.association_type,
-            association_confidence=img.association_confidence, panel_label=img.panel_label,
-        )
-        if not repo.find_image_asset_by_source(project_id, img.page_number, img.xref, img.placement_index):
-            raise RuntimeError(f"Failed to verify persisted image asset {img.image_id} in database")
-        if hasattr(filestore, "exists") and not filestore.exists(project_id, image_key):
-            raise RuntimeError(f"Failed to verify persisted image object {image_key} in storage")
-        # Keep grouping metadata in memory but release image payloads as soon as they are persisted.
-        img.image_bytes = b""
+    # Persist all successfully uploaded images before propagating any partial Blob upload error
+    # so retries do not re-upload or orphan already-persisted assets.
+    t0_insert = time.perf_counter()
+    db_insert_count = 0
+    if uploaded:
+        if hasattr(repo, "create_image_assets_batch"):
+            batch_items = [
+                {
+                    "image_id": img.image_id,
+                    "project_id": project_id,
+                    "page_number": img.page_number,
+                    "xref": img.xref,
+                    "placement_index": img.placement_index,
+                    "bbox": img.bbox.to_dict(),
+                    "original_caption": img.caption,
+                    "caption_position": img.caption_position,
+                    "needs_caption_review": img.needs_caption_review,
+                    "review_reasons": img.review_reasons,
+                    "suggested_filename": img.suggested_filename,
+                    "file_storage_key": image_key,
+                    "file_checksum": image_checksum,
+                    "image_format": img.image_format,
+                    "processing_status": "ready_for_review",
+                    "group_id": None,
+                    "association_type": img.association_type,
+                    "association_confidence": img.association_confidence,
+                    "panel_label": img.panel_label,
+                }
+                for img, image_key, image_checksum, _ in uploaded
+            ]
+            repo.create_image_assets_batch(batch_items)
+            db_insert_count = 1
+        else:
+            for img, image_key, image_checksum, _ in uploaded:
+                repo.create_image_asset(
+                    image_id=img.image_id, project_id=project_id, page_number=img.page_number,
+                    xref=img.xref, placement_index=img.placement_index, bbox=img.bbox.to_dict(),
+                    original_caption=img.caption, caption_position=img.caption_position,
+                    needs_caption_review=img.needs_caption_review, review_reasons=img.review_reasons,
+                    suggested_filename=img.suggested_filename, file_storage_key=image_key,
+                    file_checksum=image_checksum, image_format=img.image_format,
+                    processing_status="ready_for_review", group_id=None,
+                    association_type=img.association_type,
+                    association_confidence=img.association_confidence, panel_label=img.panel_label,
+                )
+                db_insert_count += 1
+        for img, _, _, _ in uploaded:
+            img.image_bytes = b""
+            if known_source_map is not None:
+                known_source_map[(int(img.page_number), int(img.xref), int(img.placement_index))] = img.image_id
+    dur_db_insert = time.perf_counter() - t0_insert
+
+    if metrics is not None:
+        metrics["dur_db_lookup"] += dur_db_lookup
+        metrics["db_lookup_count"] += db_lookup_count
+        metrics["dur_blob_upload"] += dur_blob_upload
+        metrics["blob_upload_count"] += blob_upload_count
+        metrics["dur_db_insert"] += dur_db_insert
+        metrics["db_insert_count"] += db_insert_count
+        metrics["batch_last"] = {
+            "dur_db_lookup": dur_db_lookup,
+            "dur_blob_upload": dur_blob_upload,
+            "dur_db_insert": dur_db_insert,
+            "dur_blob_verify": 0.0,
+            "db_lookup_count": db_lookup_count,
+            "blob_upload_count": blob_upload_count,
+            "db_insert_count": db_insert_count,
+            "blob_verify_count": 0,
+        }
+
+    if first_upload_error is not None:
+        raise first_upload_error
 
     return context
 
 
-def _finalize_document_grouping(repo, project_id, engine, contexts):
+def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None):
     images_by_page, text_blocks_by_page, page_dimensions = {}, {}, {}
     for context in contexts:
         images_by_page.update(context.get("images_by_page", {}))
         text_blocks_by_page.update(context.get("text_blocks_by_page", {}))
         page_dimensions.update(context.get("page_dimensions", {}))
     final_images, groups = engine.group_extracted_pages(images_by_page, text_blocks_by_page, page_dimensions)
+
     group_ids = {}
+    group_payloads = []
     for group in groups:
         stable_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
             f"{project_id}:{group.caption_page_number}:{group.caption_text}:{group.figure_label or ''}"))
         group_ids[group.group_id] = stable_id
-        if not repo.get_figure_group(stable_id):
-            repo.create_figure_group(
-                group_id=stable_id, project_id=project_id, caption_text=group.caption_text,
-                caption_page_number=group.caption_page_number,
-                caption_position=group.caption_position or "below", figure_label=group.figure_label,
-                is_cross_page=group.is_cross_page, review_status=group.review_status,
-                review_reasons=group.review_reasons,
-            )
+        group_payloads.append({
+            "group_id": stable_id,
+            "project_id": project_id,
+            "caption_text": group.caption_text,
+            "caption_page_number": group.caption_page_number,
+            "caption_position": group.caption_position or "below",
+            "figure_label": group.figure_label,
+            "is_cross_page": group.is_cross_page,
+            "review_status": group.review_status,
+            "review_reasons": group.review_reasons,
+        })
+
+    groups_created = 0
+    if group_payloads:
+        if hasattr(repo, "create_figure_groups_batch"):
+            groups_created = repo.create_figure_groups_batch(group_payloads)
+        else:
+            for g in group_payloads:
+                if not repo.get_figure_group(g["group_id"]):
+                    repo.create_figure_group(
+                        group_id=g["group_id"], project_id=project_id, caption_text=g["caption_text"],
+                        caption_page_number=g["caption_page_number"], caption_position=g["caption_position"],
+                        figure_label=g["figure_label"], is_cross_page=g["is_cross_page"],
+                        review_status=g["review_status"], review_reasons=g["review_reasons"],
+                    )
+                    groups_created += 1
+
+    fallback_source_map = None
+    association_updates = []
     for image in final_images:
         existing_id = getattr(image, "image_id", None)
         if not existing_id:
-            existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
-            existing_id = existing["id"] if existing else None
+            if fallback_source_map is None and hasattr(repo, "list_image_asset_source_keys"):
+                fallback_source_map = repo.list_image_asset_source_keys(project_id)
+            if fallback_source_map is not None:
+                existing_id = fallback_source_map.get((int(image.page_number), int(image.xref), int(image.placement_index)))
+            else:
+                existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
+                existing_id = existing["id"] if existing else None
         if not existing_id:
             continue
         image.group_id = group_ids.get(image.group_id, image.group_id)
-        repo.update_image_group_association(
-            existing_id, image.group_id, association_type=image.association_type,
-            association_confidence=image.association_confidence, panel_label=image.panel_label,
-            caption=image.caption, caption_position=image.caption_position,
-            needs_caption_review=image.needs_caption_review, review_reasons=image.review_reasons,
-        )
+        association_updates.append({
+            "image_id": existing_id,
+            "group_id": image.group_id,
+            "association_type": image.association_type,
+            "association_confidence": image.association_confidence,
+            "panel_label": image.panel_label,
+            "caption": image.caption,
+            "caption_position": image.caption_position,
+            "needs_caption_review": image.needs_caption_review,
+            "review_reasons": image.review_reasons,
+        })
+
+    if association_updates:
+        if hasattr(repo, "update_image_group_associations_batch"):
+            repo.update_image_group_associations_batch(association_updates)
+        else:
+            for u in association_updates:
+                repo.update_image_group_association(
+                    u["image_id"], u["group_id"], association_type=u["association_type"],
+                    association_confidence=u["association_confidence"], panel_label=u["panel_label"],
+                    caption=u["caption"], caption_position=u["caption_position"],
+                    needs_caption_review=u["needs_caption_review"], review_reasons=u["review_reasons"],
+                )
+
+    if metrics is not None:
+        metrics["groups_created"] = groups_created
+        metrics["group_assoc_updates"] = len(association_updates)
     return len(final_images), len(groups)
 
 
@@ -243,16 +408,26 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
 
     def heartbeat():
         while not stopped.wait(heartbeat_seconds):
+            if stopped.is_set():
+                return
             try:
-                if not repo.renew_job_lease(job_id, worker_id, _iso(datetime.now(timezone.utc))):
-                    lease_lost.set()
-                    logger.warning("Worker %s lost lease for extraction job %s", worker_id, job_id)
+                renewed = repo.renew_job_lease(job_id, worker_id, _iso(datetime.now(timezone.utc)))
+                if not renewed:
+                    if not stopped.is_set():
+                        lease_lost.set()
+                        logger.warning("Worker %s lost lease for extraction job %s", worker_id, job_id)
                     return
             except Exception:
-                logger.exception("Could not renew extraction job lease %s", job_id)
+                if not stopped.is_set():
+                    logger.exception("Could not renew extraction job lease %s", job_id)
 
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
+
+    def _stop_heartbeat(join_timeout: float = 5.0) -> None:
+        stopped.set()
+        if thread.is_alive():
+            thread.join(timeout=join_timeout)
     tmp_path = None
     t0_job = time.perf_counter()
     try:
@@ -298,45 +473,96 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
         batch_size = _env_int("PDF_BATCH_SIZE", 25)
         max_parallel = _env_int("MAX_PARALLEL_BATCHES", 1, minimum=1, maximum=4)
         page_batches = [page_numbers[i:i + batch_size] for i in range(0, len(page_numbers), batch_size)]
+        t0_init = time.perf_counter()
         repo.initialize_job_batches(job_id, page_batches, total_document_pages, max_attempts=max_retries)
         batch_rows = {row["batch_index"]: row for row in repo.list_job_batches(job_id)}
+        dur_init_batches = time.perf_counter() - t0_init
+
         contexts = []
         active_engine = engine or ExtractionEngine()
         use_processes = engine is None and max_parallel > 1 and len(page_batches) > 1
+        job_metrics = {
+            "dur_init_batches": dur_init_batches,
+            "dur_start_batch": 0.0,
+            "start_batch_count": 0,
+            "dur_renew_lease": 0.0,
+            "renew_lease_count": 0,
+            "dur_complete_batch": 0.0,
+            "complete_batch_count": 0,
+            "dur_db_lookup": 0.0,
+            "db_lookup_count": 0,
+            "dur_blob_upload": 0.0,
+            "blob_upload_count": 0,
+            "dur_db_insert": 0.0,
+            "db_insert_count": 0,
+            "dur_blob_verify": 0.0,
+            "blob_verify_count": 0,
+            "groups_created": 0,
+            "group_assoc_updates": 0,
+        }
+        if hasattr(repo, "list_image_asset_source_keys"):
+            t0_job_lookup = time.perf_counter()
+            known_source_map = repo.list_image_asset_source_keys(project_id)
+            job_metrics["dur_db_lookup"] += time.perf_counter() - t0_job_lookup
+            job_metrics["db_lookup_count"] += 1
+        else:
+            known_source_map = None
+
+        last_lease_check = [time.monotonic()]
+
+        def _ensure_lease():
+            if stopped.is_set():
+                return
+            if lease_lost.is_set():
+                raise RuntimeError("Worker lost the extraction job lease")
+            now_mono = time.monotonic()
+            if now_mono - last_lease_check[0] >= heartbeat_seconds:
+                t0_lease = time.perf_counter()
+                ok = repo.renew_job_lease(job_id, worker_id, _iso(datetime.now(timezone.utc)))
+                job_metrics["dur_renew_lease"] += time.perf_counter() - t0_lease
+                job_metrics["renew_lease_count"] += 1
+                if not ok:
+                    lease_lost.set()
+                    raise RuntimeError("Worker lost the extraction job lease")
+                last_lease_check[0] = now_mono
 
         logger.info(
-            "Job started: job_id=%s project_id=%s worker_id=%s total_pages=%d total_batches=%d batch_size=%d max_parallel=%d duration_download=%.3fs duration_open=%.3fs",
-            job_id, project_id, worker_id, total_document_pages, len(page_batches), batch_size, max_parallel, dur_download, dur_open,
+            "Job started: job_id=%s project_id=%s worker_id=%s total_pages=%d total_batches=%d batch_size=%d max_parallel=%d duration_download=%.3fs duration_open=%.3fs dur_init_batches=%.3fs",
+            job_id, project_id, worker_id, total_document_pages, len(page_batches), batch_size, max_parallel, dur_download, dur_open, dur_init_batches,
         )
 
         if use_processes:
             _process_batches_parallel(
                 job_id, project_id, tmp_path, repo, filestore, page_batches,
                 batch_rows, contexts, active_engine, max_parallel, worker_id, lease_lost,
+                metrics=job_metrics, known_source_map=known_source_map, ensure_lease=_ensure_lease,
             )
         else:
             for index, pages in enumerate(page_batches):
                 t0_batch = time.perf_counter()
-                if lease_lost.is_set() or not repo.renew_job_lease(
-                    job_id, worker_id, _iso(datetime.now(timezone.utc))
-                ):
-                    raise RuntimeError("Worker lost the extraction job lease")
+                _ensure_lease()
                 batch = batch_rows[index]
-                if batch["status"] != "completed" and not repo.start_job_batch(
-                    job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
-                ):
-                    raise RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
+                if batch["status"] != "completed":
+                    t0_sb = time.perf_counter()
+                    started_ok = repo.start_job_batch(
+                        job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
+                    )
+                    job_metrics["dur_start_batch"] += time.perf_counter() - t0_sb
+                    job_metrics["start_batch_count"] += 1
+                    if not started_ok:
+                        raise RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
                 batch_temp_dir = None
                 try:
                     t0_extract = time.perf_counter()
                     result, batch_temp_dir = _process_batch(tmp_path, pages, engine)
                     dur_extract = time.perf_counter() - t0_extract
-                    if lease_lost.is_set() or not repo.renew_job_lease(
-                        job_id, worker_id, _iso(datetime.now(timezone.utc))
-                    ):
-                        raise RuntimeError("Worker lost the extraction job lease")
+                    _ensure_lease()
                     t0_persist = time.perf_counter()
-                    contexts.append(_persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=batch_temp_dir))
+                    contexts.append(_persist_batch_images(
+                        repo, filestore, project_id, result,
+                        batch_temp_dir=batch_temp_dir, metrics=job_metrics,
+                        known_source_map=known_source_map,
+                    ))
                     dur_persist = time.perf_counter() - t0_persist
                 finally:
                     if batch_temp_dir and os.path.exists(batch_temp_dir):
@@ -348,29 +574,48 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
                             job_id, index, "failed", repr(result.errors[:3]), worker_id=worker_id
                         )
                         raise RuntimeError(f"Page batch {index + 1} reported extraction errors")
-                    if not repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id):
+                    t0_cb = time.perf_counter()
+                    completed_ok = repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id)
+                    job_metrics["dur_complete_batch"] += time.perf_counter() - t0_cb
+                    job_metrics["complete_batch_count"] += 1
+                    if not completed_ok:
                         raise RuntimeError("Worker lost ownership before recording batch completion")
                 dur_batch = time.perf_counter() - t0_batch
+                b_last = job_metrics.get("batch_last") or {}
                 logger.info(
-                    "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d duration_extract=%.3fs duration_persist=%.3fs duration_total=%.3fs status=completed",
-                    job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images), dur_extract, dur_persist, dur_batch,
+                    "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d duration_extract=%.3fs dur_db_lookup=%.3fs dur_blob_upload=%.3fs dur_db_insert=%.3fs dur_blob_verify=%.3fs duration_persist=%.3fs duration_total=%.3fs status=completed",
+                    job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images), dur_extract,
+                    b_last.get("dur_db_lookup", 0.0), b_last.get("dur_blob_upload", 0.0), b_last.get("dur_db_insert", 0.0), b_last.get("dur_blob_verify", 0.0),
+                    dur_persist, dur_batch,
                 )
 
-        if lease_lost.is_set() or not repo.renew_job_lease(job_id, worker_id, _iso(datetime.now(timezone.utc))):
-            raise RuntimeError("Worker lost the extraction job lease")
+        _ensure_lease()
         t0_group = time.perf_counter()
-        img_count, group_count = _finalize_document_grouping(repo, project_id, active_engine, contexts)
+        img_count, group_count = _finalize_document_grouping(repo, project_id, active_engine, contexts, metrics=job_metrics)
         dur_group = time.perf_counter() - t0_group
+        _stop_heartbeat()
+        if lease_lost.is_set():
+            raise RuntimeError("Worker lost the extraction job lease")
         if not repo.update_claimed_job_status(job_id, worker_id, "completed"):
             raise RuntimeError("Worker lost ownership before completing the extraction job")
         repo.update_project_status(project_id, status="ready_for_review")
         dur_job = time.perf_counter() - t0_job
         logger.info(
-            "Job completed: job_id=%s project_id=%s total_pages=%d total_batches=%d total_images=%d total_groups=%d duration_download=%.3fs duration_grouping=%.3fs duration_total=%.3fs status=completed",
-            job_id, project_id, total_document_pages, len(page_batches), img_count, group_count, dur_download, dur_group, dur_job,
+            "Job completed: job_id=%s project_id=%s total_pages=%d total_batches=%d total_images=%d total_groups=%d "
+            "dur_download=%.3fs dur_init_batches=%.3fs dur_start_batch=%.3fs dur_renew_lease=%.3fs dur_complete_batch=%.3fs "
+            "dur_db_lookup=%.3fs dur_blob_upload=%.3fs dur_db_insert=%.3fs dur_blob_verify=%.3fs dur_grouping=%.3fs dur_job=%.3fs "
+            "start_batches=%d renew_leases=%d complete_batches=%d db_lookups=%d blob_uploads=%d db_inserts=%d blob_verifies=%d groups_created=%d group_assoc_updates=%d status=completed",
+            job_id, project_id, total_document_pages, len(page_batches), img_count, group_count,
+            dur_download, job_metrics["dur_init_batches"], job_metrics["dur_start_batch"], job_metrics["dur_renew_lease"], job_metrics["dur_complete_batch"],
+            job_metrics["dur_db_lookup"], job_metrics["dur_blob_upload"], job_metrics["dur_db_insert"], job_metrics["dur_blob_verify"],
+            dur_group, dur_job,
+            job_metrics["start_batch_count"], job_metrics["renew_lease_count"], job_metrics["complete_batch_count"],
+            job_metrics["db_lookup_count"], job_metrics["blob_upload_count"], job_metrics["db_insert_count"], job_metrics["blob_verify_count"],
+            job_metrics["groups_created"], job_metrics["group_assoc_updates"],
         )
         return True
     except Exception as exc:
+        _stop_heartbeat()
         logger.exception("Extraction job %s failed", job_id)
         current = repo.get_job(job_id) or claimed
         retry = int(current.get("attempt_count", 1)) < int(current.get("max_attempts", 3))
@@ -387,8 +632,7 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
             repo.update_project_status(project_id, status="queued" if retry else "failed")
         return False
     finally:
-        stopped.set()
-        thread.join(timeout=1)
+        _stop_heartbeat()
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -397,7 +641,8 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
 
 
 def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, page_batches,
-                              batch_rows, contexts, engine, max_parallel, worker_id, lease_lost):
+                              batch_rows, contexts, engine, max_parallel, worker_id, lease_lost,
+                              metrics=None, known_source_map=None, ensure_lease=None):
     pending = iter(enumerate(page_batches))
     active = {}
     batch_start_times = {}
@@ -405,22 +650,33 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
     with ProcessPoolExecutor(max_workers=max_parallel) as executor:
         while True:
             while first_error is None and len(active) < max_parallel:
-                if lease_lost.is_set() or not repo.renew_job_lease(
-                    job_id, worker_id, _iso(datetime.now(timezone.utc))
-                ):
-                    lease_lost.set()
-                    first_error = RuntimeError("Worker lost the extraction job lease")
+                try:
+                    if ensure_lease is not None:
+                        ensure_lease()
+                    elif lease_lost.is_set() or not repo.renew_job_lease(
+                        job_id, worker_id, _iso(datetime.now(timezone.utc))
+                    ):
+                        lease_lost.set()
+                        raise RuntimeError("Worker lost the extraction job lease")
+                except Exception as exc:
+                    first_error = exc
                     break
                 try:
                     index, pages = next(pending)
                 except StopIteration:
                     break
                 batch = batch_rows[index]
-                if batch["status"] != "completed" and not repo.start_job_batch(
-                    job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
-                ):
-                    first_error = RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
-                    break
+                if batch["status"] != "completed":
+                    t0_sb = time.perf_counter()
+                    started_ok = repo.start_job_batch(
+                        job_id, index, _iso(datetime.now(timezone.utc)), worker_id=worker_id
+                    )
+                    if metrics is not None:
+                        metrics["dur_start_batch"] = metrics.get("dur_start_batch", 0.0) + (time.perf_counter() - t0_sb)
+                        metrics["start_batch_count"] = metrics.get("start_batch_count", 0) + 1
+                    if not started_ok:
+                        first_error = RuntimeError(f"Extraction batch {index + 1} exhausted its retry limit")
+                        break
                 batch_start_times[index] = time.perf_counter()
                 active[executor.submit(_extract_pdf_batch, pdf_path, pages)] = (index, batch)
             if not active:
@@ -430,28 +686,45 @@ def _process_batches_parallel(job_id, project_id, pdf_path, repo, filestore, pag
                 index, batch = active.pop(future)
                 try:
                     result, batch_temp_dir = future.result()
-                    if lease_lost.is_set() or not repo.renew_job_lease(
-                        job_id, worker_id, _iso(datetime.now(timezone.utc))
-                    ):
-                        lease_lost.set()
+                    try:
+                        if ensure_lease is not None:
+                            ensure_lease()
+                        elif lease_lost.is_set() or not repo.renew_job_lease(
+                            job_id, worker_id, _iso(datetime.now(timezone.utc))
+                        ):
+                            lease_lost.set()
+                            raise RuntimeError("Worker lost the extraction job lease")
+                    except Exception:
                         if batch_temp_dir and os.path.exists(batch_temp_dir):
                             shutil.rmtree(batch_temp_dir, ignore_errors=True)
-                        raise RuntimeError("Worker lost the extraction job lease")
+                        raise
                     t0_persist = time.perf_counter()
-                    contexts.append(_persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=batch_temp_dir))
+                    contexts.append(_persist_batch_images(
+                        repo, filestore, project_id, result,
+                        batch_temp_dir=batch_temp_dir, metrics=metrics,
+                        known_source_map=known_source_map,
+                    ))
                     dur_persist = time.perf_counter() - t0_persist
                     if batch_temp_dir and os.path.exists(batch_temp_dir):
                         shutil.rmtree(batch_temp_dir, ignore_errors=True)
                     if result.errors:
                         raise RuntimeError(f"Page batch {index + 1} reported extraction errors: {result.errors[:3]}")
                     if batch["status"] != "completed":
-                        if not repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id):
+                        t0_cb = time.perf_counter()
+                        completed_ok = repo.set_job_batch_status(job_id, index, "completed", worker_id=worker_id)
+                        if metrics is not None:
+                            metrics["dur_complete_batch"] = metrics.get("dur_complete_batch", 0.0) + (time.perf_counter() - t0_cb)
+                            metrics["complete_batch_count"] = metrics.get("complete_batch_count", 0) + 1
+                        if not completed_ok:
                             raise RuntimeError("Worker lost ownership before recording batch completion")
                     dur_batch = time.perf_counter() - batch_start_times.get(index, t0_persist)
                     pages = page_batches[index]
+                    b_last = (metrics or {}).get("batch_last") or {}
                     logger.info(
-                        "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d duration_persist=%.3fs duration_total=%.3fs status=completed",
-                        job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images), dur_persist, dur_batch,
+                        "Batch processed: job_id=%s batch_index=%d/%d page_range=%s pages_count=%d images_discovered=%d dur_db_lookup=%.3fs dur_blob_upload=%.3fs dur_db_insert=%.3fs dur_blob_verify=%.3fs duration_persist=%.3fs duration_total=%.3fs status=completed",
+                        job_id, index + 1, len(page_batches), f"{pages[0]}-{pages[-1]}", len(pages), len(result.images),
+                        b_last.get("dur_db_lookup", 0.0), b_last.get("dur_blob_upload", 0.0), b_last.get("dur_db_insert", 0.0), b_last.get("dur_blob_verify", 0.0),
+                        dur_persist, dur_batch,
                     )
                 except Exception as exc:
                     retry_batch = int(batch["attempt_count"]) + (0 if batch["status"] == "completed" else 1) < int(batch["max_attempts"])

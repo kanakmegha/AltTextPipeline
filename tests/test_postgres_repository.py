@@ -1000,3 +1000,202 @@ def test_postgres_user_doc_design_save_restore_reset_and_isolation(repo):
     assert repo.get_user_doc_design(u1) is None
     assert repo.get_user_doc_design(u2)["document_title"] == "User 2 Prefs"
     repo.reset_user_doc_design(u2)
+
+
+def test_postgres_batch_image_and_group_persistence_idempotency(repo):
+    pid = str(uuid.uuid4())
+    repo.create_project(
+        project_id=pid,
+        name="PG Batch Project",
+        source_filename="batch.pdf",
+        source_storage_key="source/batch.pdf",
+        source_checksum="chk123",
+    )
+    img1_id = str(uuid.uuid4())
+    img2_id = str(uuid.uuid4())
+    items = [
+        {
+            "image_id": img1_id,
+            "project_id": pid,
+            "page_number": 1,
+            "xref": 10,
+            "placement_index": 1,
+            "bbox": {"x0": 0.0, "y0": 0.0, "x1": 50.0, "y1": 50.0},
+            "original_caption": "Fig 1",
+            "caption_position": "below",
+            "needs_caption_review": False,
+            "review_reasons": [],
+            "suggested_filename": "fig1.png",
+            "file_storage_key": "images/fig1.png",
+            "file_checksum": "c1",
+            "image_format": "png",
+        },
+        {
+            "image_id": img2_id,
+            "project_id": pid,
+            "page_number": 1,
+            "xref": 11,
+            "placement_index": 2,
+            "bbox": {"x0": 60.0, "y0": 0.0, "x1": 110.0, "y1": 50.0},
+            "original_caption": "Fig 1",
+            "caption_position": "below",
+            "needs_caption_review": False,
+            "review_reasons": [],
+            "suggested_filename": "fig2.png",
+            "file_storage_key": "images/fig2.png",
+            "file_checksum": "c2",
+            "image_format": "png",
+        },
+    ]
+    assert repo.create_image_assets_batch(items) == 2
+    # Idempotent repeat with different UUIDs for same source keys inserts 0 rows
+    repeat_items = [{**item, "image_id": str(uuid.uuid4())} for item in items]
+    assert repo.create_image_assets_batch(repeat_items) == 0
+
+    src_map = repo.list_image_asset_source_keys(pid)
+    assert src_map == {(1, 10, 1): img1_id, (1, 11, 2): img2_id}
+
+    gid = str(uuid.uuid4())
+    groups = [{
+        "group_id": gid,
+        "project_id": pid,
+        "caption_text": "Figure 1: Dual panel.",
+        "caption_page_number": 1,
+        "caption_position": "below",
+        "figure_label": "Figure 1",
+        "is_cross_page": False,
+        "review_status": "candidate",
+        "review_reasons": [],
+    }]
+    assert repo.create_figure_groups_batch(groups) == 1
+    assert repo.create_figure_groups_batch(groups) == 0
+
+    updated = repo.update_image_group_associations_batch([
+        {
+            "image_id": img1_id,
+            "group_id": gid,
+            "association_type": "group",
+            "association_confidence": 0.95,
+            "panel_label": "A",
+            "caption": "Figure 1: Dual panel.",
+            "caption_position": "below",
+            "needs_caption_review": False,
+            "review_reasons": [],
+        },
+        {
+            "image_id": img2_id,
+            "group_id": gid,
+            "association_type": "group",
+            "association_confidence": 0.95,
+            "panel_label": "B",
+            "caption": "Figure 1: Dual panel.",
+            "caption_position": "below",
+            "needs_caption_review": False,
+            "review_reasons": [],
+        },
+    ])
+    assert updated == 2
+    imgs = repo.list_project_images(pid)
+    assert all(img["group_id"] == gid for img in imgs)
+    assert {img["panel_label"] for img in imgs} == {"A", "B"}
+
+
+def test_postgres_concurrent_duplicate_source_key_and_grouping_safety(pg_db, repo):
+    import threading
+    import psycopg2
+
+    pid = str(uuid.uuid4())
+    repo.create_project(
+        project_id=pid,
+        name="PG Conc Project",
+        source_filename="conc.pdf",
+        source_storage_key="source/conc.pdf",
+        source_checksum="chk_conc",
+    )
+
+    # Confirm Migration 15 unique index rejects raw conflicting INSERT
+    img_a = _make_image_kwargs(repo, pid, page_number=1, xref=55, placement_index=1)
+    repo.create_image_asset(**img_a)
+    img_b = _make_image_kwargs(repo, pid, page_number=1, xref=55, placement_index=1)
+    with pytest.raises(psycopg2.IntegrityError):
+        repo.create_image_asset(**img_b)
+
+    # Two concurrent threads calling create_image_assets_batch for the same new source key
+    barrier = threading.Barrier(2)
+    counts = []
+    lock = threading.Lock()
+
+    def worker_insert():
+        barrier.wait()
+        inserted = repo.create_image_assets_batch([{
+            "image_id": str(uuid.uuid4()),
+            "project_id": pid,
+            "page_number": 2,
+            "xref": 88,
+            "placement_index": 1,
+            "bbox": {"x0": 0.0, "y0": 0.0, "x1": 40.0, "y1": 40.0},
+            "original_caption": "Fig 2",
+            "caption_position": "below",
+            "needs_caption_review": False,
+            "review_reasons": [],
+            "suggested_filename": "fig2.png",
+            "file_storage_key": f"images/{uuid.uuid4()}.png",
+            "file_checksum": "c88",
+            "image_format": "png",
+        }])
+        with lock:
+            counts.append(inserted)
+
+    t1 = threading.Thread(target=worker_insert)
+    t2 = threading.Thread(target=worker_insert)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert sum(counts) == 1
+    assert len(repo.list_project_images(pid)) == 2
+
+    # Concurrent grouping updates on existing images remain consistent
+    imgs = repo.list_project_images(pid)
+    gid = str(uuid.uuid4())
+    repo.create_figure_groups_batch([{
+        "group_id": gid,
+        "project_id": pid,
+        "caption_text": "Concurrent Group",
+        "caption_page_number": 1,
+        "caption_position": "below",
+        "figure_label": "Fig 1",
+        "is_cross_page": False,
+        "review_status": "candidate",
+        "review_reasons": [],
+    }])
+
+    g_barrier = threading.Barrier(2)
+
+    def worker_group():
+        g_barrier.wait()
+        repo.update_image_group_associations_batch([
+            {
+                "image_id": img["id"],
+                "group_id": gid,
+                "association_type": "group",
+                "association_confidence": 0.9,
+                "panel_label": "A",
+                "caption": "Concurrent Group",
+                "caption_position": "below",
+                "needs_caption_review": False,
+                "review_reasons": [],
+            }
+            for img in imgs
+        ])
+
+    gt1 = threading.Thread(target=worker_group)
+    gt2 = threading.Thread(target=worker_group)
+    gt1.start()
+    gt2.start()
+    gt1.join()
+    gt2.join()
+
+    assert len(repo.list_project_groups(pid)) == 1
+    assert all(img["group_id"] == gid for img in repo.list_project_images(pid))

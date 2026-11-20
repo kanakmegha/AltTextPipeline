@@ -73,13 +73,15 @@ def create_test_image(env, page_number: int, caption: str = "", xref: int = 100)
     img_id = str(uuid.uuid4())
     img_bytes = make_test_png()
     storage_key, checksum, _ = filestore.save_image(project_id, img_id, img_bytes, "png")
+    placement_index = env.get("_next_placement", 0) + 1
+    env["_next_placement"] = placement_index
 
     repo.create_image_asset(
         image_id=img_id,
         project_id=project_id,
         page_number=page_number,
         xref=xref,
-        placement_index=0,
+        placement_index=placement_index,
         bbox={"x0": 50.0, "y0": 100.0, "x1": 250.0, "y1": 300.0},
         original_caption=caption,
         caption_position="below" if caption else None,
@@ -515,13 +517,15 @@ def create_api_test_image(api_env, page_number: int, caption: str = "") -> str:
     img_id = str(uuid.uuid4())
     img_bytes = make_test_png()
     storage_key, checksum, _ = filestore.save_image(project_id, img_id, img_bytes, "png")
+    placement_index = api_env.get("_next_placement", 0) + 1
+    api_env["_next_placement"] = placement_index
 
     repo.create_image_asset(
         image_id=img_id,
         project_id=project_id,
         page_number=page_number,
         xref=100,
-        placement_index=0,
+        placement_index=placement_index,
         bbox={"x0": 10.0, "y0": 20.0, "x1": 110.0, "y1": 120.0},
         original_caption=caption,
         caption_position="below" if caption else None,

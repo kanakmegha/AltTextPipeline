@@ -444,6 +444,176 @@ class Repository:
             conn.execute(query, tuple(values))
         return self.get_image_asset(image_id)
 
+    def list_image_asset_source_keys(self, project_id: str) -> Dict[tuple, str]:
+        """Return {(page_number, xref, placement_index): image_id} for a project in one query."""
+        with self.db.session() as conn:
+            cursor = conn.execute(
+                "SELECT id, page_number, xref, placement_index FROM image_assets WHERE project_id = ?;",
+                (project_id,),
+            )
+            return {
+                (int(row["page_number"]), int(row["xref"]), int(row["placement_index"])): row["id"]
+                for row in cursor.fetchall()
+            }
+
+    def create_image_assets_batch(self, items: List[Dict[str, Any]]) -> int:
+        """Idempotently insert image_assets rows in a single transaction."""
+        if not items:
+            return 0
+        now = utc_now_iso()
+        project_ids = {item["project_id"] for item in items}
+        with self.db.session() as conn:
+            existing_keys = set()
+            for pid in project_ids:
+                cur = conn.execute(
+                    "SELECT page_number, xref, placement_index FROM image_assets WHERE project_id = ?;",
+                    (pid,),
+                )
+                for row in cur.fetchall():
+                    existing_keys.add((pid, int(row["page_number"]), int(row["xref"]), int(row["placement_index"])))
+
+            rows_to_insert = []
+            for item in items:
+                key = (
+                    item["project_id"],
+                    int(item["page_number"]),
+                    int(item["xref"]),
+                    int(item["placement_index"]),
+                )
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                bbox = item["bbox"]
+                rows_to_insert.append((
+                    item["image_id"],
+                    item["project_id"],
+                    int(item["page_number"]),
+                    int(item["xref"]),
+                    int(item["placement_index"]),
+                    bbox["x0"],
+                    bbox["y0"],
+                    bbox["x1"],
+                    bbox["y1"],
+                    item.get("original_caption", ""),
+                    item.get("caption_position"),
+                    1 if item.get("needs_caption_review") else 0,
+                    json.dumps(item.get("review_reasons") or []),
+                    item["suggested_filename"],
+                    item["file_storage_key"],
+                    item["file_checksum"],
+                    item["image_format"],
+                    item.get("processing_status", "extracted"),
+                    item.get("group_id"),
+                    item.get("association_type", "single"),
+                    float(item.get("association_confidence", 1.0)),
+                    item.get("panel_label"),
+                    now,
+                    now,
+                ))
+            if not rows_to_insert:
+                return 0
+            before_changes = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO image_assets (
+                    id, project_id, page_number, xref, placement_index,
+                    bbox_x0, bbox_y0, bbox_x1, bbox_y1,
+                    original_caption, caption_position, needs_caption_review,
+                    review_reasons, suggested_filename, file_storage_key,
+                    file_checksum, image_format, processing_status,
+                    group_id, association_type, association_confidence, panel_label,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING;
+                """,
+                rows_to_insert,
+            )
+            return conn.total_changes - before_changes
+
+    def create_figure_groups_batch(self, groups: List[Dict[str, Any]]) -> int:
+        """Idempotently insert figure_groups rows in a single transaction."""
+        if not groups:
+            return 0
+        now = utc_now_iso()
+        project_ids = {g["project_id"] for g in groups}
+        with self.db.session() as conn:
+            existing_ids = set()
+            for pid in project_ids:
+                cur = conn.execute("SELECT id FROM figure_groups WHERE project_id = ?;", (pid,))
+                for row in cur.fetchall():
+                    existing_ids.add(row["id"])
+            rows_to_insert = []
+            for g in groups:
+                gid = g["group_id"]
+                if gid in existing_ids:
+                    continue
+                existing_ids.add(gid)
+                rows_to_insert.append((
+                    gid,
+                    g["project_id"],
+                    g["caption_text"],
+                    int(g["caption_page_number"]),
+                    g.get("caption_position", "below"),
+                    g.get("figure_label"),
+                    1 if g.get("is_cross_page") else 0,
+                    g.get("review_status", "candidate"),
+                    json.dumps(g.get("review_reasons") or []),
+                    now,
+                    now,
+                ))
+            if not rows_to_insert:
+                return 0
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO figure_groups (
+                    id, project_id, caption_text, caption_page_number,
+                    caption_position, figure_label, is_cross_page,
+                    review_status, review_reasons, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                rows_to_insert,
+            )
+            return len(rows_to_insert)
+
+    def update_image_group_associations_batch(self, updates: List[Dict[str, Any]]) -> int:
+        """Batch-update image_assets group/caption metadata in a single transaction."""
+        if not updates:
+            return 0
+        now = utc_now_iso()
+        rows = [
+            (
+                u.get("group_id"),
+                u.get("association_type", "single"),
+                float(u.get("association_confidence", 1.0)),
+                u.get("panel_label"),
+                u.get("caption", ""),
+                u.get("caption_position"),
+                1 if u.get("needs_caption_review") else 0,
+                json.dumps(u.get("review_reasons") or []),
+                now,
+                u["image_id"],
+            )
+            for u in updates
+        ]
+        with self.db.session() as conn:
+            conn.executemany(
+                """
+                UPDATE image_assets
+                SET group_id = ?,
+                    association_type = ?,
+                    association_confidence = ?,
+                    panel_label = ?,
+                    original_caption = ?,
+                    caption_position = ?,
+                    needs_caption_review = ?,
+                    review_reasons = ?,
+                    updated_at = ?
+                WHERE id = ?;
+                """,
+                rows,
+            )
+        return len(rows)
+
     def remove_image_from_group(self, image_id: str) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
         reasons_json = json.dumps(["Removed from figure group by editor"])

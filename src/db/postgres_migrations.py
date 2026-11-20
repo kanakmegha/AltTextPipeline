@@ -447,4 +447,30 @@ def apply_migrations(db: PostgresConnection) -> int:
         _record_version(db, 14)
         current_version = 14
 
+    # Migration 15: Database-level unique constraint on (project_id, page_number, xref, placement_index)
+    if current_version < 15:
+        with db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT project_id, page_number, xref, placement_index, COUNT(*) AS cnt
+                    FROM image_assets
+                    GROUP BY project_id, page_number, xref, placement_index
+                    HAVING COUNT(*) > 1;
+                    """
+                )
+                dups = cur.fetchall()
+                if dups:
+                    dup_summary = [dict(r) for r in dups[:10]]
+                    raise RuntimeError(
+                        f"Cannot apply unique index uq_image_assets_source: found {len(dups)} duplicate "
+                        f"source key(s) in image_assets (sample: {dup_summary}). Resolve duplicates explicitly first."
+                    )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_image_assets_source "
+                    "ON image_assets(project_id, page_number, xref, placement_index);"
+                )
+        _record_version(db, 15)
+        current_version = 15
+
     return current_version
