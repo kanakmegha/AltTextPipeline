@@ -162,7 +162,10 @@ class PostgresRepository:
         values.append(now)
         values.append(project_id)
 
-        query = f"UPDATE projects SET {', '.join(fields)} WHERE id = %s;"
+        if status is not None and cleanup_status is None:
+            query = f"UPDATE projects SET {', '.join(fields)} WHERE id = %s AND COALESCE(cleanup_status, 'retained') != 'deleting';"
+        else:
+            query = f"UPDATE projects SET {', '.join(fields)} WHERE id = %s;"
         with self.db.session() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, tuple(values))
@@ -487,6 +490,205 @@ class PostgresRepository:
                 cur.execute(query, tuple(values))
         return self.get_image_asset(image_id)
 
+    def list_image_asset_source_keys(self, project_id: str) -> Dict[tuple, str]:
+        """Return {(page_number, xref, placement_index): image_id} for a project in one query."""
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, page_number, xref, placement_index FROM image_assets WHERE project_id = %s;",
+                    (project_id,),
+                )
+                return {
+                    (int(row["page_number"]), int(row["xref"]), int(row["placement_index"])): row["id"]
+                    for row in cur.fetchall()
+                }
+
+    def create_image_assets_batch(self, items: List[Dict[str, Any]]) -> int:
+        """Idempotently insert image_assets rows in a single transaction."""
+        if not items:
+            return 0
+        now = utc_now_iso()
+        project_ids = {item["project_id"] for item in items}
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                existing_keys = set()
+                blocked_projects = set()
+                for pid in project_ids:
+                    cur.execute("SELECT cleanup_status FROM projects WHERE id = %s;", (pid,))
+                    prow = cur.fetchone()
+                    if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                        blocked_projects.add(pid)
+                        continue
+                    cur.execute(
+                        "SELECT page_number, xref, placement_index FROM image_assets WHERE project_id = %s;",
+                        (pid,),
+                    )
+                    for row in cur.fetchall():
+                        existing_keys.add((pid, int(row["page_number"]), int(row["xref"]), int(row["placement_index"])))
+
+                rows_to_insert = []
+                for item in items:
+                    if item["project_id"] in blocked_projects:
+                        continue
+                    key = (
+                        item["project_id"],
+                        int(item["page_number"]),
+                        int(item["xref"]),
+                        int(item["placement_index"]),
+                    )
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                    bbox = item["bbox"]
+                    rows_to_insert.append((
+                        item["image_id"],
+                        item["project_id"],
+                        int(item["page_number"]),
+                        int(item["xref"]),
+                        int(item["placement_index"]),
+                        bbox["x0"],
+                        bbox["y0"],
+                        bbox["x1"],
+                        bbox["y1"],
+                        item.get("original_caption", ""),
+                        item.get("caption_position"),
+                        bool(item.get("needs_caption_review")),
+                        json.dumps(item.get("review_reasons") or []),
+                        item["suggested_filename"],
+                        item["file_storage_key"],
+                        item["file_checksum"],
+                        item["image_format"],
+                        item.get("processing_status", "extracted"),
+                        item.get("group_id"),
+                        item.get("association_type", "single"),
+                        float(item.get("association_confidence", 1.0)),
+                        item.get("panel_label"),
+                        now,
+                        now,
+                    ))
+                if not rows_to_insert:
+                    return 0
+                from psycopg2.extras import execute_values
+                inserted_rows = execute_values(
+                    cur,
+                    """
+                    INSERT INTO image_assets (
+                        id, project_id, page_number, xref, placement_index,
+                        bbox_x0, bbox_y0, bbox_x1, bbox_y1,
+                        original_caption, caption_position, needs_caption_review,
+                        review_reasons, suggested_filename, file_storage_key,
+                        file_checksum, image_format, processing_status,
+                        group_id, association_type, association_confidence, panel_label,
+                        created_at, updated_at
+                    ) VALUES %s
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                    """,
+                    rows_to_insert,
+                    fetch=True,
+                )
+                return len(inserted_rows)
+
+    def create_figure_groups_batch(self, groups: List[Dict[str, Any]]) -> int:
+        """Idempotently insert figure_groups rows in a single transaction."""
+        if not groups:
+            return 0
+        now = utc_now_iso()
+        project_ids = {g["project_id"] for g in groups}
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                existing_ids = set()
+                blocked_projects = set()
+                for pid in project_ids:
+                    cur.execute("SELECT cleanup_status FROM projects WHERE id = %s;", (pid,))
+                    prow = cur.fetchone()
+                    if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                        blocked_projects.add(pid)
+                        continue
+                    cur.execute("SELECT id FROM figure_groups WHERE project_id = %s;", (pid,))
+                    for row in cur.fetchall():
+                        existing_ids.add(row["id"])
+                rows_to_insert = []
+                for g in groups:
+                    if g["project_id"] in blocked_projects:
+                        continue
+                    gid = g["group_id"]
+                    if gid in existing_ids:
+                        continue
+                    existing_ids.add(gid)
+                    rows_to_insert.append((
+                        gid,
+                        g["project_id"],
+                        g["caption_text"],
+                        int(g["caption_page_number"]),
+                        g.get("caption_position", "below"),
+                        g.get("figure_label"),
+                        bool(g.get("is_cross_page")),
+                        g.get("review_status", "candidate"),
+                        json.dumps(g.get("review_reasons") or []),
+                        now,
+                        now,
+                    ))
+                if not rows_to_insert:
+                    return 0
+                cur.executemany(
+                    """
+                    INSERT INTO figure_groups (
+                        id, project_id, caption_text, caption_page_number,
+                        caption_position, figure_label, is_cross_page,
+                        review_status, review_reasons, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    rows_to_insert,
+                )
+                return len(rows_to_insert)
+
+    def update_image_group_associations_batch(self, updates: List[Dict[str, Any]]) -> int:
+        """Batch-update image_assets group/caption metadata in a single transaction."""
+        if not updates:
+            return 0
+        now = utc_now_iso()
+        rows = [
+            (
+                u.get("group_id"),
+                u.get("association_type", "single"),
+                float(u.get("association_confidence", 1.0)),
+                u.get("panel_label"),
+                u.get("caption", ""),
+                u.get("caption_position"),
+                bool(u.get("needs_caption_review")),
+                json.dumps(u.get("review_reasons") or []),
+                now,
+                u["image_id"],
+            )
+            for u in updates
+        ]
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    UPDATE image_assets
+                    SET group_id = %s,
+                        association_type = %s,
+                        association_confidence = %s,
+                        panel_label = %s,
+                        original_caption = %s,
+                        caption_position = %s,
+                        needs_caption_review = %s,
+                        review_reasons = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND EXISTS (
+                          SELECT 1 FROM projects p
+                          WHERE p.id = image_assets.project_id
+                            AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                      );
+                    """,
+                    rows,
+                )
+        return len(rows)
+
     def remove_image_from_group(self, image_id: str) -> Optional[Dict[str, Any]]:
         now = utc_now_iso()
         reasons_json = json.dumps(["Removed from figure group by editor"])
@@ -529,7 +731,12 @@ class PostgresRepository:
                         needs_caption_review = %s,
                         review_reasons = %s,
                         updated_at = %s
-                    WHERE id = %s;
+                    WHERE id = %s
+                      AND EXISTS (
+                          SELECT 1 FROM projects p
+                          WHERE p.id = image_assets.project_id
+                            AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                      );
                     """,
                     (caption, caption_position, needs_review, reasons_json, now, image_id)
                 )
@@ -941,7 +1148,12 @@ class PostgresRepository:
                        started_at=COALESCE(started_at, %s), lease_updated_at=%s, error_message=NULL,
                        worker_id=%s,max_attempts=COALESCE(%s,max_attempts)
                        WHERE id=%s AND attempt_count < COALESCE(%s,max_attempts)
-                       AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < %s));""",
+                       AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < %s))
+                       AND EXISTS (
+                           SELECT 1 FROM projects p
+                           WHERE p.id = jobs.project_id
+                             AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                       );""",
                     (now, now, worker_id, max_attempts, job_id, max_attempts, stale_before),
                 )
                 claimed = cur.rowcount == 1
@@ -1051,10 +1263,28 @@ class PostgresRepository:
                 cur.execute(
                     """SELECT id FROM jobs WHERE job_type='extraction' AND attempt_count < max_attempts
                        AND (status='queued' OR (status='running' AND COALESCE(lease_updated_at, started_at) < %s))
+                       AND EXISTS (
+                           SELECT 1 FROM projects p
+                           WHERE p.id = jobs.project_id
+                             AND COALESCE(p.cleanup_status, 'retained') NOT IN ('cleaning', 'deleting')
+                       )
                        ORDER BY created_at LIMIT %s;""", (stale_before, limit)
                 )
                 ids = [row["id"] for row in cur.fetchall()]
         return [job for job_id in ids if (job := self.get_job(job_id))]
+
+    def is_job_cancelled_or_project_deleting(self, job_id: str, project_id: str) -> bool:
+        with self.db.session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT cleanup_status FROM projects WHERE id = %s;", (project_id,))
+                prow = cur.fetchone()
+                if not prow or (prow["cleanup_status"] or "retained") in ("cleaning", "deleting"):
+                    return True
+                cur.execute("SELECT status FROM jobs WHERE id = %s;", (job_id,))
+                jrow = cur.fetchone()
+                if not jrow or jrow["status"] == "cancelled":
+                    return True
+        return False
 
     def fail_exhausted_jobs(self, stale_before: str) -> List[str]:
         now = utc_now_iso()
@@ -2812,10 +3042,6 @@ class PostgresRepository:
             (project_id,),
         )
         active_jobs = [dict(r) for r in cur.fetchall()]
-        if active_jobs:
-            blocking_reasons.append(
-                f"Project has active background job(s) in progress (e.g. job {active_jobs[0]['id']})."
-            )
 
         cur.execute(
             "SELECT id, status FROM exports WHERE project_id = %s AND status IN ('queued', 'running', 'processing');",
@@ -2943,6 +3169,7 @@ class PostgresRepository:
             "existing_operation": existing_operation,
             "can_resume": can_resume,
             "is_active_deletion": is_active_deletion,
+            "active_extraction_jobs": active_jobs,
         }
 
     def preview_project_deletion(self, project_id: str, storage: Any = None) -> Dict[str, Any]:
@@ -2980,6 +3207,29 @@ class PostgresRepository:
                 op_row = cur.fetchone()
                 cur.execute(
                     "UPDATE projects SET cleanup_status = 'deleting', updated_at = %s WHERE id = %s;",
+                    (now, project_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'cancelled',
+                        error_message = 'Cancelled because project is being deleted',
+                        completed_at = COALESCE(completed_at, %s),
+                        lease_updated_at = NULL,
+                        worker_id = NULL
+                    WHERE project_id = %s AND status IN ('queued', 'running', 'processing');
+                    """,
+                    (now, project_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE job_batches
+                    SET status = 'cancelled',
+                        error_message = 'Cancelled because project is being deleted',
+                        completed_at = COALESCE(completed_at, %s)
+                    WHERE job_id IN (SELECT id FROM jobs WHERE project_id = %s)
+                      AND status IN ('queued', 'running');
+                    """,
                     (now, project_id),
                 )
                 return self._format_cleanup_operation_row(op_row)
@@ -3138,6 +3388,35 @@ class PostgresRepository:
                     raise StorageError(err_msg)
 
             self._renew_deletion_lease(operation_id, lease_token)
+
+            # Final sweep for any Blobs uploaded by an in-flight worker racing with cancellation
+            if storage is not None and hasattr(storage, "list_project_keys") and claimed_op["status"] != "deleting_records":
+                already_handled = set(deleted_all) | set(missing_all)
+                extra_keys = []
+                for raw_k in storage.list_project_keys(project_id):
+                    k = (raw_k or "").strip().lstrip("/")
+                    if k.startswith(f"{project_id}/"):
+                        k = k[len(f"{project_id}/"):]
+                    if k and k not in already_handled and k not in extra_keys:
+                        extra_keys.append(k)
+                if extra_keys:
+                    extra_res = storage.delete_objects(project_id, extra_keys)
+                    for k in extra_res.deleted:
+                        if k not in deleted_all:
+                            deleted_all.append(k)
+                    for k in extra_res.missing:
+                        if k not in missing_all:
+                            missing_all.append(k)
+                    if extra_res.failed:
+                        failed_map.update(extra_res.failed)
+                        err_msg = f"Failed to delete {len(failed_map)} storage object(s)."
+                        if not self._record_deletion_failure(
+                            operation_id, lease_token, deleted_all, missing_all, failed_map, err_msg
+                        ):
+                            raise CleanupBlockedError(
+                                f"Deletion lease lost for operation '{operation_id}' (reclaimed by another worker)."
+                            )
+                        raise StorageError(err_msg)
 
             if hasattr(storage, "get_project_dir"):
                 p_dir = storage.get_project_dir(project_id)

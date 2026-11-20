@@ -20,13 +20,17 @@ def main():
     conn = create_connection("postgres", database_url=database_url)
     repo = PostgresRepository(conn)
     storage = create_storage("blob", blob_token=token, blob_store_id=os.environ.get("BLOB_STORE_ID"))
-    run_worker(
-        repo,
-        storage,
-        redis_url,
-        poll_seconds=float(os.environ.get("WORKER_POLL_SECONDS", "5")),
-        stop_event=stop,
-    )
+    try:
+        run_worker(
+            repo,
+            storage,
+            redis_url,
+            poll_seconds=float(os.environ.get("WORKER_POLL_SECONDS", "5")),
+            stop_event=stop,
+        )
+    finally:
+        if hasattr(conn, "close_pool"):
+            conn.close_pool()
 
 
 if __name__ == "__main__":

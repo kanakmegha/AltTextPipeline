@@ -222,3 +222,4 @@ CREATE TABLE IF NOT EXISTS user_doc_preferences (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_project ON audit_events(project_id);
 CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_image_assets_source ON image_assets(project_id, page_number, xref, placement_index);

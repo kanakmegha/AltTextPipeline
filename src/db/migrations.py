@@ -413,4 +413,32 @@ def apply_migrations(db: DatabaseConnection) -> int:
             conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (14, now_iso))
             current_version = 14
 
+        # Migration 15: Database-level unique constraint on (project_id, page_number, xref, placement_index)
+        if current_version < 15:
+            has_image_assets = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='image_assets';"
+            ).fetchone()
+            if has_image_assets:
+                dups = conn.execute(
+                    """
+                    SELECT project_id, page_number, xref, placement_index, COUNT(*) AS cnt
+                    FROM image_assets
+                    GROUP BY project_id, page_number, xref, placement_index
+                    HAVING COUNT(*) > 1;
+                    """
+                ).fetchall()
+                if dups:
+                    dup_summary = [tuple(r) for r in dups[:10]]
+                    raise RuntimeError(
+                        f"Cannot apply unique index uq_image_assets_source: found {len(dups)} duplicate "
+                        f"source key(s) in image_assets (sample: {dup_summary}). Resolve duplicates explicitly first."
+                    )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_image_assets_source "
+                    "ON image_assets(project_id, page_number, xref, placement_index);"
+                )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);", (15, now_iso))
+            current_version = 15
+
     return current_version

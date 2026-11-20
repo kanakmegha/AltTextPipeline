@@ -93,138 +93,18 @@ class ExtractionEngine:
         for page_num in target_pages:
             if page_num < 1 or page_num > total_pages:
                 continue
-
-            page_extracted_images: List[ExtractedImage] = []
-
-            try:
-                page = doc[page_num - 1]
-                page_width = page.rect.width
-                page_height = page.rect.height
-                text_blocks = page.get_text("blocks")
+            page_extracted_images, text_blocks, page_dim, page_errors, image_seq_counter = self.extract_page(
+                doc=doc,
+                page_num=page_num,
+                output_images_dir=output_images_dir,
+                used_filenames=used_filenames,
+                image_seq_start=image_seq_counter,
+            )
+            if page_dim is not None:
                 text_blocks_by_page[page_num] = text_blocks
-                page_dimensions[page_num] = (page_width, page_height)
-                image_info_list = page.get_images(full=True)
-
-                # 1. First collect all image placements on this page for boundary isolation
-                placements_on_page = []
-                seen_xrefs = set()
-
-                for img_info in image_info_list:
-                    xref = img_info[0]
-                    if xref in seen_xrefs:
-                        continue
-                    seen_xrefs.add(xref)
-
-                    rects = page.get_image_rects(xref)
-                    for rect in rects:
-                        placements_on_page.append(
-                            (xref, BoundingBox(rect.x0, rect.y0, rect.x1, rect.y1))
-                        )
-
-                # Sort placements on page in visual reading order (top-to-bottom, left-to-right)
-                placements_on_page.sort(key=lambda item: (item[1].y0, item[1].x0))
-
-                # 2. Extract and match caption for each placement
-                for placement_idx, (xref, img_bbox) in enumerate(placements_on_page, start=1):
-                    image_seq_counter += 1
-
-                    # Extract raw image bytes
-                    base_image = doc.extract_image(xref)
-                    if not base_image or "image" not in base_image:
-                        errors.append({
-                            "page": page_num,
-                            "xref": xref,
-                            "error": "Failed to extract image bytes from XRef"
-                        })
-                        continue
-
-                    img_bytes = base_image["image"]
-                    ext = base_image.get("ext", "png").lower()
-                    if ext not in {"png", "jpg", "jpeg", "webp", "bmp", "tiff"}:
-                        ext = "png"
-
-                    # Identify all other image bboxes on page to avoid cross-image caption leakage
-                    other_bboxes = [b for (x, b) in placements_on_page if b != img_bbox]
-
-                    candidates = find_candidate_blocks(
-                        text_blocks=text_blocks,
-                        target_img_bbox=img_bbox,
-                        other_img_bboxes=other_bboxes,
-                        page_width=page_width,
-                        page_height=page_height,
-                        max_gap=self.max_caption_gap,
-                        horizontal_tolerance=self.horizontal_tolerance,
-                    )
-
-                    if candidates:
-                        best_candidate = candidates[0]
-                        final_caption, combined_blocks = assemble_multiline_caption(
-                            primary_candidate=best_candidate,
-                            all_candidates=candidates,
-                        )
-                        caption_pos = best_candidate.position
-                        caption_found = True
-                        raw_blocks = [c.text for c in combined_blocks]
-                    else:
-                        best_candidate = None
-                        final_caption = ""
-                        caption_pos = None
-                        caption_found = False
-                        raw_blocks = []
-
-                    needs_review, review_reasons = evaluate_caption_ambiguity(
-                        winning_candidate=best_candidate,
-                        all_candidates=candidates,
-                    )
-
-                    # Build clean, deterministic filename
-                    base_filename = build_concise_filename(
-                        caption_text=final_caption,
-                        page_number=page_num,
-                        image_sequence=image_seq_counter,
-                    )
-                    unique_filename = allocate_unique_filename(
-                        base_name=base_filename,
-                        extension=ext,
-                        used_names=used_filenames,
-                    )
-
-                    if output_images_dir:
-                        out_path = os.path.join(output_images_dir, unique_filename)
-                        with open(out_path, "wb") as f:
-                            f.write(img_bytes)
-
-                    # Generate stable internal UUID
-                    image_id = str(uuid.uuid4())
-
-                    img_record = ExtractedImage(
-                        image_id=image_id,
-                        page_number=page_num,
-                        xref=xref,
-                        placement_index=placement_idx,
-                        bbox=img_bbox,
-                        image_bytes=img_bytes,
-                        image_format=ext,
-                        suggested_filename=unique_filename,
-                        caption=final_caption,
-                        caption_position=caption_pos,
-                        caption_found=caption_found,
-                        needs_caption_review=needs_review,
-                        review_reasons=review_reasons,
-                        caption_candidates=candidates,
-                        raw_caption_blocks=raw_blocks,
-                        association_type="single" if caption_found else "uncaptioned",
-                        association_confidence=1.0 if caption_found else 0.0,
-                    )
-                    page_extracted_images.append(img_record)
-
+                page_dimensions[page_num] = page_dim
                 images_by_page[page_num] = page_extracted_images
-
-            except Exception as e:
-                errors.append({
-                    "page": page_num,
-                    "error": repr(e)
-                })
+            errors.extend(page_errors)
 
         doc.close()
 
@@ -276,3 +156,135 @@ class ExtractionEngine:
             text_blocks_by_page=text_blocks_by_page,
             page_dimensions=page_dimensions,
         )
+
+    def extract_page(
+        self,
+        doc: Any,
+        page_num: int,
+        output_images_dir: Optional[str] = None,
+        used_filenames: Optional[Set[str]] = None,
+        image_seq_start: int = 0,
+        disk_filename_by_id: bool = False,
+    ):
+        """Extract images, coordinates, and text blocks from a single 1-based page."""
+        page_extracted_images: List[ExtractedImage] = []
+        page_errors: List[Dict[str, Any]] = []
+        text_blocks: List[Any] = []
+        page_dim: Optional[tuple] = None
+        image_seq_counter = image_seq_start
+        if used_filenames is None:
+            used_filenames = set()
+
+        try:
+            page = doc[page_num - 1]
+            page_width = page.rect.width
+            page_height = page.rect.height
+            text_blocks = page.get_text("blocks")
+            page_dim = (page_width, page_height)
+            image_info_list = page.get_images(full=True)
+
+            placements_on_page = []
+            seen_xrefs = set()
+            for img_info in image_info_list:
+                xref = img_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                rects = page.get_image_rects(xref)
+                for rect in rects:
+                    placements_on_page.append(
+                        (xref, BoundingBox(rect.x0, rect.y0, rect.x1, rect.y1))
+                    )
+
+            placements_on_page.sort(key=lambda item: (item[1].y0, item[1].x0))
+
+            for placement_idx, (xref, img_bbox) in enumerate(placements_on_page, start=1):
+                image_seq_counter += 1
+                base_image = doc.extract_image(xref)
+                if not base_image or "image" not in base_image:
+                    page_errors.append({
+                        "page": page_num,
+                        "xref": xref,
+                        "error": "Failed to extract image bytes from XRef",
+                    })
+                    continue
+
+                img_bytes = base_image["image"]
+                ext = base_image.get("ext", "png").lower()
+                if ext not in {"png", "jpg", "jpeg", "webp", "bmp", "tiff"}:
+                    ext = "png"
+
+                other_bboxes = [b for (_, b) in placements_on_page if b != img_bbox]
+                candidates = find_candidate_blocks(
+                    text_blocks=text_blocks,
+                    target_img_bbox=img_bbox,
+                    other_img_bboxes=other_bboxes,
+                    page_width=page_width,
+                    page_height=page_height,
+                    max_gap=self.max_caption_gap,
+                    horizontal_tolerance=self.horizontal_tolerance,
+                )
+
+                if candidates:
+                    best_candidate = candidates[0]
+                    final_caption, combined_blocks = assemble_multiline_caption(
+                        primary_candidate=best_candidate,
+                        all_candidates=candidates,
+                    )
+                    caption_pos = best_candidate.position
+                    caption_found = True
+                    raw_blocks = [c.text for c in combined_blocks]
+                else:
+                    best_candidate = None
+                    final_caption = ""
+                    caption_pos = None
+                    caption_found = False
+                    raw_blocks = []
+
+                needs_review, review_reasons = evaluate_caption_ambiguity(
+                    winning_candidate=best_candidate,
+                    all_candidates=candidates,
+                )
+
+                base_filename = build_concise_filename(
+                    caption_text=final_caption,
+                    page_number=page_num,
+                    image_sequence=image_seq_counter,
+                )
+                unique_filename = allocate_unique_filename(
+                    base_name=base_filename,
+                    extension=ext,
+                    used_names=used_filenames,
+                )
+                image_id = str(uuid.uuid4())
+
+                if output_images_dir:
+                    disk_name = f"{image_id}.{ext}" if disk_filename_by_id else unique_filename
+                    out_path = os.path.join(output_images_dir, disk_name)
+                    with open(out_path, "wb") as f:
+                        f.write(img_bytes)
+
+                img_record = ExtractedImage(
+                    image_id=image_id,
+                    page_number=page_num,
+                    xref=xref,
+                    placement_index=placement_idx,
+                    bbox=img_bbox,
+                    image_bytes=img_bytes,
+                    image_format=ext,
+                    suggested_filename=unique_filename,
+                    caption=final_caption,
+                    caption_position=caption_pos,
+                    caption_found=caption_found,
+                    needs_caption_review=needs_review,
+                    review_reasons=review_reasons,
+                    caption_candidates=candidates,
+                    raw_caption_blocks=raw_blocks,
+                    association_type="single" if caption_found else "uncaptioned",
+                    association_confidence=1.0 if caption_found else 0.0,
+                )
+                page_extracted_images.append(img_record)
+        except Exception as e:
+            page_errors.append({"page": page_num, "error": repr(e)})
+
+        return page_extracted_images, text_blocks, page_dim, page_errors, image_seq_counter

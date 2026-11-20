@@ -112,6 +112,7 @@ export function openDeleteProjectModal({ projectId, projectName = "", onComplete
   let canDelete = false;
   let isDeleting = false;
   let activeOperationId = null;
+  let hasActiveExtraction = false;
   let pollTimer = null;
 
   function stopPolling() {
@@ -234,11 +235,13 @@ export function openDeleteProjectModal({ projectId, projectName = "", onComplete
       const recs = preview.records_to_delete || {};
       previewLoading.style.display = "none";
       previewDetails.style.display = "block";
+      hasActiveExtraction = Array.isArray(preview.active_extraction_jobs) && preview.active_extraction_jobs.length > 0;
       manifestList.innerHTML = `
         <li><strong>${preview.target_blob_count || 0}</strong> storage object(s) (source PDF, images, and DOCX exports)</li>
         <li><strong>${recs.image_assets || 0}</strong> image asset record(s) &amp; alt text</li>
         <li><strong>${recs.exports || 0}</strong> DOCX export record(s)</li>
         <li><strong>${recs.jobs || 0}</strong> job(s) &amp; <strong>${recs.audit_events || 0}</strong> audit/history record(s)</li>
+        ${hasActiveExtraction ? `<li><strong>Active extraction job(s)</strong> will be cancelled automatically.</li>` : ""}
       `;
 
       const existingOp = preview.existing_operation || null;
@@ -337,7 +340,9 @@ export function openDeleteProjectModal({ projectId, projectName = "", onComplete
     cancelBtn.disabled = true;
     progressBox.style.display = "block";
     failedBox.style.display = "none";
-    progressText.textContent = "Permanently deleting project storage objects and database records…";
+    progressText.textContent = hasActiveExtraction
+      ? "Cancelling active extraction and permanently deleting project…"
+      : "Permanently deleting project storage objects and database records…";
 
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/delete`, {
