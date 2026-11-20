@@ -428,8 +428,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const scrollY = window.scrollY;
 
-    currentImages = incomingImages;
-    if (incomingGroups && incomingGroups.length > 0) {
+    // Deduplicate incoming images by ID while preserving latest server metadata
+    const dedupMap = new Map();
+    for (const img of (incomingImages || [])) {
+      if (img && img.id) dedupMap.set(img.id, img);
+    }
+    currentImages = Array.from(dedupMap.values());
+    if (Array.isArray(incomingGroups)) {
       currentGroups = incomingGroups;
     }
 
@@ -477,19 +482,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
       updateExtractionBanner(data);
 
-      // Merge newly arrived images
+      // Merge newly arrived images or final grouping reconciliation
       const incomingImages = data.images || [];
       const incomingGroups = data.groups || [];
-
-      if (incomingImages.length > currentImages.length) {
-        mergeNewlyExtractedImages(incomingImages, incomingGroups);
-      }
-
-      // Check if polling should continue
       const projectStatus = data.project_status || data.status;
       const jobStatus = data.job_status || (data.job && data.job.status);
       const isTerminal = (projectStatus === "ready_for_review" && (jobStatus === "completed" || !jobStatus)) ||
                          (jobStatus === "failed" || projectStatus === "failed");
+
+      if (
+        incomingImages.length !== currentImages.length ||
+        incomingGroups.length !== currentGroups.length ||
+        isTerminal
+      ) {
+        mergeNewlyExtractedImages(incomingImages, incomingGroups);
+      }
 
       if (!isTerminal) {
         extractionPollTimer = setTimeout(pollExtractionProgress, extractionPollDelay);

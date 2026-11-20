@@ -1,9 +1,11 @@
 """Crash-recoverable extraction job execution shared by Render and tests."""
 
+import atexit
 import gc
 import hashlib
 import logging
 import os
+import queue
 import shutil
 import tempfile
 import threading
@@ -19,6 +21,52 @@ logger = logging.getLogger("alttext.worker")
 LEASE_SECONDS = 300
 DEFAULT_PDF_BATCH_SIZE = 25
 PDF_BATCH_SIZE = DEFAULT_PDF_BATCH_SIZE
+DEFAULT_PERSIST_MICRO_BATCH_SIZE = 8
+DEFAULT_PERSIST_FLUSH_SECONDS = 1.5
+PERSIST_QUEUE_MAXSIZE = 16
+
+_WORKER_DOC = None
+_WORKER_TEMP_DIR = None
+_WORKER_ENGINE = None
+
+
+def _close_page_worker():
+    global _WORKER_DOC
+    if _WORKER_DOC is not None:
+        try:
+            _WORKER_DOC.close()
+        except Exception:
+            pass
+        _WORKER_DOC = None
+
+
+def _init_page_worker(pdf_path, temp_dir):
+    global _WORKER_DOC, _WORKER_TEMP_DIR, _WORKER_ENGINE
+    _close_page_worker()
+    _WORKER_DOC = fitz.open(pdf_path)
+    _WORKER_TEMP_DIR = temp_dir
+    _WORKER_ENGINE = ExtractionEngine()
+    atexit.register(_close_page_worker)
+
+
+def _extract_single_page(page_num):
+    """Extract a single 1-based page using the worker's persistent read-only fitz.Document."""
+    if _WORKER_DOC is None or _WORKER_ENGINE is None:
+        raise RuntimeError("Page worker is not initialized")
+    page_images, text_blocks, page_dim, page_errors, _ = _WORKER_ENGINE.extract_page(
+        _WORKER_DOC,
+        page_num,
+        output_images_dir=_WORKER_TEMP_DIR,
+        disk_filename_by_id=True,
+    )
+    disk_paths = {}
+    for img in page_images:
+        if _WORKER_TEMP_DIR:
+            candidate = os.path.join(_WORKER_TEMP_DIR, f"{img.image_id}.{img.image_format}")
+            if os.path.isfile(candidate):
+                disk_paths[img.image_id] = candidate
+                img.image_bytes = b""
+    return page_num, page_images, text_blocks, page_dim, page_errors, disk_paths
 
 
 def _env_int(name, default, minimum=1, maximum=64):
@@ -112,6 +160,9 @@ def _extract_pdf_batch(pdf_path, page_numbers):
         raise
 
 
+_ORIG_EXTRACT_PDF_BATCH = _extract_pdf_batch
+
+
 def _process_batch(pdf_path, pages, engine):
     if engine is None:
         return _extract_pdf_batch(pdf_path, pages)
@@ -127,10 +178,15 @@ def _process_batch(pdf_path, pages, engine):
         raise
 
 
-def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=None, metrics=None, known_source_map=None):
-    context = result.grouping_context or {}
-    images_by_page = context.get("images_by_page", {})
+_ORIG_EXTRACT_PDF_BATCH = _extract_pdf_batch
 
+
+def _persist_images_list(repo, filestore, project_id, image_entries, metrics=None, known_source_map=None):
+    """
+    Persist a list of (ExtractedImage, optional_disk_path) items using
+    job-scoped source-map caching, deterministic UUID5 IDs, bounded Blob upload
+    concurrency, and batch DB insertion.
+    """
     t0_lookup = time.perf_counter()
     db_lookup_count = 0
     if known_source_map is not None:
@@ -143,32 +199,45 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
 
     images_to_upload = []
     seen_keys = set()
-    for page in sorted(images_by_page):
-        for image in images_by_page[page]:
-            src_key = (int(image.page_number), int(image.xref), int(image.placement_index))
-            if src_key in seen_keys:
+    skipped_disk_paths = []
+    for image, disk_path in image_entries:
+        src_key = (int(image.page_number), int(image.xref), int(image.placement_index))
+        if src_key in seen_keys:
+            if disk_path:
+                skipped_disk_paths.append(disk_path)
+            continue
+        seen_keys.add(src_key)
+        if existing_map is not None:
+            existing_id = existing_map.get(src_key)
+            if existing_id:
+                image.image_id = existing_id
+                if disk_path:
+                    skipped_disk_paths.append(disk_path)
                 continue
-            seen_keys.add(src_key)
-            if existing_map is not None:
-                existing_id = existing_map.get(src_key)
-                if existing_id:
-                    image.image_id = existing_id
-                    continue
-            else:
-                db_lookup_count += 1
-                existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
-                if existing:
-                    image.image_id = existing["id"]
-                    continue
-            # Use deterministic image_id so Blob storage keys are idempotent across retries and DB failures.
-            image.image_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"alttext-image:{project_id}:{image.page_number}:{image.xref}:{image.placement_index}",
-                )
+        else:
+            db_lookup_count += 1
+            existing = repo.find_image_asset_by_source(project_id, image.page_number, image.xref, image.placement_index)
+            if existing:
+                image.image_id = existing["id"]
+                if disk_path:
+                    skipped_disk_paths.append(disk_path)
+                continue
+        # Use deterministic image_id so Blob storage keys are idempotent across retries and DB failures.
+        image.image_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"alttext-image:{project_id}:{image.page_number}:{image.xref}:{image.placement_index}",
             )
-            images_to_upload.append(image)
+        )
+        images_to_upload.append((image, disk_path))
     dur_db_lookup = time.perf_counter() - t0_lookup
+
+    for p in skipped_disk_paths:
+        try:
+            if os.path.isfile(p):
+                os.unlink(p)
+        except OSError:
+            pass
 
     if not images_to_upload:
         if metrics is not None:
@@ -184,21 +253,25 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
                 "db_insert_count": 0,
                 "blob_verify_count": 0,
             }
-        return context
+        return 0
 
-    def _save_one(img):
+    def _save_one(entry):
+        img, disk_path = entry
         payload = img.image_bytes
-        if not payload and batch_temp_dir and img.suggested_filename:
-            disk_path = os.path.join(batch_temp_dir, img.suggested_filename)
-            if os.path.isfile(disk_path):
-                with open(disk_path, "rb") as f:
-                    payload = f.read()
+        if not payload and disk_path and os.path.isfile(disk_path):
+            with open(disk_path, "rb") as f:
+                payload = f.read()
         key, checksum, size = filestore.save_image(
             project_id=project_id,
             image_id=img.image_id,
             image_bytes=payload,
             ext=img.image_format,
         )
+        if disk_path and os.path.isfile(disk_path):
+            try:
+                os.unlink(disk_path)
+            except OSError:
+                pass
         return img, key, checksum, size
 
     t0_upload = time.perf_counter()
@@ -207,7 +280,7 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
     max_upload_workers = min(4, len(images_to_upload))
     if max_upload_workers > 1:
         with ThreadPoolExecutor(max_workers=max_upload_workers) as uploader:
-            future_map = {uploader.submit(_save_one, img): img for img in images_to_upload}
+            future_map = {uploader.submit(_save_one, entry): entry for entry in images_to_upload}
             for future in as_completed(future_map):
                 try:
                     uploaded.append(future.result())
@@ -215,17 +288,15 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
                     if first_upload_error is None:
                         first_upload_error = exc
     else:
-        for img in images_to_upload:
+        for entry in images_to_upload:
             try:
-                uploaded.append(_save_one(img))
+                uploaded.append(_save_one(entry))
             except Exception as exc:
                 if first_upload_error is None:
                     first_upload_error = exc
     dur_blob_upload = time.perf_counter() - t0_upload
     blob_upload_count = len(uploaded)
 
-    # Persist all successfully uploaded images before propagating any partial Blob upload error
-    # so retries do not re-upload or orphan already-persisted assets.
     t0_insert = time.perf_counter()
     db_insert_count = 0
     if uploaded:
@@ -297,6 +368,30 @@ def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=No
     if first_upload_error is not None:
         raise first_upload_error
 
+    return len(uploaded)
+
+
+def _persist_batch_images(repo, filestore, project_id, result, batch_temp_dir=None, metrics=None, known_source_map=None):
+    context = result.grouping_context or {}
+    images_by_page = context.get("images_by_page", {})
+    entries = []
+    for page in sorted(images_by_page):
+        for image in images_by_page[page]:
+            disk_path = None
+            if batch_temp_dir and image.suggested_filename:
+                candidate = os.path.join(batch_temp_dir, image.suggested_filename)
+                if os.path.isfile(candidate):
+                    disk_path = candidate
+            entries.append((image, disk_path))
+
+    _persist_images_list(
+        repo,
+        filestore,
+        project_id,
+        entries,
+        metrics=metrics,
+        known_source_map=known_source_map,
+    )
     return context
 
 
@@ -341,6 +436,11 @@ def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None
                     )
                     groups_created += 1
 
+    existing_imgs_by_id = (
+        {row["id"]: row for row in repo.list_project_images(project_id)}
+        if hasattr(repo, "list_project_images")
+        else {}
+    )
     fallback_source_map = None
     association_updates = []
     for image in final_images:
@@ -355,14 +455,28 @@ def _finalize_document_grouping(repo, project_id, engine, contexts, metrics=None
                 existing_id = existing["id"] if existing else None
         if not existing_id:
             continue
-        image.group_id = group_ids.get(image.group_id, image.group_id)
+        existing_row = existing_imgs_by_id.get(existing_id) or {}
+        editor_modified = bool(
+            existing_row
+            and existing_row.get("updated_at")
+            and existing_row.get("created_at")
+            and existing_row.get("updated_at") != existing_row.get("created_at")
+        )
+        if existing_row.get("group_id"):
+            # Preserve manual grouping created by the editor during live extraction
+            image.group_id = existing_row["group_id"]
+            assoc_type = existing_row.get("association_type") or image.association_type
+        else:
+            image.group_id = group_ids.get(image.group_id, image.group_id)
+            assoc_type = image.association_type
+        caption_to_save = existing_row.get("original_caption", image.caption) if editor_modified else image.caption
         association_updates.append({
             "image_id": existing_id,
             "group_id": image.group_id,
-            "association_type": image.association_type,
+            "association_type": assoc_type,
             "association_confidence": image.association_confidence,
             "panel_label": image.panel_label,
-            "caption": image.caption,
+            "caption": caption_to_save,
             "caption_position": image.caption_position,
             "needs_caption_review": image.needs_caption_review,
             "review_reasons": image.review_reasons,
@@ -480,6 +594,12 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
 
         contexts = []
         active_engine = engine or ExtractionEngine()
+        use_continuous = (
+            engine is None
+            and max_parallel > 1
+            and len(page_numbers) > 1
+            and _extract_pdf_batch is _ORIG_EXTRACT_PDF_BATCH
+        )
         use_processes = engine is None and max_parallel > 1 and len(page_batches) > 1
         job_metrics = {
             "dur_init_batches": dur_init_batches,
@@ -531,7 +651,13 @@ def process_extraction_job(job_id, repo, filestore, engine=None, heartbeat_secon
             job_id, project_id, worker_id, total_document_pages, len(page_batches), batch_size, max_parallel, dur_download, dur_open, dur_init_batches,
         )
 
-        if use_processes:
+        if use_continuous:
+            _process_pages_continuous(
+                job_id, project_id, tmp_path, repo, filestore, page_batches,
+                batch_rows, contexts, max_parallel, worker_id, lease_lost,
+                metrics=job_metrics, known_source_map=known_source_map, ensure_lease=_ensure_lease,
+            )
+        elif use_processes:
             _process_batches_parallel(
                 job_id, project_id, tmp_path, repo, filestore, page_batches,
                 batch_rows, contexts, active_engine, max_parallel, worker_id, lease_lost,
@@ -809,3 +935,267 @@ def run_worker(repo, filestore, redis_url=None, poll_seconds=5, stop_event=None)
     finally:
         client.close()
 
+
+def _process_pages_continuous(
+    job_id, project_id, pdf_path, repo, filestore, page_batches,
+    batch_rows, contexts, max_parallel, worker_id, lease_lost,
+    metrics=None, known_source_map=None, ensure_lease=None,
+):
+    """
+    Option C: Continuous page extraction with bounded IPC & persistence micro-batching.
+    - Each worker process opens pdf_path read-only once in _init_page_worker.
+    - Page 1 is dispatched first; the very first extracted image flushes immediately.
+    - Subsequent images flush in bounded micro-batches (PERSIST_MICRO_BATCH_SIZE / PERSIST_FLUSH_INTERVAL_SECONDS).
+    - Coarse job_batches checkpoints are marked completed only after all pages in that batch are persisted.
+    """
+    micro_batch_size = _env_int("PERSIST_MICRO_BATCH_SIZE", DEFAULT_PERSIST_MICRO_BATCH_SIZE, minimum=1, maximum=32)
+    try:
+        flush_interval = float(os.environ.get("PERSIST_FLUSH_INTERVAL_SECONDS", str(DEFAULT_PERSIST_FLUSH_SECONDS)))
+    except (TypeError, ValueError):
+        flush_interval = DEFAULT_PERSIST_FLUSH_SECONDS
+    flush_interval = max(0.05, min(10.0, flush_interval))
+
+    job_temp_dir = tempfile.mkdtemp(prefix="pdf_cont_")
+    persist_queue = queue.Queue(maxsize=PERSIST_QUEUE_MAXSIZE)
+    persist_error = [None]
+    persist_stop = threading.Event()
+    batch_lock = threading.Lock()
+
+    # Track per-batch extraction & persistence completion so coarse checkpoints stay accurate
+    batch_remaining_extract = {}
+    batch_remaining_persist = {}
+    batch_started = {}
+    page_tasks = []
+    for batch_idx, pages in enumerate(page_batches):
+        batch = batch_rows[batch_idx]
+        if batch["status"] == "completed":
+            continue
+        batch_remaining_extract[batch_idx] = len(pages)
+        batch_remaining_persist[batch_idx] = len(pages)
+        batch_started[batch_idx] = False
+        for pno in pages:
+            page_tasks.append((batch_idx, pno))
+
+    completed_batches_ready = queue.Queue()
+
+    def _persistence_loop():
+        first_image_flushed = False
+        buffer = []
+        buffer_batch_counts = {}
+        buffer_started_at = None
+
+        def _mark_batches_persisted(counts_map):
+            for b_idx, cnt in counts_map.items():
+                if cnt <= 0:
+                    continue
+                with batch_lock:
+                    batch_remaining_persist[b_idx] -= cnt
+                    if batch_remaining_persist[b_idx] == 0 and batch_remaining_extract[b_idx] == 0:
+                        completed_batches_ready.put(b_idx)
+
+        def _flush():
+            nonlocal buffer, buffer_batch_counts, buffer_started_at
+            if not buffer and not buffer_batch_counts:
+                return
+            if buffer:
+                _persist_images_list(
+                    repo,
+                    filestore,
+                    project_id,
+                    buffer,
+                    metrics=metrics,
+                    known_source_map=known_source_map,
+                )
+            _mark_batches_persisted(buffer_batch_counts)
+            buffer = []
+            buffer_batch_counts = {}
+            buffer_started_at = None
+
+        try:
+            sentinel_seen = False
+            while not sentinel_seen:
+                timeout = 0.05 if buffer else 0.25
+                try:
+                    item = persist_queue.get(timeout=timeout)
+                except queue.Empty:
+                    if buffer and buffer_started_at is not None and (time.monotonic() - buffer_started_at) >= flush_interval:
+                        _flush()
+                    continue
+
+                if item is None:
+                    sentinel_seen = True
+                    _flush()
+                    break
+
+                b_idx, entries = item
+                if entries and not first_image_flushed:
+                    # Immediate flush for the very first extracted image (TTFI priority)
+                    first_entry = entries[0]
+                    _persist_images_list(
+                        repo,
+                        filestore,
+                        project_id,
+                        [first_entry],
+                        metrics=metrics,
+                        known_source_map=known_source_map,
+                    )
+                    first_image_flushed = True
+                    entries = entries[1:]
+                    if not entries:
+                        _mark_batches_persisted({b_idx: 1})
+                        continue
+
+                if entries:
+                    if not buffer:
+                        buffer_started_at = time.monotonic()
+                    buffer.extend(entries)
+                buffer_batch_counts[b_idx] = buffer_batch_counts.get(b_idx, 0) + 1
+
+                if len(buffer) >= micro_batch_size or (
+                    buffer and buffer_started_at is not None and (time.monotonic() - buffer_started_at) >= flush_interval
+                ):
+                    _flush()
+                elif not buffer and buffer_batch_counts:
+                    _mark_batches_persisted(buffer_batch_counts)
+                    buffer_batch_counts = {}
+        except Exception as exc:
+            persist_error[0] = exc
+            persist_stop.set()
+
+    persist_thread = threading.Thread(target=_persistence_loop, daemon=True)
+    persist_thread.start()
+
+    job_context = {
+        "images_by_page": {},
+        "text_blocks_by_page": {},
+        "page_dimensions": {},
+    }
+    contexts.append(job_context)
+
+    def _drain_completed_batches():
+        while True:
+            try:
+                b_idx = completed_batches_ready.get_nowait()
+            except queue.Empty:
+                break
+            t0_cb = time.perf_counter()
+            ok = repo.set_job_batch_status(job_id, b_idx, "completed", worker_id=worker_id)
+            if metrics is not None:
+                metrics["dur_complete_batch"] = metrics.get("dur_complete_batch", 0.0) + (time.perf_counter() - t0_cb)
+                metrics["complete_batch_count"] = metrics.get("complete_batch_count", 0) + 1
+            if not ok:
+                raise RuntimeError("Worker lost ownership before recording batch completion")
+
+    max_in_flight = max(2, max_parallel * 2)
+    pending = iter(page_tasks)
+    active = {}
+    first_error = None
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=max_parallel,
+            initializer=_init_page_worker,
+            initargs=(pdf_path, job_temp_dir),
+        ) as executor:
+            while True:
+                if persist_error[0] is not None and first_error is None:
+                    first_error = persist_error[0]
+
+                while first_error is None and len(active) < max_in_flight:
+                    try:
+                        if ensure_lease is not None:
+                            ensure_lease()
+                        elif lease_lost.is_set():
+                            raise RuntimeError("Worker lost the extraction job lease")
+                    except Exception as exc:
+                        first_error = exc
+                        break
+                    try:
+                        b_idx, pno = next(pending)
+                    except StopIteration:
+                        break
+
+                    if not batch_started[b_idx]:
+                        t0_sb = time.perf_counter()
+                        started_ok = repo.start_job_batch(
+                            job_id, b_idx, _iso(datetime.now(timezone.utc)), worker_id=worker_id
+                        )
+                        if metrics is not None:
+                            metrics["dur_start_batch"] = metrics.get("dur_start_batch", 0.0) + (time.perf_counter() - t0_sb)
+                            metrics["start_batch_count"] = metrics.get("start_batch_count", 0) + 1
+                        if not started_ok:
+                            first_error = RuntimeError(f"Extraction batch {b_idx + 1} exhausted its retry limit")
+                            break
+                        batch_started[b_idx] = True
+
+                    active[executor.submit(_extract_single_page, pno)] = (b_idx, pno)
+
+                if not active:
+                    break
+
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    b_idx, pno = active.pop(future)
+                    if first_error is not None:
+                        continue
+                    try:
+                        page_num, page_images, text_blocks, page_dim, page_errors, disk_paths = future.result()
+                        if page_errors:
+                            raise RuntimeError(f"Page {page_num} reported extraction errors: {page_errors[:3]}")
+                        if page_dim is not None:
+                            job_context["images_by_page"][page_num] = page_images
+                            job_context["text_blocks_by_page"][page_num] = text_blocks
+                            job_context["page_dimensions"][page_num] = page_dim
+
+                        with batch_lock:
+                            batch_remaining_extract[b_idx] -= 1
+
+                        entries = [(img, disk_paths.get(img.image_id)) for img in page_images]
+                        while not persist_stop.is_set():
+                            try:
+                                persist_queue.put((b_idx, entries), timeout=0.25)
+                                break
+                            except queue.Full:
+                                if persist_error[0] is not None:
+                                    raise persist_error[0]
+                        if persist_error[0] is not None:
+                            raise persist_error[0]
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+
+                _drain_completed_batches()
+
+                if first_error is not None:
+                    for fut in list(active):
+                        fut.cancel()
+                    break
+
+        # Drain persistence queue cleanly before grouping or raising
+        if not persist_stop.is_set():
+            while True:
+                try:
+                    persist_queue.put(None, timeout=0.25)
+                    break
+                except queue.Full:
+                    if persist_error[0] is not None:
+                        break
+        persist_thread.join(timeout=30)
+
+        if first_error is None and persist_error[0] is not None:
+            first_error = persist_error[0]
+
+        if first_error is not None:
+            raise first_error
+
+        _drain_completed_batches()
+    finally:
+        persist_stop.set()
+        if persist_thread.is_alive():
+            try:
+                persist_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            persist_thread.join(timeout=5)
+        if os.path.exists(job_temp_dir):
+            shutil.rmtree(job_temp_dir, ignore_errors=True)
